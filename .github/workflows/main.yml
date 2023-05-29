@@ -5,7 +5,7 @@ name: Netlify workflow
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main ]
   pull_request:
     branches: [ main ]
 
@@ -16,7 +16,6 @@ jobs:
     strategy:
       matrix:
         node-version: [18.x]
-        # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
 
     defaults:
       run:
@@ -32,16 +31,16 @@ jobs:
 
     - name: Create .env file
       run: |
-        echo "GITHUB_USERNAME=naqeebali-shamsi" > .env
-        echo "USE_GITHUB_DATA=true" >> .env
-        echo "MEDIUM_USERNAME=naqeebali-shamsi" >> .env
+        echo "GITHUB_USERNAME=naqeebali-shamsi" > $GITHUB_WORKSPACE/.env
+        echo "USE_GITHUB_DATA=true" >> $GITHUB_WORKSPACE/.env
+        echo "MEDIUM_USERNAME=naqeebali-shamsi" >> $GITHUB_WORKSPACE/.env
         
     - name: Install dependencies
       run: npm ci --legacy-peer-deps
 
     - name: Build
       run: CI=false npm run build --if-present
-      
+
     - name: Netlify Deploy
       env:
         NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
