@@ -23,10 +23,10 @@ const greeting = {
   username: "Naqeebali Shamsi",
   title: "Hi all, I'm Naqeebali",
   subTitle: emoji(
-    "A passionate Full Stack Software Developer 🚀 having an experience of building Web and Mobile applications with JavaScript / Reactjs / Nodejs / React Native and some other cool libraries and frameworks."
+    "Welcome to my world as a passionate Full Stack Software Developer 🚀. I specialize in crafting user-friendly applications, leveraging modern tech stacks to bring ideas to life. Let's collaborate to create innovative solutions that make a meaningful impact."
   ),
   resumeLink:
-    "", // Set to empty to hide the button
+    "https://drive.google.com/file/d/1ufIOvs3peSvufm9fCfYMMR5yI_8Eap2N/view?usp=drive_link", // Set to empty to hide the button
   displayGreeting: true // Set false to hide this section, defaults to true
 };
 
@@ -111,11 +111,14 @@ https://fontawesome.com/icons?d=gallery */
       skillName: "git",
       fontAwesomeClassname: "fa-brands fa-git"
     },
-
     {
       skillName: "docker",
       fontAwesomeClassname: "fab fa-docker"
-    }
+    },
+    {
+      skillName: "Figma",
+      fontAwesomeClassname: "fa-brands fa-figma"
+    },
   ],
   display: true // Set false to hide this section, defaults to true
 };
@@ -130,10 +133,10 @@ const educationInfo = {
       logo: require("./assets/images/dalLogo.png"),
       subHeader: "Master of Applied Computer Science",
       duration: "September 2022 - Current",
-      desc: "Took courses on Web Development, UI/UX, Serverless Architecture, Cloud Computing, ...",
+      desc: "Mastering the craft in progress...",
       descBullets: [
         "Built projects using React, Node, MongoDB, AWS, ...",
-        "Lorem ipsum dolor sit amet, consectetur adipiscing elit"
+        "Conducted research on Tangible User Interfaces"
       ]
     },
     {
@@ -141,8 +144,8 @@ const educationInfo = {
       logo: require("./assets/images/charusatLogo.png"),
       subHeader: "Bachelor of Technology in Information Technology",
       duration: "July 2015 - April 2019",
-      desc: "Took courses about Software Engineering, Web Security, Operating Systems, ...",
-      descBullets: ["Lorem ipsum dolor sit amet, consectetur adipiscing elit"]
+      desc: "Learned core concepts of Computer Science and Information Technology",
+      descBullets: ["Took courses in Data Structures, Algorithms, DBMS, Operating Systems, Java, Computer Networks", "Built projects using C, C++, Java, Python, HTML, CSS, JavaScript, MongoDB", "Participated in various Hackathons and Coding Competitions"]
     }
   ]
 };
@@ -196,11 +199,11 @@ const workExperiences = {
       date: "May 2019 – August 2022",
       desc: "Full stack developer in TA Factory",
       descBullets: [
-        "Developed and maintained 19+ third-party apps, 11 full-stack Splunk applications, and 30+ scalable REST APIs for international ,clients using Java, Python, JavaScript, and MongoDB in an agile environment.",
-        "Improved the search performance of an application's search feature by 1500% through the development of a Python-based caching mechanism and leveraging Splunk's KV-Store.",
-        "Played a key role in platform security by vetting applications for vulnerabilities before release on Splunkbase and ensuring platform integrity and safety.",
-        "Implemented an internal automated solution for app vetting request prioritization, leading to a 3x increase in team efficiency and better resource allocation.",
-        "Collaborated with clients to successfully deploy automation pipelines for Splunk applications, ensuring efficient workflows and seamless integration with third-party platforms.",
+        "📱 Developed & maintained 19+ 3rd-party apps, 11 full-stack Splunk apps, and 30+ scalable REST APIs for international clients 🌍🚀",
+        "🔍 Boosted search performance by 1500% by developing a Python-based caching mechanism and utilizing Splunk's KV-Store 🐍💨",
+        "🔒 Played a vital role in platform security by vetting apps for vulnerabilities before release on Splunkbase, ensuring integrity and safety 🛡️",
+        "🤖 Implemented an internal automated solution for app vetting request prioritization, resulting in a 3x increase in team efficiency and better resource allocation ⏱️📈",
+        "🤝 Collaborated with clients to deploy automation pipelines for Splunk apps, enabling efficient workflows and seamless integration with third-party platforms 🔄🔌",
       ]
     },
   ]
