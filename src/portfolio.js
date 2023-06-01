@@ -47,11 +47,11 @@ const socialMediaLinks = {
 // Skills Section
 
 const skillsSection = {
-  title: "What I do",
-  subTitle: "CRAZY FULL STACK DEVELOPER WHO WANTS TO EXPLORE EVERY TECH STACK",
+  title: "My Skills",
+  subTitle: "Versatile Full Stack Developer Committed to Mastering Diverse Tech Stacks",
   skills: [
     emoji(
-      "⚡ Develop highly scalabe full-stack applications"
+      "⚡ Develop highly scalable full-stack applications"
     ),
     emoji("⚡ Currently a student at Dalhousie University"),
     emoji(
@@ -165,15 +165,15 @@ const techStack = {
     },
     {
       Stack: "Programming",
-      progressPercentage: "60%"
+      progressPercentage: "95%"
     },
     {
       Stack: "Cloud Computing",
-      progressPercentage: "70%"
+      progressPercentage: "75%"
     },
     {
       Stack: "Database",
-      progressPercentage: "80%"
+      progressPercentage: "75%"
     },
     {
       Stack: "UI/UX",
@@ -226,7 +226,7 @@ const bigProjects = {
     {
       image: require("./assets/images/mockpi.png"),
       projectName: "MockPI",
-      projectDesc: "Lorem ipsum dolor sit amet, consectetur adipiscing elit",
+      projectDesc: "An AI Powered Mock Interview Platform to enhance interview skills and boost success rates in job and college admission interviews.",
       footerLink: [
         {
           name: "Visit Website",
@@ -354,6 +354,24 @@ const podcastSection = {
     "https://anchor.fm/codevcast/embed/episodes/DevStory---Saad-Pasta-from-Karachi--Pakistan-e9givv/a-a15itvo"
   ],
   display: false // Set false to hide this section, defaults to true
+};
+
+const figmaSection = {
+  title: emoji("Figma 🎨"),
+  subtitle: "I LOVE TO DESIGN UI/UX",
+  prototypes: [
+    {
+      title: "TrailScout",
+      subtitle: "a hiking and biking trail companion application for a smartwatch",
+      url: "https://www.figma.com/proto/Y9hChiL1VgI69y2D2LHiJS/TrailScout?type=design&node-id=66-1167&scaling=scale-down&page-id=66%3A1166&starting-point-node-id=66%3A1167"
+    },
+    {
+      title: "Museum Application",
+      subtitle: "A museum application enhanced with AR",
+      url: "https://www.figma.com/proto/pPyTuHccnkO3zhrwdWT5WF/MuseumAPP?type=design&node-id=35-67&scaling=scale-down&page-id=0%3A1&starting-point-node-id=35%3A67",
+    },
+  ],
+  display: true // Set false to hide this section, defaults to true
 };
 
 const contactInfo = {
