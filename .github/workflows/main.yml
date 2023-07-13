@@ -26,12 +26,12 @@ jobs:
         run: npm run build
 
       - name: Deploy to Netlify
-        uses: nwtgck/actions-netlify@v2
+        uses: netlify/actions/cli@master
         with:
           publish-dir: ./build
           production-branch: main
           deploy-message: "Auto-deploy from GitHub Actions"
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          netlify-site-name: naqeebalishamsi.netlify.app # Replace with your Netlify site name
+          netlify-site-name: naqeebalishamsi.netlify.app
           netlify-access-token: ${{ secrets.NETLIFY_AUTH_TOKEN }}
 
