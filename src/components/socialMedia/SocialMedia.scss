@@ -68,6 +68,10 @@
   background-color: $instagram;
 }
 
+.figma i {
+  background-color: $figma;
+}
+
 /* Hover Transition */
 .twitter i:hover,
 .google i:hover,
@@ -78,6 +82,7 @@
 .instagram i:hover,
 .stack-overflow i:hover,
 .kaggle i:hover,
+.figma i:hover,
 .medium i:hover {
   background-color: $textColor;
 }

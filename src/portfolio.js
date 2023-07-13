@@ -26,7 +26,7 @@ const greeting = {
     "Welcome to my world as a passionate Full Stack Software Developer 🚀. I specialize in crafting user-friendly applications, leveraging modern tech stacks to bring ideas to life. Let's collaborate to create innovative solutions that make a meaningful impact."
   ),
   resumeLink:
-    "https://drive.google.com/file/d/1ufIOvs3peSvufm9fCfYMMR5yI_8Eap2N/view?usp=drive_link", // Set to empty to hide the button
+    "https://www.dropbox.com/scl/fi/8bqjawyqh8vdkfz3nbyyn/Naqeebali_Shamsi_Resume.pdf?rlkey=h9dbrtmc3cf8q4030s9zyoz46&dl=0", // Set to empty to hide the button
   displayGreeting: true // Set false to hide this section, defaults to true
 };
 
@@ -39,6 +39,7 @@ const socialMediaLinks = {
   gitlab: "https://gitlab.com/Skywalk3R-NNS",
   instagram: "https://www.instagram.com/naqeebali_shamsi/",
   medium: "https://medium.com/@naqeebali-shamsi",
+  figma: "https://www.figma.com/@naqeebalishamsi",
   // Instagram, Twitter and Kaggle are also supported in the links!
   // To customize icons and social links, tweak src/components/SocialMedia
   display: true // Set true to display this section, defaults to false
@@ -47,11 +48,11 @@ const socialMediaLinks = {
 // Skills Section
 
 const skillsSection = {
-  title: "What I do",
-  subTitle: "CRAZY FULL STACK DEVELOPER WHO WANTS TO EXPLORE EVERY TECH STACK",
+  title: "My Skills",
+  subTitle: "Versatile Full Stack Developer Committed to Mastering Diverse Tech Stacks",
   skills: [
     emoji(
-      "⚡ Develop highly scalabe full-stack applications"
+      "⚡ Develop highly scalable full-stack applications"
     ),
     emoji("⚡ Currently a student at Dalhousie University"),
     emoji(
@@ -165,15 +166,15 @@ const techStack = {
     },
     {
       Stack: "Programming",
-      progressPercentage: "60%"
+      progressPercentage: "95%"
     },
     {
       Stack: "Cloud Computing",
-      progressPercentage: "70%"
+      progressPercentage: "75%"
     },
     {
       Stack: "Database",
-      progressPercentage: "80%"
+      progressPercentage: "75%"
     },
     {
       Stack: "UI/UX",
@@ -226,7 +227,7 @@ const bigProjects = {
     {
       image: require("./assets/images/mockpi.png"),
       projectName: "MockPI",
-      projectDesc: "Lorem ipsum dolor sit amet, consectetur adipiscing elit",
+      projectDesc: "An AI Powered Mock Interview Platform to enhance interview skills and boost success rates in job and college admission interviews.",
       footerLink: [
         {
           name: "Visit Website",
@@ -249,55 +250,20 @@ const achievementSection = {
 
   achievementsCards: [
     {
-      title: "Google Code-In Finalist",
+      title: "AWS Cloud Practitioner",
       subtitle:
-        "First Pakistani to be selected as Google Code-in Finalist from 4000 students from 77 different countries.",
-      image: require("./assets/images/codeInLogo.webp"),
-      imageAlt: "Google Code-In Logo",
+        "I'm a cetified AWS Cloud Practitioner",
+      image: require("./assets/images/aws-badge.png"),
+      imageAlt: "AWS Badge",
       footerLink: [
         {
           name: "Certification",
-          url: "https://drive.google.com/file/d/0B7kazrtMwm5dYkVvNjdNWjNybWJrbndFSHpNY2NFV1p4YmU0/view?usp=sharing"
+          url: "https://www.dropbox.com/s/xsqpzstz8di4vqi/AWS%20Certified%20Cloud%20Practitioner.pdf?dl=0"
         },
-        {
-          name: "Award Letter",
-          url: "https://drive.google.com/file/d/0B7kazrtMwm5dekxBTW5hQkg2WXUyR3QzQmR0VERiLXlGRVdF/view?usp=sharing"
-        },
-        {
-          name: "Google Code-in Blog",
-          url: "https://opensource.googleblog.com/2019/01/google-code-in-2018-winners.html"
-        }
       ]
     },
-    {
-      title: "Google Assistant Action",
-      subtitle:
-        "Developed a Google Assistant Action JavaScript Guru that is available on 2 Billion devices world wide.",
-      image: require("./assets/images/googleAssistantLogo.webp"),
-      imageAlt: "Google Assistant Action Logo",
-      footerLink: [
-        {
-          name: "View Google Assistant Action",
-          url: "https://assistant.google.com/services/a/uid/000000100ee688ee?hl=en"
-        }
-      ]
-    },
-
-    {
-      title: "PWA Web App Developer",
-      subtitle: "Completed Certifcation from SMIT for PWA Web App Development",
-      image: require("./assets/images/pwaLogo.webp"),
-      imageAlt: "PWA Logo",
-      footerLink: [
-        { name: "Certification", url: "" },
-        {
-          name: "Final Project",
-          url: "https://pakistan-olx-1.firebaseapp.com/"
-        }
-      ]
-    }
   ],
-  display: false // Set false to hide this section, defaults to true
+  display: true // Set false to hide this section, defaults to true
 };
 
 // Blogs Section
@@ -356,6 +322,24 @@ const podcastSection = {
   display: false // Set false to hide this section, defaults to true
 };
 
+const figmaSection = {
+  title: emoji("Figma 🎨"),
+  subtitle: "I LOVE TO DESIGN UI/UX",
+  prototypes: [
+    {
+      title: "TrailScout",
+      subtitle: "a hiking and biking trail companion application for a smartwatch",
+      url: "https://www.figma.com/proto/Y9hChiL1VgI69y2D2LHiJS/TrailScout?type=design&node-id=66-1167&scaling=scale-down&page-id=66%3A1166&starting-point-node-id=66%3A1167"
+    },
+    {
+      title: "Museum Application",
+      subtitle: "A museum application enhanced with AR",
+      url: "https://www.figma.com/proto/pPyTuHccnkO3zhrwdWT5WF/MuseumAPP?type=design&node-id=35-67&scaling=scale-down&page-id=0%3A1&starting-point-node-id=35%3A67",
+    },
+  ],
+  display: true // Set false to hide this section, defaults to true
+};
+
 const contactInfo = {
   title: emoji("Contact Me ☎️"),
   subtitle:
@@ -382,6 +366,7 @@ export {
   educationInfo,
   techStack,
   workExperiences,
+  figmaSection,
   openSource,
   bigProjects,
   achievementSection,
