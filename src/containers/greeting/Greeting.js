@@ -1,17 +1,17 @@
-import React, {useContext} from "react";
-import {Fade} from "react-reveal";
+import React, { useContext } from "react";
+import { Fade } from "react-reveal";
 import emoji from "react-easy-emoji";
 import "./Greeting.scss";
-import landingPerson from "../../assets/lottie/landingPerson";
+import landingPerson from "../../assets/lottie/hello";
 import DisplayLottie from "../../components/displayLottie/DisplayLottie";
 import SocialMedia from "../../components/socialMedia/SocialMedia";
 import Button from "../../components/button/Button";
-
-import {illustration, greeting} from "../../portfolio";
+import Typewriter from 'typewriter-effect';
+import { illustration, greeting } from "../../portfolio";
 import StyleContext from "../../contexts/StyleContext";
 
 export default function Greeting() {
-  const {isDark} = useContext(StyleContext);
+  const { isDark } = useContext(StyleContext);
   if (!greeting.displayGreeting) {
     return null;
   }
@@ -26,6 +26,13 @@ export default function Greeting() {
               >
                 {" "}
                 {greeting.title}{" "}
+                <Typewriter
+                  options={{
+                    strings: ['Naqeebali', 'a Full Stack Dev', 'a Cloud Developer',],
+                    autoStart: true,
+                    loop: true,
+                  }}
+                />
                 <span className="wave-emoji">{emoji("👋")}</span>
               </h1>
               <p

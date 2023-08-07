@@ -21,9 +21,9 @@ const illustration = {
 
 const greeting = {
   username: "Naqeebali Shamsi",
-  title: "Hi all, I'm Naqeebali",
+  title: "Hi, I'm",
   subTitle: emoji(
-    "Welcome to my world as a passionate Full Stack Software Developer 🚀. I specialize in crafting user-friendly applications, leveraging modern tech stacks to bring ideas to life. Let's collaborate to create innovative solutions that make a meaningful impact."
+    "An experienced Software Engineer crafting scalable solutions using Java, JavaScript, and Python. As an AWS Certified Practitioner with robust cloud expertise, I'm excited to drive innovation in your development projects. Explore my work on LinkedIn or GitHub, or contact me directly. Together, let's create excellence!"
   ),
   resumeLink:
     "https://www.dropbox.com/scl/fi/8bqjawyqh8vdkfz3nbyyn/Naqeebali_Shamsi_Resume.pdf?rlkey=h9dbrtmc3cf8q4030s9zyoz46&dl=0", // Set to empty to hide the button
@@ -157,32 +157,32 @@ const techStack = {
   viewSkillBars: true, //Set it to true to show Proficiency Section
   experience: [
     {
-      Stack: "Frontend/Design", //Insert stack or technology you have experience in
-      progressPercentage: "90%" //Insert relative proficiency in percentage
+      Stack: "JavaScript", //Insert stack or technology you have experience in
+      progressPercentage: "95%" //Insert relative proficiency in percentage
     },
     {
-      Stack: "Backend",
+      Stack: "Python",
       progressPercentage: "90%"
     },
     {
-      Stack: "Programming",
-      progressPercentage: "95%"
-    },
-    {
-      Stack: "Cloud Computing",
-      progressPercentage: "75%"
-    },
-    {
-      Stack: "Database",
-      progressPercentage: "75%"
-    },
-    {
-      Stack: "UI/UX",
+      Stack: "AWS Cloud Services",
       progressPercentage: "90%"
     },
     {
-      Stack: "Version Control + CI/CD",
+      Stack: "ReactJS",
+      progressPercentage: "80%"
+    },
+    {
+      Stack: "Java",
+      progressPercentage: "80%"
+    },
+    {
+      Stack: "Agile Methodologies",
       progressPercentage: "90%"
+    },
+    {
+      Stack: "Software Testing",
+      progressPercentage: "80%"
     }
   ],
   displayCodersrank: true // Set true to display codersrank badges section need to changes your username in src/containers/skillProgress/skillProgress.js:17:62, defaults to false
@@ -198,13 +198,18 @@ const workExperiences = {
       company: "Crest Data Systems",
       companylogo: require("./assets/images/cds.png"),
       date: "May 2019 – August 2022",
-      desc: "Full stack developer in TA Factory",
+      desc: "Full-stack Splunk App developer",
       descBullets: [
-        "📱 Developed & maintained 19+ 3rd-party apps, 11 full-stack Splunk apps, and 30+ scalable REST APIs for international clients 🌍🚀",
-        "🔍 Boosted search performance by 1500% by developing a Python-based caching mechanism and utilizing Splunk's KV-Store 🐍💨",
-        "🔒 Played a vital role in platform security by vetting apps for vulnerabilities before release on Splunkbase, ensuring integrity and safety 🛡️",
-        "🤖 Implemented an internal automated solution for app vetting request prioritization, resulting in a 3x increase in team efficiency and better resource allocation ⏱️📈",
-        "🤝 Collaborated with clients to deploy automation pipelines for Splunk apps, enabling efficient workflows and seamless integration with third-party platforms 🔄🔌",
+        "🚀 Directed a team of 4 in migrating Splunk apps to Python 3, sharpening system design and boosting operational efficiency.",
+        "🎯 Developed over 100 scalable REST APIs and 15 full-stack Splunk apps, tailoring integration solutions for international clients.",
+        "💡 Designed 6+ intuitive dashboards for Splunk applications, employing Python and ReactJS capabilities.",
+        "☁️ Saved up to 50% on operational costs by developing AWS cloud migration solutions, promoting high availability and scalability.",
+        "📊 Devised an automated workflow, reducing ticket turnaround time by 60% and enhancing team collaboration.",
+        "⏱️ Implemented automation pipelines within GitHub and Bitbucket, doubling team productivity.",
+        "🛠️ Ensured software reliability through stringent testing and debugging of software components.",
+        "🔒 Boosted code security by vetting apps for vulnerabilities pre-release, maintaining application integrity and safety.",
+        "➕ Achieved 23% decrease in technical debt by integrating SonarQube, improving code maintainability and quality.",
+        "🎖️ Contributed to a 40% increase in product adoption rate via cost-effective AWS solutions and ReactJS interfaces."
       ]
     },
   ]
@@ -221,17 +226,41 @@ const openSource = {
 // Some big projects you have worked on
 
 const bigProjects = {
-  title: "Big Projects",
-  subtitle: "SOME STARTUPS AND COMPANIES THAT I HELPED TO CREATE THEIR TECH",
+  title: "Projects",
+  subtitle: "Some projects that I built/collaborated on to enhance my skills and learn new technologies",
   projects: [
     {
       image: require("./assets/images/mockpi.png"),
       projectName: "MockPI",
-      projectDesc: "An AI Powered Mock Interview Platform to enhance interview skills and boost success rates in job and college admission interviews.",
+      projectDesc: "A Personal Interview Platform startup.",
       footerLink: [
         {
           name: "Visit Website",
           url: "http://mockpi.com/"
+        }
+        //  you can add extra buttons here.
+      ]
+    },
+    {
+      image: require("./assets/images/quizcraft.png"),
+      projectName: "QuizCraft",
+      projectDesc: "An interactive online trivia game that facilitates real-time competition, tracks player progress, and enhances user engagement through a scalable multi-cloud serverless platform.",
+      footerLink: [
+        {
+          name: "Visit Website",
+          url: "https://trivia-ui-c37ej7l5xa-uc.a.run.app/profile"
+        }
+        //  you can add extra buttons here.
+      ]
+    },
+    {
+      image: require("./assets/images/rebounder.png"),
+      projectName: "Rebounder",
+      projectDesc: "An AI Powered Mock Interview Platform to enhance interview skills and boost success rates in job and college admission interviews.",
+      footerLink: [
+        {
+          name: "Visit Website",
+          url: "https://rebounder.netlify.app/"
         }
         //  you can add extra buttons here.
       ]
@@ -252,7 +281,7 @@ const achievementSection = {
     {
       title: "AWS Cloud Practitioner",
       subtitle:
-        "I'm a cetified AWS Cloud Practitioner",
+        "I'm a certified AWS Cloud Practitioner",
       image: require("./assets/images/aws-badge.png"),
       imageAlt: "AWS Badge",
       footerLink: [
