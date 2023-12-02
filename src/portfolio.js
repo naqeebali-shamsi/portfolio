@@ -120,6 +120,9 @@ https://fontawesome.com/icons?d=gallery */
       skillName: "Figma",
       fontAwesomeClassname: "fa-brands fa-figma"
     },
+    {
+      skillName: "Terraform"
+    }
   ],
   display: true // Set false to hide this section, defaults to true
 };
@@ -157,31 +160,31 @@ const techStack = {
   viewSkillBars: true, //Set it to true to show Proficiency Section
   experience: [
     {
-      Stack: "Frontend/Design", //Insert stack or technology you have experience in
-      progressPercentage: "90%" //Insert relative proficiency in percentage
+      Stack: "AWS Cloud Services",
+      progressPercentage: "90%"
+    },
+    {
+      Stack: "Terraform",
+      progressPercentage: "90%"
+    },
+    {
+      Stack: "MERN", //Insert stack or technology you have experience in
+      progressPercentage: "95%" //Insert relative proficiency in percentage
     },
     {
       Stack: "Backend",
       progressPercentage: "90%"
     },
     {
-      Stack: "Programming",
-      progressPercentage: "95%"
+      Stack: "ReactJS",
+      progressPercentage: "80%"
     },
     {
-      Stack: "Cloud Computing",
-      progressPercentage: "75%"
+      Stack: "Java",
+      progressPercentage: "80%"
     },
     {
-      Stack: "Database",
-      progressPercentage: "75%"
-    },
-    {
-      Stack: "UI/UX",
-      progressPercentage: "90%"
-    },
-    {
-      Stack: "Version Control + CI/CD",
+      Stack: "Agile Methodologies",
       progressPercentage: "90%"
     }
   ],
@@ -194,17 +197,37 @@ const workExperiences = {
   display: true, //Set it to true to show workExperiences Section
   experience: [
     {
-      role: "Software Engineer",
-      company: "Crest Data Systems",
-      companylogo: require("./assets/images/cds.png"),
-      date: "May 2019 – August 2022",
-      desc: "Full stack developer in TA Factory",
-      descBullets: [
-        "📱 Developed & maintained 19+ 3rd-party apps, 11 full-stack Splunk apps, and 30+ scalable REST APIs for international clients 🌍🚀",
-        "🔍 Boosted search performance by 1500% by developing a Python-based caching mechanism and utilizing Splunk's KV-Store 🐍💨",
-        "🔒 Played a vital role in platform security by vetting apps for vulnerabilities before release on Splunkbase, ensuring integrity and safety 🛡️",
-        "🤖 Implemented an internal automated solution for app vetting request prioritization, resulting in a 3x increase in team efficiency and better resource allocation ⏱️📈",
-        "🤝 Collaborated with clients to deploy automation pipelines for Splunk apps, enabling efficient workflows and seamless integration with third-party platforms 🔄🔌",
+      "role": "DevOps Developer",
+      "company": "OPAS Mobile Canada",
+      "companylogo": require("./assets/images/opas_mobile.png"),
+      "date": "September 2022 – Present",
+      "desc": "Co-op role focused on DevOps methodologies and cloud solutions",
+      "descBullets": [
+        "🚀 Spearheaded the adoption of Terraform at OPAS Mobile, enhancing operational efficiency and scalability through automated infrastructure provisioning.",
+        "🌐 Actively involved in designing scalable and cost-effective cloud solutions, contributing to multi-cloud architecture plans aligned with business objectives.",
+        "🔧 Revamped CI/CD processes for JavaScript applications, integrating containerization for improved deployment speed and reliability.",
+        "🐳 Led Dockerization of critical applications and established automated nightly build processes, improving build stability.",
+        "💼 Pursuing AWS Cloud Architect and Terraform certifications, demonstrating commitment to professional growth and expertise in cloud solutions."
+      ]
+    },
+    {
+      "role": "Software Engineer",
+      "company": "Crest Data Systems",
+      "companylogo": require("./assets/images/cds.png"),
+      "date": "December 2018 – July 2022",
+      "desc": "Software Engineer specializing in full-stack Splunk App development",
+      "descBullets": [
+        "🚀 Led a team of 3 in system architecture refinement and Python 2 to 3 migration for Splunk apps, enhancing collaborative success.",
+        "💡 Pioneered Splunk KV Store usage for in-app caching, achieving 15x improvement in data search performance.",
+        "🎨 Conceptualized and developed data-driven dashboards for 6+ Splunk apps using JavaScript and Bootstrap, enhancing user experience.",
+        "🌐 Developed Splunk apps serving 200,000+ daily users, enabling search of 10M+ records within 2 seconds.",
+        "🔗 Crafted 100+ robust REST APIs for 15 Splunk Apps, ensuring scalability and efficient integration.",
+        "🔧 Streamlined software development lifecycle with automated workflows, cutting lead time by 60%.",
+        "🔍 Integrated SonarQube in CI/CD pipeline, driving a 23% reduction in technical debt and elevating code quality.",
+        "🤝 Translated complex business requirements into technical solutions, closely collaborating with stakeholders.",
+        "🔬 Championed software reliability with thorough unit testing and peer code reviews, maintaining high-quality standards.",
+        "📢 Effectively communicated project milestones and technical details to stakeholders, promoting transparency.",
+        "👨‍💻 Initiated professional journey with a 6-month internship, building a Splunk app for visualizing PUBG player data on Microsoft cloud."
       ]
     },
   ]
