@@ -1,6 +1,7 @@
 fs = require("fs");
 const https = require("https");
-process = require("process");
+const fetch = require("node-fetch");
+require("process");
 require("dotenv").config();
 
 const GITHUB_TOKEN = process.env.REACT_APP_GITHUB_TOKEN;
@@ -97,64 +98,83 @@ if (USE_GITHUB_DATA === "true") {
 if (MEDIUM_USERNAME !== undefined) {
   console.log(`Fetching Medium blogs data for ${MEDIUM_USERNAME}`);
   let options = {
-    hostname: "api.rss2json.com",
-    path: `/v1/api.json?rss_url=https://medium.com/feed/@${MEDIUM_USERNAME}`,
+    hostname: "toptal.com",
+    path: `/developers/feed2json/convert?url=https://medium.com/feed/@${MEDIUM_USERNAME}`,
     port: 443,
-    method: "GET"
-  };
-
-  const req = https.request(options, res => {
-    let mediumData = "";
-    console.log(`Request URL: ${options.hostname}${options.path}`);
-    console.log(`statusCode: ${res.statusCode}`);
-    if (res.statusCode !== 200) {
-      console.log("First request failed. Retrying with alternate options.");
-      options = {
-        hostname: "feeds.feedburner.com",
-        path: "/medium/FM5SddpE6X0",
-        port: 443,
-        method: "GET"
-      };
-      const retryReq = https.request(options, res => {
-        let retryData = "";
-        console.log(`Request URL: ${options.hostname}${options.path}`);
-        console.log(`statusCode: ${res.statusCode}`);
-        if (res.statusCode !== 200) {
-          throw new Error(ERR.requestMediumFailed);
-        }
-
-        res.on("data", d => {
-          retryData += d;
-        });
-        res.on("end", () => {
-          fs.writeFile("./public/blogs.json", retryData, function (err) {
-            if (err) return console.log(err);
-            console.log("saved file to public/blogs.json");
-          });
-        });
-      });
-
-      retryReq.on("error", error => {
-        throw error;
-      });
-
-      retryReq.end();
-    } else {
-      res.on("data", d => {
-        mediumData += d;
-      });
-      res.on("end", () => {
-        fs.writeFile("./public/blogs.json", mediumData, function (err) {
-          if (err) return console.log(err);
-          console.log("saved file to public/blogs.json");
-        });
-      });
+    method: "GET",
+    headers: {
+      "User-Agent": "PostmanRuntime/7.35.0"
     }
-  });
+  };
+  const requestOptions = {
+    method: "GET",
+    redirect: "follow",
+    headers: {
+      "User-Agent": "PostmanRuntime/7.35.0"
+    },
+  };
+  fetch(`https://toptal.com/developers/feed2json/convert?url=https://medium.com/feed/@${MEDIUM_USERNAME}`, requestOptions)
+  .then(response => response.text())
+  .then(result => {
+    fs.writeFile("./public/blogs.json", result, function (err) {
+      if (err) return console.log(err);
+      console.log("saved file to public/blogs.json");
+    });
+  })
+  .catch(error => console.log('error', error));
 
-  req.on("error", error => {
-    throw error;
-  });
 
-  req.end();
+  // const req = https.request(options, res => {
+  //   let mediumData = "";
+    
+  //   if (res.statusCode !== 200) {
+  //     console.log("First request failed. Retrying with alternate options.");
+  //     options = {
+  //       hostname: "feeds.feedburner.com",
+  //       path: "/medium/FM5SddpE6X0",
+  //       port: 443,
+  //       method: "GET"
+  //     };
+  //     const retryReq = https.request(options, res => {
+  //       let retryData = "";
+  //       console.log(`Request URL: ${options.hostname}${options.path}`);
+  //       console.log(`statusCode: ${res.statusCode}`);
+  //       if (res.statusCode !== 200) {
+  //         throw new Error(ERR.requestMediumFailed);
+  //       }
+
+  //       res.on("data", d => {
+  //         retryData += d;
+  //       });
+  //       res.on("end", () => {
+  //         fs.writeFile("./public/blogs.json", retryData, function (err) {
+  //           if (err) return console.log(err);
+  //           console.log("saved file to public/blogs.json");
+  //         });
+  //       });
+  //     });
+
+  //     retryReq.on("error", error => {
+  //       throw error;
+  //     });
+
+  //     retryReq.end();
+  //   } else {
+  //     res.on("data", d => {
+  //       mediumData += d;
+  //     });
+  //     res.on("end", () => {
+  //       fs.writeFile("./public/blogs.json", mediumData, function (err) {
+  //         if (err) return console.log(err);
+  //         console.log("saved file to public/blogs.json");
+  //       });
+  //     });
+  //   }
+  // });
+
+  // req.on("error", error => {
+  //   throw error;
+  // });
+
+  // req.end();
 }

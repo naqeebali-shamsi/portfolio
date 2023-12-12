@@ -326,8 +326,8 @@ const blogSection = {
   displayMediumBlogs: "true", // Set true to display fetched medium blogs instead of hardcoded ones
   blogs: [
     {
-      url: "https://blog.usejournal.com/create-a-google-assistant-action-and-win-a-google-t-shirt-and-cloud-credits-4a8d86d76eae",
-      title: "Win a Google Assistant Tshirt and $200 in Google Cloud Credits",
+      url: "https://medium.com/@naqeebali-shamsi/a-guide-to-setting-up-aws-ec2-and-rds-instances-inside-a-secure-vpc-4153656153a5",
+      title: "A Guide to Setting Up AWS EC2 and RDS Instances Inside a Secure VPC",
       description:
         "Do you want to win $200 and Google Assistant Tshirt by creating a Google Assistant Action in less then 30 min?"
     },
