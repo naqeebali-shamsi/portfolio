@@ -1,6 +1,6 @@
 fs = require("fs");
+const axios = require("axios");
 const https = require("https");
-const fetch = require("node-fetch");
 require("process");
 require("dotenv").config();
 
@@ -113,15 +113,14 @@ if (MEDIUM_USERNAME !== undefined) {
       "User-Agent": "PostmanRuntime/7.35.0"
     },
   };
-  fetch(`https://toptal.com/developers/feed2json/convert?url=https://medium.com/feed/@${MEDIUM_USERNAME}`, requestOptions)
-  .then(response => response.text())
-  .then(result => {
-    fs.writeFile("./public/blogs.json", result, function (err) {
-      if (err) return console.log(err);
-      console.log("saved file to public/blogs.json");
-    });
-  })
-  .catch(error => console.log('error', error));
+  axios.get(`https://toptal.com/developers/feed2json/convert?url=https://medium.com/feed/@${MEDIUM_USERNAME}`, requestOptions)
+    .then(response => {
+      fs.writeFile("./public/blogs.json", JSON.stringify(response.data), function (err) {
+        if (err) return console.log(err);
+        console.log("saved file to public/blogs.json");
+      });
+    })
+    .catch(error => console.log('error', error));
 
 
   // const req = https.request(options, res => {
