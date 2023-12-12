@@ -18,6 +18,7 @@
 
 .dark-menu li a:hover {
   background-color: $buttonColor !important;
+  border-radius: 2%;
 }
 
 .header {
@@ -48,6 +49,7 @@
 .header li a:hover,
 .header .menu-btn:hover {
   background-color: $headerHoverBG;
+  border-radius: 2%;
 }
 
 .header .logo {
@@ -61,7 +63,7 @@
 }
 
 .header .logo-name {
-  font-family: "gt walsheim";
+  font-family: "Open Sans", sans-serif;
   font-weight: bold;
   font-variant-ligatures: no-common-ligatures;
   -webkit-font-variant-ligatures: no-common-ligatures;

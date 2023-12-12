@@ -1,21 +1,21 @@
-@font-face {
+/* @font-face {
   font-family: "GT Walsheim";
   font-style: normal;
   font-weight: normal;
   src: local("GT Walsheim Medium"),
     url("./assets/fonts/GT Walsheim Medium.ttf") format("woff");
   font-display: swap;
-}
+} */
 
 @font-face {
-  font-family: "Montserrat";
-  src: local("Montserrat"),
-    url("./assets/fonts/Montserrat-Regular.ttf") format("woff");
+  font-family: "Open Sans";
+  src: local("Open Sans"),
+    url("./assets/fonts/Open_Sans/OpenSans-VariableFont_wdth\,wght.ttf") format("woff");
   font-display: swap;
 }
 
 code {
-  font-family: source-code-pro, Menlo, Monaco, Consolas, "Courier New",
+  font-family: source-code-pro, Menlo, Monaco, Consolas, "Courier New", "Open Sans",
     monospace;
 }
 
@@ -26,7 +26,7 @@ body {
 
 body {
   margin: 0;
-  font: 19px / 23px Montserrat, "Montserrat", sans-serif;
+  font: 19px / 23px Open_Sans, "Open Sans", sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }

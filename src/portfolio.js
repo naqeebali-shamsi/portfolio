@@ -22,9 +22,9 @@ const illustration = {
 const greeting = {
   username: "Naqeebali Shamsi",
   title: "Hi, I'm",
-  subTitle: emoji(
-    "An experienced Software Engineer crafting scalable solutions using Java, JavaScript, and Python. As an AWS Certified Practitioner with robust cloud expertise, I'm excited to drive innovation in your development projects. Explore my work on LinkedIn or GitHub, or contact me directly. Together, let's create excellence!"
-  ),
+  subTitle: 
+    `Agile in code and philosophy, I craft digital experiences that users didn't know they needed, but once they have, they can't live without.\\n In the cloud, I’m the ${<u>silver lining</u>}, turning 'Oops' into opportunities. Peek at my work, and let's turn 'What if' into 'What's next'.`
+  ,
   resumeLink:
     "https://www.dropbox.com/scl/fi/8bqjawyqh8vdkfz3nbyyn/Naqeebali_Shamsi_Resume.pdf?rlkey=h9dbrtmc3cf8q4030s9zyoz46&dl=0", // Set to empty to hide the button
   displayGreeting: true // Set false to hide this section, defaults to true
@@ -52,11 +52,11 @@ const skillsSection = {
   subTitle: "Versatile Full Stack Developer Committed to Mastering Diverse Tech Stacks",
   skills: [
     emoji(
-      "⚡ Develop highly scalable full-stack applications"
+      "✅ Architect highly scalable, robust full-stack applications optimized for performance and maintainability."
     ),
-    emoji("⚡ Currently a student at Dalhousie University"),
+    emoji("✅ Academically trained with a forward-thinking approach to software engineering, actively applying theoretical knowledge to practical, real-world problems."),
     emoji(
-      "⚡ Actively looking for full-time opportunities in Software Development"
+      "✅ Actively looking for full-time opportunities in Software Development."
     )
   ],
 
@@ -202,7 +202,7 @@ const workExperiences = {
   experience: [
     {
       "role": "DevOps Developer",
-      "company": "OPAS Mobile Canada",
+      "company": "OPAS Mobile",
       "companylogo": require("./assets/images/opas_mobile.png"),
       "date": "September 2022 – Present",
       "desc": "Co-op role focused on DevOps methodologies and cloud solutions",

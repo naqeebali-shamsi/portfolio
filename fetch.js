@@ -96,7 +96,7 @@ if (USE_GITHUB_DATA === "true") {
 
 if (MEDIUM_USERNAME !== undefined) {
   console.log(`Fetching Medium blogs data for ${MEDIUM_USERNAME}`);
-  const options = {
+  let options = {
     hostname: "api.rss2json.com",
     path: `/v1/api.json?rss_url=https://medium.com/feed/@${MEDIUM_USERNAME}`,
     port: 443,
@@ -105,21 +105,51 @@ if (MEDIUM_USERNAME !== undefined) {
 
   const req = https.request(options, res => {
     let mediumData = "";
-
+    console.log(`Request URL: ${options.hostname}${options.path}`);
     console.log(`statusCode: ${res.statusCode}`);
     if (res.statusCode !== 200) {
-      throw new Error(ERR.requestMediumFailed);
-    }
+      console.log("First request failed. Retrying with alternate options.");
+      options = {
+        hostname: "feeds.feedburner.com",
+        path: "/medium/FM5SddpE6X0",
+        port: 443,
+        method: "GET"
+      };
+      const retryReq = https.request(options, res => {
+        let retryData = "";
+        console.log(`Request URL: ${options.hostname}${options.path}`);
+        console.log(`statusCode: ${res.statusCode}`);
+        if (res.statusCode !== 200) {
+          throw new Error(ERR.requestMediumFailed);
+        }
 
-    res.on("data", d => {
-      mediumData += d;
-    });
-    res.on("end", () => {
-      fs.writeFile("./public/blogs.json", mediumData, function (err) {
-        if (err) return console.log(err);
-        console.log("saved file to public/blogs.json");
+        res.on("data", d => {
+          retryData += d;
+        });
+        res.on("end", () => {
+          fs.writeFile("./public/blogs.json", retryData, function (err) {
+            if (err) return console.log(err);
+            console.log("saved file to public/blogs.json");
+          });
+        });
       });
-    });
+
+      retryReq.on("error", error => {
+        throw error;
+      });
+
+      retryReq.end();
+    } else {
+      res.on("data", d => {
+        mediumData += d;
+      });
+      res.on("end", () => {
+        fs.writeFile("./public/blogs.json", mediumData, function (err) {
+          if (err) return console.log(err);
+          console.log("saved file to public/blogs.json");
+        });
+      });
+    }
   });
 
   req.on("error", error => {
