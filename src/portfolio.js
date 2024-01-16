@@ -201,39 +201,34 @@ const workExperiences = {
   display: true, //Set it to true to show workExperiences Section
   experience: [
     {
-      "role": "DevOps Developer",
+      "role": "Software Developer Co-op",
       "company": "OPAS Mobile",
       "companylogo": require("./assets/images/opas_mobile.png"),
-      "date": "September 2022 – Present",
-      "desc": "Co-op role focused on DevOps methodologies and cloud solutions",
+      "date": "September 2023 – December 2023",
+      "desc": "Co-op role focused on DevOps methodologies, cloud solutions, and containerization",
       "descBullets": [
-        "🚀 Spearheaded the adoption of Terraform at OPAS Mobile, enhancing operational efficiency and scalability through automated infrastructure provisioning.",
-        "🌐 Actively involved in designing scalable and cost-effective cloud solutions, contributing to multi-cloud architecture plans aligned with business objectives.",
-        "🔧 Revamped CI/CD processes for JavaScript applications, integrating containerization for improved deployment speed and reliability.",
-        "🐳 Led Dockerization of critical applications and established automated nightly build processes, improving build stability.",
-        "💼 Pursuing AWS Cloud Architect and Terraform certifications, demonstrating commitment to professional growth and expertise in cloud solutions."
+        "🚀 Architected QA and nightly servers; authored Terraform code, boosting infrastructure deployment efficiency by 70% and reducing downtime.",
+        "🔧 Configured Kiwi TCMS on AWS Fargate, overcoming challenges due to limited documentation.",
+        "🐳 Led containerization of OPAS Mobile React app, enhancing CI/CD integration via GitHub Actions.",
+        "📚 Contributed to the company's knowledge base with comprehensive documentation and architecture diagrams, improving project onboarding efficiency by 20%."
       ]
     },
     {
       "role": "Software Engineer",
       "company": "Crest Data Systems",
       "companylogo": require("./assets/images/cds.png"),
-      "date": "December 2018 – July 2022",
-      "desc": "Software Engineer specializing in full-stack Splunk App development",
+      "date": "May 2019 – July 2022",
+      "desc": "Software Engineer specializing in full-stack development and system architecture",
       "descBullets": [
-        "🚀 Led a team of 3 in system architecture refinement and Python 2 to 3 migration for Splunk apps, enhancing collaborative success.",
-        "💡 Pioneered Splunk KV Store usage for in-app caching, achieving 15x improvement in data search performance.",
-        "🎨 Conceptualized and developed data-driven dashboards for 6+ Splunk apps using JavaScript and Bootstrap, enhancing user experience.",
-        "🌐 Developed Splunk apps serving 200,000+ daily users, enabling search of 10M+ records within 2 seconds.",
-        "🔗 Crafted 100+ robust REST APIs for 15 Splunk Apps, ensuring scalability and efficient integration.",
-        "🔧 Streamlined software development lifecycle with automated workflows, cutting lead time by 60%.",
-        "🔍 Integrated SonarQube in CI/CD pipeline, driving a 23% reduction in technical debt and elevating code quality.",
-        "🤝 Translated complex business requirements into technical solutions, closely collaborating with stakeholders.",
-        "🔬 Championed software reliability with thorough unit testing and peer code reviews, maintaining high-quality standards.",
-        "📢 Effectively communicated project milestones and technical details to stakeholders, promoting transparency.",
-        "👨‍💻 Initiated professional journey with a 6-month internship, building a Splunk app for visualizing PUBG player data on Microsoft cloud."
+        "🚀 Developed high-performance APIs in Python with PostgreSQL, catering to over 200,000 daily users.",
+        "🎨 Created interactive dashboards using JavaScript, ReactJS, and Bootstrap for high-profile customer-facing apps.",
+        "🔗 Integrated third-party APIs into Splunk apps using Python, increasing usability by 15%.",
+        "🔧 Implemented Jenkins-driven CI/CD pipelines for automated testing and deployment.",
+        "💡 Spearheaded the migration and testing of legacy Splunk apps from Python 2 to 3, ensuring future compatibility.",
+        "🛠️ Developed a Python automation script for JIRA ticket grooming, saving 15 hours per week.",
+        "🤝 Utilized JIRA and Confluence for task tracking and documentation, enhancing team efficiency and agile collaboration."
       ]
-    },
+    }
   ]
 };
 
