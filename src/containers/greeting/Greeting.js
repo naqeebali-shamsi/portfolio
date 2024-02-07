@@ -35,23 +35,9 @@ export default function Greeting() {
                 />
                 <span className="wave-emoji">{emoji("👋")}</span>
               </h1>
-              {/* <p className={isDark ? "dark-mode greeting-text-p" : "greeting-text-p subTitle"}>
-                {greeting.subTitle.split("\\n").map((line, index) => (
-                  <React.Fragment key={index}>
-                    {line}
-                    <br />
-                  </React.Fragment>
-                ))}
-              </p> */}
               <p className={isDark ? "dark-mode greeting-text-p" : "greeting-text-p subTitle"}>
-                Agile in code and philosophy, I craft digital experiences that users didn't know they needed, but deserve.
-                <br />
-                Actively seeking New Grad 2024 roles in Software Development.
-                <br />
-                On the cloud, I’m the <span className="pulse-glow">silver lining</span>, turning 'Oops' into opportunities. Take a look at my work, and let's turn 'What if' into 'What's next'.
+              Real Problems, Creative Solutions: I’m Here to Make Tech Work Harder So We Don’t Have To.
               </p>
-
-
               <SocialMedia />
               <div className="button-greeting-div">
                 <Button text="Contact me" href="#contact" />

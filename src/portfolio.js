@@ -23,7 +23,7 @@ const greeting = {
   username: "Naqeebali Shamsi",
   title: "Hi, I'm",
   subTitle: 
-    `Agile in code and philosophy, I craft digital experiences that users didn't know they needed, but once they have, they can't live without.\\n In the cloud, I’m the ${<u>silver lining</u>}, turning 'Oops' into opportunities. Peek at my work, and let's turn 'What if' into 'What's next'.`
+    `Real Problems, Creative Solutions: I’m Here to Make Tech Work Harder So We Don’t Have To.`
   ,
   resumeLink:
     "https://www.dropbox.com/scl/fi/8bqjawyqh8vdkfz3nbyyn/Naqeebali_Shamsi_Resume.pdf?rlkey=h9dbrtmc3cf8q4030s9zyoz46&dl=0", // Set to empty to hide the button
