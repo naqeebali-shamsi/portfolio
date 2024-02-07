@@ -207,10 +207,10 @@ const workExperiences = {
       "date": "September 2023 – December 2023",
       "desc": "Co-op role focused on DevOps methodologies, cloud solutions, and containerization",
       "descBullets": [
-        "🚀 Architected QA and nightly servers; authored Terraform code, boosting infrastructure deployment efficiency by 70% and reducing downtime.",
-        "🔧 Configured Kiwi TCMS on AWS Fargate, overcoming challenges due to limited documentation.",
-        "🐳 Led containerization of OPAS Mobile React app, enhancing CI/CD integration via GitHub Actions.",
-        "📚 Contributed to the company's knowledge base with comprehensive documentation and architecture diagrams, improving project onboarding efficiency by 20%."
+        "🚀 Architected nightly server with Terraform, achieving a 150% boost in deployment frequency and 90% reduction in downtime.",
+        "🔧 Configured Kiwi TCMS on AWS Fargate, overcoming documentation gaps through independent problem-solving.",
+        "🐳 Containerized OPAS Mobile’s React and Node.js applications, enhancing deployment stability and consistency.",
+        "📚 Contributed to the company’s knowledge base through technical documentation, architecture diagrams and process walkthroughs, improving overall project clarity."
       ]
     },
     {
@@ -220,7 +220,7 @@ const workExperiences = {
       "date": "May 2019 – July 2022",
       "desc": "Software Engineer specializing in full-stack development and system architecture",
       "descBullets": [
-        "🚀 Developed high-performance APIs in Python with PostgreSQL, catering to over 200,000 daily users.",
+        "🚀 Developed high-performance APIs in Python and Node.js with PostgreSQL, serving over 200,000 daily users.",
         "🎨 Created interactive dashboards using JavaScript, ReactJS, and Bootstrap for high-profile customer-facing apps.",
         "🔗 Integrated third-party APIs into Splunk apps using Python, increasing usability by 15%.",
         "🔧 Implemented Jenkins-driven CI/CD pipelines for automated testing and deployment.",
