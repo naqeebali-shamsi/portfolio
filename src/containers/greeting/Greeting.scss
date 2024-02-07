@@ -21,10 +21,6 @@
   color: $subTitle !important;
 }
 
-.greeting-main {
-  display: flex;
-}
-
 .greeting-main > * {
   flex: 1;
   margin-bottom: 30px;
@@ -117,3 +113,21 @@
     width: auto;
   }
 }
+
+@keyframes text-glow {
+  0% {
+    text-shadow: 0 0 5px rgb(232, 225, 225);
+  }
+  50% {
+    text-shadow: 0 0 5px rgb(232, 225, 225);
+  }
+  100% {
+    text-shadow: 0 0 5px rgb(232, 225, 225);
+  }
+}
+
+.pulse-glow {
+  animation: text-glow 1.5s infinite;
+  color: rgb(232, 225, 225);
+}
+

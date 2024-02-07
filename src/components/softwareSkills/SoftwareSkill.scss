@@ -21,6 +21,12 @@
 
 .software-skill-inline > i:hover {
   color: $skillsColor;
+  svg {
+    fill: $skillsColor;
+    path {
+      fill: inherit;
+    }
+  }
 }
 .software-skill-inline > p {
   color: $subTitle;

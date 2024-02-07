@@ -28,21 +28,15 @@ export default function Greeting() {
                 {greeting.title}{" "}
                 <Typewriter
                   options={{
-                    strings: ['Naqeebali', 'a Full Stack Dev', 'a Cloud Developer',],
+                    strings: ['Naqeebali', 'a Solutions Engineer', 'a Cloud Developer',],
                     autoStart: true,
                     loop: true,
                   }}
                 />
                 <span className="wave-emoji">{emoji("👋")}</span>
               </h1>
-              <p
-                className={
-                  isDark
-                    ? "dark-mode greeting-text-p"
-                    : "greeting-text-p subTitle"
-                }
-              >
-                {greeting.subTitle}
+              <p className={isDark ? "dark-mode greeting-text-p" : "greeting-text-p subTitle"}>
+              Real Problems, Creative Solutions: I’m Here to Make Tech Work Harder So We Don’t Have To.
               </p>
               <SocialMedia />
               <div className="button-greeting-div">

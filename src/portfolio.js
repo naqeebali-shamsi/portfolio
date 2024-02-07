@@ -22,9 +22,9 @@ const illustration = {
 const greeting = {
   username: "Naqeebali Shamsi",
   title: "Hi, I'm",
-  subTitle: emoji(
-    "An experienced Software Engineer crafting scalable solutions using Java, JavaScript, and Python. As an AWS Certified Practitioner with robust cloud expertise, I'm excited to drive innovation in your development projects. Explore my work on LinkedIn or GitHub, or contact me directly. Together, let's create excellence!"
-  ),
+  subTitle: 
+    `Real Problems, Creative Solutions: I’m Here to Make Tech Work Harder So We Don’t Have To.`
+  ,
   resumeLink:
     "https://www.dropbox.com/scl/fi/8bqjawyqh8vdkfz3nbyyn/Naqeebali_Shamsi_Resume.pdf?rlkey=h9dbrtmc3cf8q4030s9zyoz46&dl=0", // Set to empty to hide the button
   displayGreeting: true // Set false to hide this section, defaults to true
@@ -52,11 +52,11 @@ const skillsSection = {
   subTitle: "Versatile Full Stack Developer Committed to Mastering Diverse Tech Stacks",
   skills: [
     emoji(
-      "⚡ Develop highly scalable full-stack applications"
+      "✅ Architect highly scalable, robust full-stack applications optimized for performance and maintainability."
     ),
-    emoji("⚡ Currently a student at Dalhousie University"),
+    emoji("✅ Academically trained with a forward-thinking approach to software engineering, actively applying theoretical knowledge to practical, real-world problems."),
     emoji(
-      "⚡ Actively looking for full-time opportunities in Software Development"
+      "✅ Actively looking for full-time opportunities in Software Development."
     )
   ],
 
@@ -120,6 +120,9 @@ https://fontawesome.com/icons?d=gallery */
       skillName: "Figma",
       fontAwesomeClassname: "fa-brands fa-figma"
     },
+    {
+      skillName: "Terraform"
+    }
   ],
   display: true // Set false to hide this section, defaults to true
 };
@@ -157,15 +160,19 @@ const techStack = {
   viewSkillBars: true, //Set it to true to show Proficiency Section
   experience: [
     {
-      Stack: "JavaScript", //Insert stack or technology you have experience in
+      Stack: "AWS Cloud Services",
+      progressPercentage: "90%"
+    },
+    {
+      Stack: "Terraform",
+      progressPercentage: "90%"
+    },
+    {
+      Stack: "MERN", //Insert stack or technology you have experience in
       progressPercentage: "95%" //Insert relative proficiency in percentage
     },
     {
       Stack: "Python",
-      progressPercentage: "90%"
-    },
-    {
-      Stack: "AWS Cloud Services",
       progressPercentage: "90%"
     },
     {
@@ -194,24 +201,34 @@ const workExperiences = {
   display: true, //Set it to true to show workExperiences Section
   experience: [
     {
-      role: "Software Engineer",
-      company: "Crest Data Systems",
-      companylogo: require("./assets/images/cds.png"),
-      date: "May 2019 – August 2022",
-      desc: "Full-stack Splunk App developer",
-      descBullets: [
-        "🚀 Directed a team of 4 in migrating Splunk apps to Python 3, sharpening system design and boosting operational efficiency.",
-        "🎯 Developed over 100 scalable REST APIs and 15 full-stack Splunk apps, tailoring integration solutions for international clients.",
-        "💡 Designed 6+ intuitive dashboards for Splunk applications, employing Python and ReactJS capabilities.",
-        "☁️ Saved up to 50% on operational costs by developing AWS cloud migration solutions, promoting high availability and scalability.",
-        "📊 Devised an automated workflow, reducing ticket turnaround time by 60% and enhancing team collaboration.",
-        "⏱️ Implemented automation pipelines within GitHub and Bitbucket, doubling team productivity.",
-        "🛠️ Ensured software reliability through stringent testing and debugging of software components.",
-        "🔒 Boosted code security by vetting apps for vulnerabilities pre-release, maintaining application integrity and safety.",
-        "➕ Achieved 23% decrease in technical debt by integrating SonarQube, improving code maintainability and quality.",
-        "🎖️ Contributed to a 40% increase in product adoption rate via cost-effective AWS solutions and ReactJS interfaces."
+      "role": "Software Developer Co-op",
+      "company": "OPAS Mobile",
+      "companylogo": require("./assets/images/opas_mobile.png"),
+      "date": "September 2023 – December 2023",
+      "desc": "Co-op role focused on DevOps methodologies, cloud solutions, and containerization",
+      "descBullets": [
+        "🚀 Architected nightly server with Terraform, achieving a 150% boost in deployment frequency and 90% reduction in downtime.",
+        "🔧 Configured Kiwi TCMS on AWS Fargate, overcoming documentation gaps through independent problem-solving.",
+        "🐳 Containerized OPAS Mobile’s React and Node.js applications, enhancing deployment stability and consistency.",
+        "📚 Contributed to the company’s knowledge base through technical documentation, architecture diagrams and process walkthroughs, improving overall project clarity."
       ]
     },
+    {
+      "role": "Software Engineer",
+      "company": "Crest Data Systems",
+      "companylogo": require("./assets/images/cds.png"),
+      "date": "May 2019 – July 2022",
+      "desc": "Software Engineer specializing in full-stack development and system architecture",
+      "descBullets": [
+        "🚀 Developed high-performance APIs in Python and Node.js with PostgreSQL, serving over 200,000 daily users.",
+        "🎨 Created interactive dashboards using JavaScript, ReactJS, and Bootstrap for high-profile customer-facing apps.",
+        "🔗 Integrated third-party APIs into Splunk apps using Python, increasing usability by 15%.",
+        "🔧 Implemented Jenkins-driven CI/CD pipelines for automated testing and deployment.",
+        "💡 Spearheaded the migration and testing of legacy Splunk apps from Python 2 to 3, ensuring future compatibility.",
+        "🛠️ Developed a Python automation script for JIRA ticket grooming, saving 15 hours per week.",
+        "🤝 Utilized JIRA and Confluence for task tracking and documentation, enhancing team efficiency and agile collaboration."
+      ]
+    }
   ]
 };
 
@@ -304,8 +321,8 @@ const blogSection = {
   displayMediumBlogs: "true", // Set true to display fetched medium blogs instead of hardcoded ones
   blogs: [
     {
-      url: "https://blog.usejournal.com/create-a-google-assistant-action-and-win-a-google-t-shirt-and-cloud-credits-4a8d86d76eae",
-      title: "Win a Google Assistant Tshirt and $200 in Google Cloud Credits",
+      url: "https://medium.com/@naqeebali-shamsi/a-guide-to-setting-up-aws-ec2-and-rds-instances-inside-a-secure-vpc-4153656153a5",
+      title: "A Guide to Setting Up AWS EC2 and RDS Instances Inside a Secure VPC",
       description:
         "Do you want to win $200 and Google Assistant Tshirt by creating a Google Assistant Action in less then 30 min?"
     },
