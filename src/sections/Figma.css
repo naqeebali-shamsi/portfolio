@@ -1,0 +1,82 @@
+.figma {
+    padding: var(--section-padding) 2rem;
+    max-width: var(--container-max-width);
+    margin: 0 auto;
+}
+
+.figma-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 350px), 1fr));
+    gap: 2rem;
+    margin-top: 2rem;
+}
+
+.figma-card {
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 1rem;
+    padding: 2.5rem;
+    position: relative;
+    overflow: hidden;
+    transition: all 0.3s ease;
+}
+
+.figma-card:hover {
+    border-color: var(--primary);
+    transform: translateY(-8px);
+}
+
+.figma-icon-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+    width: 24px;
+    margin-bottom: 2rem;
+}
+
+.figma-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background-color: var(--primary);
+    opacity: 0.5;
+}
+
+.figma-dot:nth-child(2) {
+    border-radius: 0 50% 50% 0;
+}
+
+.figma-dot:nth-child(3) {
+    border-radius: 50% 0 0 50%;
+}
+
+.figma-content h3 {
+    font-size: 1.5rem;
+    color: var(--text-primary);
+    margin-bottom: 0.75rem;
+}
+
+.figma-content p {
+    font-size: 1rem;
+    color: var(--text-secondary);
+    margin-bottom: 2.5rem;
+    line-height: 1.5;
+}
+
+.figma-button {
+    display: inline-block;
+    padding: 0.75rem 1.5rem;
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    color: var(--text-primary);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    transition: all 0.2s;
+}
+
+.figma-button:hover {
+    background-color: var(--primary);
+    color: var(--bg-primary);
+    border-color: var(--primary);
+}

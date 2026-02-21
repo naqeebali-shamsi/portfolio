@@ -1,0 +1,35 @@
+.terminal-text {
+    display: inline-flex;
+    align-items: center;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+.terminal-prefix {
+    color: var(--primary);
+    margin-right: 0.5rem;
+}
+
+.terminal-content {
+    color: var(--text-primary);
+}
+
+.terminal-cursor {
+    display: inline-block;
+    width: 0.5em;
+    height: 1.1em;
+    background-color: var(--primary);
+    margin-left: 2px;
+    animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+
+    from,
+    to {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0;
+    }
+}

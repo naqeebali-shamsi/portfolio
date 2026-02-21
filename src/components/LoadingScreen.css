@@ -1,0 +1,48 @@
+.loading-screen {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: #09090b;
+    /* zinc-950 */
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.loading-content {
+    width: 300px;
+    text-align: left;
+}
+
+.terminal-prompt {
+    color: #a3e635;
+    /* lime-400 */
+    margin-bottom: 1rem;
+    font-size: 0.875rem;
+}
+
+.progress-container {
+    height: 2px;
+    background-color: #27272a;
+    width: 100%;
+    margin-bottom: 0.5rem;
+    position: relative;
+    overflow: hidden;
+}
+
+.progress-bar {
+    height: 100%;
+    background-color: #a3e635;
+    box-shadow: 0 0 10px rgba(163, 230, 53, 0.5);
+    transition: width 0.1s ease-out;
+}
+
+.percent-text {
+    color: #a1a1aa;
+    font-size: 0.75rem;
+    text-align: right;
+}

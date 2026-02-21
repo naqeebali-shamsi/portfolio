@@ -1,0 +1,114 @@
+.contact {
+    padding: 8rem 2rem;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+.contact-container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4rem;
+    margin-top: 2rem;
+}
+
+.contact-title {
+    font-size: 3rem;
+    font-weight: 800;
+    color: var(--text-primary);
+    margin-bottom: 1.5rem;
+}
+
+.contact-subtitle {
+    font-size: 1.1rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    margin-bottom: 2.5rem;
+}
+
+.email-link {
+    display: inline-block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--primary);
+    margin-bottom: 3rem;
+    position: relative;
+}
+
+.email-link::after {
+    content: '';
+    position: absolute;
+    bottom: -4px;
+    left: 0;
+    width: 100%;
+    height: 2px;
+    background-color: var(--primary);
+    transform: scaleX(0);
+    transform-origin: right;
+    transition: transform 0.3s ease;
+}
+
+.email-link:hover::after {
+    transform: scaleX(1);
+    transform-origin: left;
+}
+
+.social-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.5rem;
+}
+
+.social-icon {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    transition: all 0.2s;
+}
+
+.social-icon:hover {
+    border-color: var(--primary);
+    color: var(--primary);
+    background-color: rgba(var(--primary-glow), 0.05);
+    transform: translateY(-2px);
+}
+
+.platform-name {
+    text-transform: capitalize;
+}
+
+.contact-terminal .terminal-window {
+    margin-bottom: 0;
+}
+
+.contact-terminal .terminal-body {
+    color: var(--text-secondary);
+}
+
+.prompt {
+    color: var(--primary);
+    margin-right: 0.75rem;
+}
+
+.primary-text {
+    color: var(--text-primary);
+}
+
+@media (max-width: 1024px) {
+    .contact-container {
+        grid-template-columns: 1fr;
+        gap: 4rem;
+    }
+}
+
+@media (max-width: 768px) {
+    .email-link {
+        font-size: 1.1rem;
+    }
+}
