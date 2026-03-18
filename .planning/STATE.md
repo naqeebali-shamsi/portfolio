@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-03-18)
 
 **Core value:** A visitor feels the craft within 2 seconds, reads sharp copy, sees engineering depth, and leaves thinking "this person builds things properly."
-**Current focus:** Phase 3 in progress — Hero Section. Plan 01 complete, Plan 02 (3D element) next.
+**Current focus:** Phase 3 complete — Hero Section done. Ready for Phase 4.
 
 ## Current Position
 
 Phase: 3 of 6 (Hero Section)
-Plan: 1 of 2 in current phase
-Status: In progress
-Last activity: 2026-03-18 — Completed 03-01-PLAN.md
+Plan: 2 of 2 in current phase
+Status: Phase complete
+Last activity: 2026-03-18 — Completed 03-02-PLAN.md
 
-Progress: [██████░░░░] 50%
+Progress: [███████░░░] 58%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 6
+- Total plans completed: 7
 - Average duration: 3.3min
-- Total execution time: 0.33 hours
+- Total execution time: 0.38 hours
 
 **By Phase:**
 
@@ -29,10 +29,10 @@ Progress: [██████░░░░] 50%
 |-------|-------|-------|----------|
 | 01-design-system | 2/2 | 7min | 3.5min |
 | 02-content-sections | 3/3 | 10min | 3.3min |
-| 03-hero-section | 1/2 | 3min | 3min |
+| 03-hero-section | 2/2 | 6min | 3min |
 
 **Recent Trend:**
-- Last 5 plans: 4min, 4min, 3min, 3min, 3min
+- Last 5 plans: 4min, 3min, 3min, 3min, 3min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -60,6 +60,9 @@ Recent decisions affecting current work:
 - Copy SVG icons into SocialLinks rather than importing legacy social-icons.tsx (incompatible dark theme styling)
 - Hero name split across two lines for visual impact at display scale
 - CSS fallback hidden on mobile (text-only hero on small screens)
+- MeshTransmissionMaterial with backside=false to avoid double render cost
+- Canvas unmount (not frameloop="never") for full WebGL context disposal
+- R3F v9 required for React 19 compatibility
 
 ### Pending Todos
 
@@ -72,5 +75,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-18
-Stopped at: Completed 03-01-PLAN.md (Hero layout + typewriter)
+Stopped at: Completed 03-02-PLAN.md (3D glass icosahedron) — Phase 3 complete
 Resume file: None
