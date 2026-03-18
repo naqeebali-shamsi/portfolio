@@ -2,6 +2,13 @@
 // Single source of truth — all section components import from here
 
 // ---------------------------------------------------------------------------
+// Hero
+// ---------------------------------------------------------------------------
+
+export const heroTitles = ["Cloud Developer", "Solution Architect", "Full Stack Developer"] as const;
+export const heroTagline = "Engineering systems that scale — from infrastructure to interface.";
+
+// ---------------------------------------------------------------------------
 // How I Build — Manifesto Statements
 // ---------------------------------------------------------------------------
 
