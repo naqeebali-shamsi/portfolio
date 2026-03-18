@@ -1,0 +1,96 @@
+import { useState } from 'react';
+import { useScrollDirection } from '@/hooks/useScrollDirection';
+import clsx from 'clsx';
+
+const NAV_LINKS = [
+  { label: 'How I Build', href: '#how-i-build' },
+  { label: 'Work', href: '#work' },
+  { label: 'Experience', href: '#experience' },
+  { label: 'Contact', href: '#contact' },
+] as const;
+
+export function Navbar() {
+  const { direction, isAtTop } = useScrollDirection();
+  const [mobileOpen, setMobileOpen] = useState(false);
+
+  const isHidden = direction === 'down' && !isAtTop && !mobileOpen;
+
+  return (
+    <>
+      <nav
+        className={clsx(
+          'fixed top-0 left-0 right-0 z-50 h-16 transition-transform duration-300 ease-smooth',
+          isHidden && '-translate-y-full',
+          !isAtTop && 'bg-bg/80 backdrop-blur-md border-b border-accent-light/20',
+        )}
+      >
+        <div className="max-w-container mx-auto h-full px-6 flex items-center justify-between">
+          {/* Logo */}
+          <a
+            href="#"
+            className="font-heading text-lg font-bold tracking-heading text-text"
+          >
+            NS
+          </a>
+
+          {/* Desktop links */}
+          <div className="hidden md:flex items-center gap-8">
+            {NAV_LINKS.map((link) => (
+              <a
+                key={link.href}
+                href={link.href}
+                className="font-body text-sm text-text-muted hover:text-accent transition-colors"
+              >
+                {link.label}
+              </a>
+            ))}
+          </div>
+
+          {/* Hamburger button (mobile) */}
+          <button
+            className="md:hidden relative w-6 h-5 flex flex-col justify-between"
+            onClick={() => setMobileOpen((prev) => !prev)}
+            aria-label="Toggle menu"
+          >
+            <span
+              className={clsx(
+                'block w-full h-0.5 bg-text transition-all duration-300 origin-center',
+                mobileOpen && 'translate-y-[9px] rotate-45',
+              )}
+            />
+            <span
+              className={clsx(
+                'block w-full h-0.5 bg-text transition-opacity duration-300',
+                mobileOpen && 'opacity-0',
+              )}
+            />
+            <span
+              className={clsx(
+                'block w-full h-0.5 bg-text transition-all duration-300 origin-center',
+                mobileOpen && '-translate-y-[9px] -rotate-45',
+              )}
+            />
+          </button>
+        </div>
+      </nav>
+
+      {/* Mobile overlay */}
+      {mobileOpen && (
+        <div className="fixed inset-0 z-40 bg-bg flex items-center justify-center">
+          <div className="flex flex-col items-center gap-8">
+            {NAV_LINKS.map((link) => (
+              <a
+                key={link.href}
+                href={link.href}
+                onClick={() => setMobileOpen(false)}
+                className="font-heading text-4xl font-bold uppercase tracking-heading text-text hover:text-accent transition-colors"
+              >
+                {link.label}
+              </a>
+            ))}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
