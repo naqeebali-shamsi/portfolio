@@ -10,28 +10,28 @@ See: .planning/PROJECT.md (updated 2026-03-18)
 ## Current Position
 
 Phase: 1 of 6 (Design System)
-Plan: 0 of 2 in current phase
-Status: Ready to plan
-Last activity: 2026-03-18 — Roadmap created
+Plan: 1 of 2 in current phase
+Status: In progress
+Last activity: 2026-03-18 — Completed 01-01-PLAN.md
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [█░░░░░░░░░] 8%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 0
-- Average duration: -
-- Total execution time: 0 hours
+- Total plans completed: 1
+- Average duration: 3min
+- Total execution time: 0.05 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| - | - | - | - |
+| 01-design-system | 1/2 | 3min | 3min |
 
 **Recent Trend:**
-- Last 5 plans: -
-- Trend: -
+- Last 5 plans: 3min
+- Trend: baseline
 
 *Updated after each plan completion*
 
@@ -45,6 +45,9 @@ Recent decisions affecting current work:
 - GSAP only, no Framer Motion (saves ~30KB, superior for scroll-linked animations)
 - Light theme with extreme whitespace (blunar-inspired)
 - 3D in hero only, lazy-loaded with CSS fallback
+- Tailwind 4 @theme in CSS replaces tailwind.config.js (no JS config)
+- Fontsource self-hosting replaces Google Fonts CDN
+- Single light theme replaces multi-theme ThemeContext system
 
 ### Pending Todos
 
@@ -57,5 +60,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-18
-Stopped at: Roadmap created, ready to plan Phase 1
+Stopped at: Completed 01-01-PLAN.md
 Resume file: None
