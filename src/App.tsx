@@ -1,6 +1,8 @@
 import { Navbar } from '@/components/Navbar/Navbar';
 import { HowIBuild } from '@/sections/HowIBuild';
 import { CaseStudy } from '@/sections/CaseStudy';
+import { Experience } from '@/sections/Experience';
+import { Contact } from '@/sections/Contact';
 
 export default function App() {
   return (
@@ -17,18 +19,8 @@ export default function App() {
         </section>
         <HowIBuild />
         <CaseStudy />
-        <section id="experience" className="bg-bg-feature py-section px-8">
-          <div className="max-w-container mx-auto">
-            <h2 className="font-heading text-5xl uppercase tracking-heading font-bold">
-              EXPERIENCE
-            </h2>
-          </div>
-        </section>
-        <section id="contact" className="py-section px-8 max-w-container mx-auto">
-          <h2 className="font-heading text-5xl uppercase tracking-heading font-bold text-accent">
-            CONTACT
-          </h2>
-        </section>
+        <Experience />
+        <Contact />
       </main>
     </div>
   );
