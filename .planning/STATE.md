@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-03-18)
 
 **Core value:** A visitor feels the craft within 2 seconds, reads sharp copy, sees engineering depth, and leaves thinking "this person builds things properly."
-**Current focus:** Phase 2 complete — Content Sections done. Ready for Phase 3.
+**Current focus:** Phase 3 in progress — Hero Section. Plan 01 complete, Plan 02 (3D element) next.
 
 ## Current Position
 
-Phase: 2 of 6 (Content Sections) -- COMPLETE
-Plan: 3 of 3 in current phase
-Status: Phase complete
-Last activity: 2026-03-18 — Completed 02-03-PLAN.md
+Phase: 3 of 6 (Hero Section)
+Plan: 1 of 2 in current phase
+Status: In progress
+Last activity: 2026-03-18 — Completed 03-01-PLAN.md
 
-Progress: [█████░░░░░] 42%
+Progress: [██████░░░░] 50%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 5
-- Average duration: 3.4min
-- Total execution time: 0.28 hours
+- Total plans completed: 6
+- Average duration: 3.3min
+- Total execution time: 0.33 hours
 
 **By Phase:**
 
@@ -29,9 +29,10 @@ Progress: [█████░░░░░] 42%
 |-------|-------|-------|----------|
 | 01-design-system | 2/2 | 7min | 3.5min |
 | 02-content-sections | 3/3 | 10min | 3.3min |
+| 03-hero-section | 1/2 | 3min | 3min |
 
 **Recent Trend:**
-- Last 5 plans: 3min, 4min, 4min, 3min, 3min
+- Last 5 plans: 4min, 4min, 3min, 3min, 3min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -57,6 +58,8 @@ Recent decisions affecting current work:
 - Structural full-width breakout pattern (not CSS 100vw trick) for case study sections
 - ArchBox/Arrow as private helper components within CaseStudy (not exported)
 - Copy SVG icons into SocialLinks rather than importing legacy social-icons.tsx (incompatible dark theme styling)
+- Hero name split across two lines for visual impact at display scale
+- CSS fallback hidden on mobile (text-only hero on small screens)
 
 ### Pending Todos
 
@@ -69,5 +72,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-18
-Stopped at: Completed 02-03-PLAN.md (Phase 2 complete)
+Stopped at: Completed 03-01-PLAN.md (Hero layout + typewriter)
 Resume file: None
