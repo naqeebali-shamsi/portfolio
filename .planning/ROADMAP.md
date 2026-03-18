@@ -75,11 +75,11 @@ Plans:
   1. GSAP ScrollTrigger drives section reveals — content fades/slides in as sections enter the viewport
   2. Text stagger animations and parallax effects are present on at least the hero and case study sections
   3. Interactive elements (links, project cards, nav items) have hover micro-interactions (scale, color shift, or underline animation)
-**Plans**: TBD
+**Plans:** 2 plans
 
 Plans:
-- [ ] 04-01: ScrollTrigger setup and section reveal animations
-- [ ] 04-02: Parallax effects, text staggers, and hover micro-interactions
+- [ ] 04-01-PLAN.md — GSAP infrastructure setup, ScrollTrigger registration, and section reveal animations for all content sections
+- [ ] 04-02-PLAN.md — Hero parallax, case study pin-and-scrub, nav underline, timeline expand-on-hover, social link scale
 
 ### Phase 5: Custom Cursor
 **Goal**: Desktop visitors see a custom cursor that morphs contextually — another detail that signals craft
