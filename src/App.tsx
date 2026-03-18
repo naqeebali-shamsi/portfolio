@@ -1,5 +1,6 @@
 import { Navbar } from '@/components/Navbar/Navbar';
 import { HowIBuild } from '@/sections/HowIBuild';
+import { CaseStudy } from '@/sections/CaseStudy';
 
 export default function App() {
   return (
@@ -15,14 +16,7 @@ export default function App() {
           </p>
         </section>
         <HowIBuild />
-        <section id="work" className="py-section px-8 max-w-container mx-auto">
-          <h2 className="font-heading text-5xl uppercase tracking-heading font-bold">
-            WORK
-          </h2>
-          <p className="font-body text-base text-text-muted mt-4">
-            Placeholder for case studies.
-          </p>
-        </section>
+        <CaseStudy />
         <section id="experience" className="bg-bg-feature py-section px-8">
           <div className="max-w-container mx-auto">
             <h2 className="font-heading text-5xl uppercase tracking-heading font-bold">
