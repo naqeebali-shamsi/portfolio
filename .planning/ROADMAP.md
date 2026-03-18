@@ -45,12 +45,12 @@ Plans:
   2. NomadCrew case study shows problem, approach, technical decisions, architecture overview, embedded screenshots, and app store links in a full-width scroll layout
   3. Experience timeline displays companies (Crest Data Systems, Opas Mobile, Propwise, Outlier AI, Dalhousie) with years and role titles — no resume dump
   4. Contact section reveals email through an interaction (not plain text) and shows LinkedIn, GitHub, and Twitter/X links
-**Plans**: TBD
+**Plans:** 3 plans
 
 Plans:
-- [ ] 02-01: How I Build section
-- [ ] 02-02: NomadCrew case study
-- [ ] 02-03: Experience timeline and contact section
+- [ ] 02-01-PLAN.md — Typed content data layer and "How I Build" manifesto section
+- [ ] 02-02-PLAN.md — NomadCrew case study with full-width breakout and CSS device frames
+- [ ] 02-03-PLAN.md — Experience timeline, contact footer with click-to-copy, and final App.tsx wiring
 
 ### Phase 3: Hero Section
 **Goal**: A visitor lands and the hero immediately communicates "premium" — name, rotating titles, tagline, and a 3D element that responds to the cursor
