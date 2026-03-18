@@ -1,10 +1,12 @@
+import React, { Suspense } from 'react';
 import { HeroText } from './HeroText';
 import { HeroCSSFallback } from './HeroCSSFallback';
 import { useDeviceCapability } from '@/hooks/useDeviceCapability';
 
+const HeroScene = React.lazy(() => import('./HeroScene'));
+
 export function Hero() {
-  // Store capability for Plan 02 (3D element conditional rendering)
-  const { canRender3D: _canRender3D } = useDeviceCapability();
+  const { canRender3D } = useDeviceCapability();
 
   return (
     <section
@@ -19,7 +21,13 @@ export function Hero() {
 
         {/* Right — 3D element or CSS fallback */}
         <div className="flex-1 w-full hidden lg:flex items-center justify-center">
-          <HeroCSSFallback />
+          {canRender3D ? (
+            <Suspense fallback={<HeroCSSFallback />}>
+              <HeroScene />
+            </Suspense>
+          ) : (
+            <HeroCSSFallback />
+          )}
         </div>
       </div>
     </section>
