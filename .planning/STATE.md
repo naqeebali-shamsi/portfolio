@@ -5,33 +5,33 @@
 See: .planning/PROJECT.md (updated 2026-03-18)
 
 **Core value:** A visitor feels the craft within 2 seconds, reads sharp copy, sees engineering depth, and leaves thinking "this person builds things properly."
-**Current focus:** Phase 2 in progress — Content Sections
+**Current focus:** Phase 2 complete — Content Sections done. Ready for Phase 3.
 
 ## Current Position
 
-Phase: 2 of 6 (Content Sections)
-Plan: 2 of 3 in current phase
-Status: In progress
-Last activity: 2026-03-18 — Completed 02-02-PLAN.md
+Phase: 2 of 6 (Content Sections) -- COMPLETE
+Plan: 3 of 3 in current phase
+Status: Phase complete
+Last activity: 2026-03-18 — Completed 02-03-PLAN.md
 
-Progress: [████░░░░░░] 33%
+Progress: [█████░░░░░] 42%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
-- Average duration: 3.5min
-- Total execution time: 0.23 hours
+- Total plans completed: 5
+- Average duration: 3.4min
+- Total execution time: 0.28 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-design-system | 2/2 | 7min | 3.5min |
-| 02-content-sections | 2/3 | 7min | 3.5min |
+| 02-content-sections | 3/3 | 10min | 3.3min |
 
 **Recent Trend:**
-- Last 5 plans: 3min, 4min, 4min, 3min
+- Last 5 plans: 3min, 4min, 4min, 3min, 3min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -56,6 +56,7 @@ Recent decisions affecting current work:
 - HowIBuild manifesto style: no heading, statements only, reflective tone
 - Structural full-width breakout pattern (not CSS 100vw trick) for case study sections
 - ArchBox/Arrow as private helper components within CaseStudy (not exported)
+- Copy SVG icons into SocialLinks rather than importing legacy social-icons.tsx (incompatible dark theme styling)
 
 ### Pending Todos
 
@@ -68,5 +69,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-18
-Stopped at: Completed 02-02-PLAN.md
+Stopped at: Completed 02-03-PLAN.md (Phase 2 complete)
 Resume file: None
