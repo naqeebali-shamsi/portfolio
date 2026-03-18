@@ -78,10 +78,10 @@
 | HERO-04 | Phase 3 | Pending |
 | HERO-05 | Phase 3 | Pending |
 | HERO-06 | Phase 5 | Pending |
-| CONT-01 | Phase 2 | Pending |
-| CONT-02 | Phase 2 | Pending |
-| CONT-03 | Phase 2 | Pending |
-| CONT-04 | Phase 2 | Pending |
+| CONT-01 | Phase 2 | Complete |
+| CONT-02 | Phase 2 | Complete |
+| CONT-03 | Phase 2 | Complete |
+| CONT-04 | Phase 2 | Complete |
 | DESG-01 | Phase 1 | Complete |
 | DESG-02 | Phase 1 | Complete |
 | DESG-03 | Phase 1 | Complete |
