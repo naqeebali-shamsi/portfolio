@@ -33,17 +33,23 @@ export function GlassIcosahedron({ mouse }: GlassIcosahedronProps) {
   });
 
   return (
-    <mesh ref={meshRef}>
-      <icosahedronGeometry args={[1.5, 0]} />
+    <mesh ref={meshRef} scale={2.5}>
+      <icosahedronGeometry args={[1, 0]} />
       <MeshTransmissionMaterial
+        background={new THREE.Color('#FAFAF5')}
         color="#70ABAF"
-        transmission={0.95}
-        roughness={0.1}
-        thickness={0.5}
-        chromaticAberration={0.03}
+        transmission={0.97}
+        roughness={0.05}
+        thickness={0.3}
+        chromaticAberration={0.06}
+        anisotropicBlur={0.3}
+        distortion={0.2}
+        distortionScale={0.3}
+        temporalDistortion={0.1}
         resolution={256}
         samples={6}
-        backside={false}
+        backside
+        backsideThickness={0.3}
       />
     </mesh>
   );

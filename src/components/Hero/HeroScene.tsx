@@ -1,5 +1,6 @@
 import { useRef, useState, useEffect, useCallback } from 'react';
 import { Canvas } from '@react-three/fiber';
+import { Environment } from '@react-three/drei';
 import { GlassIcosahedron } from './GlassIcosahedron';
 
 export default function HeroScene() {
@@ -44,8 +45,9 @@ export default function HeroScene() {
           gl={{ alpha: true, antialias: true }}
           style={{ background: 'transparent' }}
         >
-          <ambientLight intensity={0.5} />
-          <directionalLight position={[5, 5, 5]} intensity={1} />
+          <ambientLight intensity={0.8} />
+          <directionalLight position={[5, 5, 5]} intensity={1.2} />
+          <Environment preset="studio" environmentIntensity={0.5} />
           <GlassIcosahedron mouse={mouseRef} />
         </Canvas>
       )}
