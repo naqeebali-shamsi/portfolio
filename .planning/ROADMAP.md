@@ -61,11 +61,11 @@ Plans:
   2. A 3D geometric element (R3F) loads behind React.lazy + Suspense and responds to cursor movement
   3. Before 3D loads (and on devices with low hardwareConcurrency/deviceMemory), a CSS-only fallback renders that looks intentional — gradient, blur, or static shape
   4. WebGL context is disposed when user scrolls past the hero section (verified via devtools — no lingering GPU usage)
-**Plans**: TBD
+**Plans:** 2 plans
 
 Plans:
-- [ ] 03-01: Hero layout, typewriter, and CSS fallback
-- [ ] 03-02: R3F 3D element with lazy loading, device detection, and WebGL disposal
+- [ ] 03-01-PLAN.md — Hero layout, GSAP typewriter, CSS fallback, and device capability detection
+- [ ] 03-02-PLAN.md — R3F glass icosahedron with lazy loading, cursor follow, and WebGL disposal
 
 ### Phase 4: Scroll Animations
 **Goal**: Every section has scroll-driven motion — the site feels alive and intentional as the user scrolls, not static
