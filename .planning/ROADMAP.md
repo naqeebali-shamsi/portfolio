@@ -30,11 +30,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. A consistent light color palette (near-white background, dark text, accent colors) is applied site-wide via Tailwind config
   3. Sections have generous whitespace — padding and margins create visible breathing room between all content blocks
   4. Navigation element exists (floating or hidden overlay) and links to section anchors
-**Plans**: TBD
+**Plans:** 2 plans
 
 Plans:
-- [ ] 01-01: Typography and color system setup
-- [ ] 01-02: Whitespace tokens, layout grid, and navigation component
+- [ ] 01-01-PLAN.md — Strip legacy dark theme, install Fontsource fonts, create @theme design tokens and base styles
+- [ ] 01-02-PLAN.md — Scroll-aware navigation component with mobile overlay and section anchors
 
 ### Phase 2: Content Sections
 **Goal**: All non-hero content is on the page with real copy, readable and properly structured — the site tells a story when scrolled
