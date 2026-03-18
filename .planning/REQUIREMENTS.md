@@ -72,11 +72,11 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| HERO-01 | Phase 3 | Pending |
-| HERO-02 | Phase 3 | Pending |
-| HERO-03 | Phase 3 | Pending |
-| HERO-04 | Phase 3 | Pending |
-| HERO-05 | Phase 3 | Pending |
+| HERO-01 | Phase 3 | Complete |
+| HERO-02 | Phase 3 | Complete |
+| HERO-03 | Phase 3 | Complete |
+| HERO-04 | Phase 3 | Complete |
+| HERO-05 | Phase 3 | Complete |
 | HERO-06 | Phase 5 | Pending |
 | CONT-01 | Phase 2 | Complete |
 | CONT-02 | Phase 2 | Complete |

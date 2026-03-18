@@ -60,7 +60,8 @@ Recent decisions affecting current work:
 - Copy SVG icons into SocialLinks rather than importing legacy social-icons.tsx (incompatible dark theme styling)
 - Hero name split across two lines for visual impact at display scale
 - CSS fallback hidden on mobile (text-only hero on small screens)
-- MeshTransmissionMaterial with backside=false to avoid double render cost
+- MeshTransmissionMaterial needs Environment preset + background color to look like glass (not opaque black)
+- backside=true with backsideThickness for realistic glass refraction
 - Canvas unmount (not frameloop="never") for full WebGL context disposal
 - R3F v9 required for React 19 compatibility
 
