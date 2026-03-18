@@ -10,28 +10,28 @@ See: .planning/PROJECT.md (updated 2026-03-18)
 ## Current Position
 
 Phase: 2 of 6 (Content Sections)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: In progress
-Last activity: 2026-03-18 — Completed 02-01-PLAN.md
+Last activity: 2026-03-18 — Completed 02-02-PLAN.md
 
-Progress: [███░░░░░░░] 25%
+Progress: [████░░░░░░] 33%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 3
-- Average duration: 3.7min
-- Total execution time: 0.18 hours
+- Total plans completed: 4
+- Average duration: 3.5min
+- Total execution time: 0.23 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-design-system | 2/2 | 7min | 3.5min |
-| 02-content-sections | 1/3 | 4min | 4min |
+| 02-content-sections | 2/3 | 7min | 3.5min |
 
 **Recent Trend:**
-- Last 5 plans: 3min, 4min, 4min
+- Last 5 plans: 3min, 4min, 4min, 3min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -54,6 +54,8 @@ Recent decisions affecting current work:
 - 10px scroll threshold for useScrollDirection to prevent jitter
 - Centralized typed content file (src/data/content.ts) as single source of truth for all section data
 - HowIBuild manifesto style: no heading, statements only, reflective tone
+- Structural full-width breakout pattern (not CSS 100vw trick) for case study sections
+- ArchBox/Arrow as private helper components within CaseStudy (not exported)
 
 ### Pending Todos
 
@@ -66,5 +68,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-18
-Stopped at: Completed 02-01-PLAN.md
+Stopped at: Completed 02-02-PLAN.md
 Resume file: None
