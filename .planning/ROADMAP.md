@@ -12,7 +12,7 @@ Build a premium minimalist portfolio from the design system out. Typography, col
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Design System** - Typography, colors, whitespace, and navigation foundation
+- [x] **Phase 1: Design System** - Typography, colors, whitespace, and navigation foundation
 - [ ] **Phase 2: Content Sections** - How I Build, NomadCrew case study, experience timeline, contact
 - [ ] **Phase 3: Hero Section** - Name, typewriter, tagline with CSS layout and 3D geometric element
 - [ ] **Phase 4: Scroll Animations** - GSAP ScrollTrigger for all section reveals, parallax, and micro-interactions
@@ -33,8 +33,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans:** 2 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Strip legacy dark theme, install Fontsource fonts, create @theme design tokens and base styles
-- [ ] 01-02-PLAN.md — Scroll-aware navigation component with mobile overlay and section anchors
+- [x] 01-01-PLAN.md — Strip legacy dark theme, install Fontsource fonts, create @theme design tokens and base styles
+- [x] 01-02-PLAN.md — Scroll-aware navigation component with mobile overlay and section anchors
 
 ### Phase 2: Content Sections
 **Goal**: All non-hero content is on the page with real copy, readable and properly structured — the site tells a story when scrolled
@@ -118,7 +118,7 @@ Note: Phases 2 and 3 can execute in parallel (both depend only on Phase 1).
 
 | Phase | Plans Complete | Status | Completed |
 |-------|---------------|--------|-----------|
-| 1. Design System | 0/2 | Not started | - |
+| 1. Design System | 2/2 | ✓ Complete | 2026-03-18 |
 | 2. Content Sections | 0/3 | Not started | - |
 | 3. Hero Section | 0/2 | Not started | - |
 | 4. Scroll Animations | 0/2 | Not started | - |

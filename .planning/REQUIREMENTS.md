@@ -82,10 +82,10 @@
 | CONT-02 | Phase 2 | Pending |
 | CONT-03 | Phase 2 | Pending |
 | CONT-04 | Phase 2 | Pending |
-| DESG-01 | Phase 1 | Pending |
-| DESG-02 | Phase 1 | Pending |
-| DESG-03 | Phase 1 | Pending |
-| DESG-04 | Phase 1 | Pending |
+| DESG-01 | Phase 1 | Complete |
+| DESG-02 | Phase 1 | Complete |
+| DESG-03 | Phase 1 | Complete |
+| DESG-04 | Phase 1 | Complete |
 | ANIM-01 | Phase 4 | Pending |
 | ANIM-02 | Phase 4 | Pending |
 | ANIM-03 | Phase 4 | Pending |
