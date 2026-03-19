@@ -15,7 +15,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Design System** - Typography, colors, whitespace, and navigation foundation
 - [x] **Phase 2: Content Sections** - How I Build, NomadCrew case study, experience timeline, contact
 - [x] **Phase 3: Hero Section** - Name, typewriter, tagline with CSS layout and 3D geometric element
-- [ ] **Phase 4: Scroll Animations** - GSAP ScrollTrigger for all section reveals, parallax, and micro-interactions
+- [x] **Phase 4: Scroll Animations** - GSAP ScrollTrigger for all section reveals, parallax, and micro-interactions
 - [ ] **Phase 5: Custom Cursor** - Desktop cursor that morphs on interactive elements
 - [ ] **Phase 6: Ship** - Mobile responsive, performance budget, SEO, Vercel deployment
 
@@ -78,8 +78,8 @@ Plans:
 **Plans:** 2 plans
 
 Plans:
-- [ ] 04-01-PLAN.md — GSAP infrastructure setup, ScrollTrigger registration, and section reveal animations for all content sections
-- [ ] 04-02-PLAN.md — Hero parallax, case study pin-and-scrub, nav underline, timeline expand-on-hover, social link scale
+- [x] 04-01-PLAN.md — GSAP infrastructure setup, ScrollTrigger registration, and section reveal animations for all content sections
+- [x] 04-02-PLAN.md — Hero parallax, case study pin-and-scrub, nav underline, timeline expand-on-hover, social link scale
 
 ### Phase 5: Custom Cursor
 **Goal**: Desktop visitors see a custom cursor that morphs contextually — another detail that signals craft
@@ -121,6 +121,6 @@ Note: Phases 2 and 3 can execute in parallel (both depend only on Phase 1).
 | 1. Design System | 2/2 | ✓ Complete | 2026-03-18 |
 | 2. Content Sections | 3/3 | ✓ Complete | 2026-03-18 |
 | 3. Hero Section | 2/2 | ✓ Complete | 2026-03-18 |
-| 4. Scroll Animations | 0/2 | Not started | - |
+| 4. Scroll Animations | 2/2 | Complete | 2026-03-19 |
 | 5. Custom Cursor | 0/1 | Not started | - |
 | 6. Ship | 0/2 | Not started | - |

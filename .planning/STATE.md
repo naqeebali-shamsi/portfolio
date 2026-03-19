@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-03-18)
 
 **Core value:** A visitor feels the craft within 2 seconds, reads sharp copy, sees engineering depth, and leaves thinking "this person builds things properly."
-**Current focus:** Phase 4 in progress — Scroll Animations. Plan 01 complete, Plan 02 remaining.
+**Current focus:** Phase 4 complete — Scroll Animations. Ready for Phase 5 (Custom Cursor).
 
 ## Current Position
 
-Phase: 4 of 6 (Scroll Animations)
-Plan: 1 of 2 in current phase
-Status: In progress
-Last activity: 2026-03-19 — Completed 04-01-PLAN.md
+Phase: 4 of 6 (Scroll Animations) -- COMPLETE
+Plan: 2 of 2 in current phase
+Status: Phase complete
+Last activity: 2026-03-19 — Completed 04-02-PLAN.md
 
-Progress: [████████░░] 62%
+Progress: [█████████░] 75%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 8
-- Average duration: 4.5min
-- Total execution time: 0.60 hours
+- Total plans completed: 9
+- Average duration: 4.6min
+- Total execution time: 0.69 hours
 
 **By Phase:**
 
@@ -30,11 +30,11 @@ Progress: [████████░░] 62%
 | 01-design-system | 2/2 | 7min | 3.5min |
 | 02-content-sections | 3/3 | 10min | 3.3min |
 | 03-hero-section | 2/2 | 6min | 3min |
-| 04-scroll-animations | 1/2 | 13min | 13min |
+| 04-scroll-animations | 2/2 | 18min | 9min |
 
 **Recent Trend:**
-- Last 5 plans: 3min, 3min, 3min, 3min, 13min
-- Trend: stable (04-01 longer due to 4-section animation scope)
+- Last 5 plans: 3min, 3min, 3min, 13min, 5min
+- Trend: stable
 
 *Updated after each plan completion*
 
@@ -68,6 +68,10 @@ Recent decisions affecting current work:
 - power3.out easing for all scroll reveals (GSAP equivalent of cubic-bezier(0.16, 1, 0.3, 1))
 - data-reveal attributes instead of CSS classes for animation targeting
 - gsap.matchMedia wrapping entire animation block for clean reduced-motion support
+- CSS for simple hovers, GSAP contextSafe for complex multi-property animations
+- Pin on section element (not nested child) for pin-and-scrub to avoid layout breaks
+- pointerenter + hover media query guard for touch device compatibility
+- fromTo() for scrubbed animations to avoid immediateRender conflict
 
 ### Pending Todos
 
@@ -80,5 +84,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-19
-Stopped at: Completed 04-01-PLAN.md (GSAP infrastructure + scroll reveal animations)
+Stopped at: Completed 04-02-PLAN.md (parallax, pin-and-scrub, hover micro-interactions)
 Resume file: None
