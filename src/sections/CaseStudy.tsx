@@ -1,12 +1,47 @@
+import { useRef } from 'react';
+import { gsap, useGSAP } from '@/lib/gsap';
 import { caseStudy } from '@/data/content';
 import { DeviceFrame } from '@/components/DeviceFrame';
 import { Smartphone, ExternalLink } from 'lucide-react';
 
 export function CaseStudy() {
+  const sectionRef = useRef<HTMLElement>(null);
+
+  useGSAP(
+    () => {
+      const mm = gsap.matchMedia();
+
+      mm.add('(prefers-reduced-motion: no-preference)', () => {
+        const intro = sectionRef.current?.querySelector('[data-reveal="intro"]');
+        const arch = sectionRef.current?.querySelector('[data-reveal="arch"]');
+        const approach = sectionRef.current?.querySelector('[data-reveal="approach"]');
+
+        const targets = [intro, arch, approach].filter(Boolean) as HTMLElement[];
+        const starts = ['top 80%', 'top 75%', 'top 85%'];
+
+        targets.forEach((el, i) => {
+          gsap.set(el, { opacity: 0, y: 40 });
+          gsap.to(el, {
+            opacity: 1,
+            y: 0,
+            duration: 0.7,
+            ease: 'power3.out',
+            scrollTrigger: {
+              trigger: el,
+              start: starts[i],
+              once: true,
+            },
+          });
+        });
+      });
+    },
+    { scope: sectionRef }
+  );
+
   return (
-    <section id="work" className="py-section scroll-mt-20">
+    <section ref={sectionRef} id="work" className="py-section scroll-mt-20">
       {/* 1. Contained intro */}
-      <div className="max-w-container mx-auto px-8">
+      <div data-reveal="intro" className="max-w-container mx-auto px-8">
         <p className="text-sm uppercase tracking-wide text-text-muted font-heading">
           Case Study
         </p>
@@ -19,7 +54,7 @@ export function CaseStudy() {
       </div>
 
       {/* 2. Full-width breakout -- architecture + screenshots */}
-      <div className="w-full bg-bg-feature mt-16 py-16">
+      <div data-reveal="arch" className="w-full bg-bg-feature mt-16 py-16">
         <div className="max-w-container mx-auto px-8">
           <div className="grid lg:grid-cols-2 gap-12 items-start">
             {/* LEFT column -- Architecture diagram */}
@@ -95,7 +130,7 @@ export function CaseStudy() {
       </div>
 
       {/* 3. Contained outro -- approach */}
-      <div className="max-w-container mx-auto px-8 mt-16">
+      <div data-reveal="approach" className="max-w-container mx-auto px-8 mt-16">
         <p className="text-sm uppercase tracking-wide text-text-muted font-heading mb-4">
           Approach
         </p>
