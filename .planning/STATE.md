@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-03-18)
 
 **Core value:** A visitor feels the craft within 2 seconds, reads sharp copy, sees engineering depth, and leaves thinking "this person builds things properly."
-**Current focus:** Phase 3 complete — Hero Section done. Ready for Phase 4.
+**Current focus:** Phase 4 in progress — Scroll Animations. Plan 01 complete, Plan 02 remaining.
 
 ## Current Position
 
-Phase: 3 of 6 (Hero Section)
-Plan: 2 of 2 in current phase
-Status: Phase complete
-Last activity: 2026-03-18 — Completed 03-02-PLAN.md
+Phase: 4 of 6 (Scroll Animations)
+Plan: 1 of 2 in current phase
+Status: In progress
+Last activity: 2026-03-19 — Completed 04-01-PLAN.md
 
-Progress: [███████░░░] 58%
+Progress: [████████░░] 62%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 7
-- Average duration: 3.3min
-- Total execution time: 0.38 hours
+- Total plans completed: 8
+- Average duration: 4.5min
+- Total execution time: 0.60 hours
 
 **By Phase:**
 
@@ -30,10 +30,11 @@ Progress: [███████░░░] 58%
 | 01-design-system | 2/2 | 7min | 3.5min |
 | 02-content-sections | 3/3 | 10min | 3.3min |
 | 03-hero-section | 2/2 | 6min | 3min |
+| 04-scroll-animations | 1/2 | 13min | 13min |
 
 **Recent Trend:**
-- Last 5 plans: 4min, 3min, 3min, 3min, 3min
-- Trend: stable
+- Last 5 plans: 3min, 3min, 3min, 3min, 13min
+- Trend: stable (04-01 longer due to 4-section animation scope)
 
 *Updated after each plan completion*
 
@@ -64,6 +65,9 @@ Recent decisions affecting current work:
 - backside=true with backsideThickness for realistic glass refraction
 - Canvas unmount (not frameloop="never") for full WebGL context disposal
 - R3F v9 required for React 19 compatibility
+- power3.out easing for all scroll reveals (GSAP equivalent of cubic-bezier(0.16, 1, 0.3, 1))
+- data-reveal attributes instead of CSS classes for animation targeting
+- gsap.matchMedia wrapping entire animation block for clean reduced-motion support
 
 ### Pending Todos
 
@@ -75,6 +79,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-18
-Stopped at: Completed 03-02-PLAN.md (3D glass icosahedron) — Phase 3 complete
+Last session: 2026-03-19
+Stopped at: Completed 04-01-PLAN.md (GSAP infrastructure + scroll reveal animations)
 Resume file: None
