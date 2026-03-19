@@ -1,3 +1,6 @@
+import { useEffect } from 'react';
+import '@/lib/gsap';
+import { ScrollTrigger } from '@/lib/gsap';
 import { Navbar } from '@/components/Navbar/Navbar';
 import { Hero } from '@/components/Hero/Hero';
 import { HowIBuild } from '@/sections/HowIBuild';
@@ -6,6 +9,10 @@ import { Experience } from '@/sections/Experience';
 import { Contact } from '@/sections/Contact';
 
 export default function App() {
+  useEffect(() => {
+    document.fonts.ready.then(() => ScrollTrigger.refresh());
+  }, []);
+
   return (
     <div className="min-h-screen bg-bg text-text">
       <Navbar />
