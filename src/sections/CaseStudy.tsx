@@ -11,29 +11,88 @@ export function CaseStudy() {
     () => {
       const mm = gsap.matchMedia();
 
-      mm.add('(prefers-reduced-motion: no-preference)', () => {
-        const intro = sectionRef.current?.querySelector('[data-reveal="intro"]');
-        const arch = sectionRef.current?.querySelector('[data-reveal="arch"]');
-        const approach = sectionRef.current?.querySelector('[data-reveal="approach"]');
+      mm.add(
+        {
+          desktop: '(min-width: 768px) and (prefers-reduced-motion: no-preference)',
+          mobile: '(max-width: 767px) and (prefers-reduced-motion: no-preference)',
+        },
+        (context) => {
+          const { desktop, mobile } = context.conditions!;
 
-        const targets = [intro, arch, approach].filter(Boolean) as HTMLElement[];
-        const starts = ['top 80%', 'top 75%', 'top 85%'];
+          const intro = sectionRef.current?.querySelector('.cs-intro') as HTMLElement | null;
+          const arch = sectionRef.current?.querySelector('.cs-architecture') as HTMLElement | null;
+          const approach = sectionRef.current?.querySelector('.cs-approach') as HTMLElement | null;
 
-        targets.forEach((el, i) => {
-          gsap.set(el, { opacity: 0, y: 40 });
-          gsap.to(el, {
-            opacity: 1,
-            y: 0,
-            duration: 0.7,
-            ease: 'power3.out',
-            scrollTrigger: {
-              trigger: el,
-              start: starts[i],
-              once: true,
-            },
-          });
-        });
-      });
+          if (desktop) {
+            // Pin-and-scrub sequential reveal
+            if (intro && arch && approach) {
+              // Set initial hidden states
+              gsap.set(arch, { opacity: 0, y: 60 });
+              gsap.set(approach, { opacity: 0, y: 60 });
+
+              const tl = gsap.timeline({
+                scrollTrigger: {
+                  trigger: sectionRef.current,
+                  pin: true,
+                  scrub: 1,
+                  start: 'top top',
+                  end: '+=200%',
+                },
+              });
+
+              // Phase 1: Intro is visible, then slides up/fades
+              tl.fromTo(
+                intro,
+                { opacity: 1, y: 0 },
+                { opacity: 0, y: -40, duration: 0.3 }
+              );
+
+              // Phase 2: Architecture block reveals
+              tl.fromTo(
+                arch,
+                { opacity: 0, y: 60 },
+                { opacity: 1, y: 0, duration: 0.3 }
+              );
+
+              // Phase 2b: Architecture slides up/fades
+              tl.fromTo(
+                arch,
+                { opacity: 1, y: 0 },
+                { opacity: 0, y: -40, duration: 0.3 },
+                '+=0.1'
+              );
+
+              // Phase 3: Approach block reveals
+              tl.fromTo(
+                approach,
+                { opacity: 0, y: 60 },
+                { opacity: 1, y: 0, duration: 0.3 }
+              );
+            }
+          }
+
+          if (mobile) {
+            // Simple stagger reveals (no pin, no scrub)
+            const targets = [intro, arch, approach].filter(Boolean) as HTMLElement[];
+            const starts = ['top 80%', 'top 75%', 'top 85%'];
+
+            targets.forEach((el, i) => {
+              gsap.set(el, { opacity: 0, y: 40 });
+              gsap.to(el, {
+                opacity: 1,
+                y: 0,
+                duration: 0.7,
+                ease: 'power3.out',
+                scrollTrigger: {
+                  trigger: el,
+                  start: starts[i],
+                  once: true,
+                },
+              });
+            });
+          }
+        }
+      );
     },
     { scope: sectionRef }
   );
@@ -41,7 +100,7 @@ export function CaseStudy() {
   return (
     <section ref={sectionRef} id="work" className="py-section scroll-mt-20">
       {/* 1. Contained intro */}
-      <div data-reveal="intro" className="max-w-container mx-auto px-8">
+      <div className="cs-intro max-w-container mx-auto px-8">
         <p className="text-sm uppercase tracking-wide text-text-muted font-heading">
           Case Study
         </p>
@@ -54,7 +113,7 @@ export function CaseStudy() {
       </div>
 
       {/* 2. Full-width breakout -- architecture + screenshots */}
-      <div data-reveal="arch" className="w-full bg-bg-feature mt-16 py-16">
+      <div className="cs-architecture w-full bg-bg-feature mt-16 py-16">
         <div className="max-w-container mx-auto px-8">
           <div className="grid lg:grid-cols-2 gap-12 items-start">
             {/* LEFT column -- Architecture diagram */}
@@ -130,7 +189,7 @@ export function CaseStudy() {
       </div>
 
       {/* 3. Contained outro -- approach */}
-      <div data-reveal="approach" className="max-w-container mx-auto px-8 mt-16">
+      <div className="cs-approach max-w-container mx-auto px-8 mt-16">
         <p className="text-sm uppercase tracking-wide text-text-muted font-heading mb-4">
           Approach
         </p>
