@@ -1,12 +1,19 @@
-import { useRef } from 'react';
+import { useRef, useCallback, useEffect } from 'react';
 import { gsap, useGSAP } from '@/lib/gsap';
 import { experiences, education } from '@/data/content';
 
 export function Experience() {
   const sectionRef = useRef<HTMLElement>(null);
+  const detailRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const contextRef = useRef<{ contextSafe: (fn: () => void) => () => void } | null>(null);
 
   useGSAP(
-    () => {
+    (_, contextSafe) => {
+      // Store contextSafe for use in event handlers
+      if (contextSafe) {
+        contextRef.current = { contextSafe: contextSafe as (fn: () => void) => () => void };
+      }
+
       const mm = gsap.matchMedia();
 
       mm.add('(prefers-reduced-motion: no-preference)', () => {
@@ -67,6 +74,39 @@ export function Experience() {
     { scope: sectionRef }
   );
 
+  const expandEntry = useCallback((index: number) => {
+    const el = detailRefs.current[index];
+    if (!el || !contextRef.current) return;
+
+    const animate = contextRef.current.contextSafe(() => {
+      // Collapse all others first
+      detailRefs.current.forEach((ref, i) => {
+        if (i !== index && ref) {
+          gsap.to(ref, { height: 0, opacity: 0, duration: 0.25, ease: 'power3.out', overflow: 'hidden' });
+        }
+      });
+      // Expand this one
+      gsap.to(el, { height: 'auto', opacity: 1, duration: 0.3, ease: 'power3.out' });
+    });
+    animate();
+  }, []);
+
+  const collapseEntry = useCallback((index: number) => {
+    const el = detailRefs.current[index];
+    if (!el || !contextRef.current) return;
+
+    const animate = contextRef.current.contextSafe(() => {
+      gsap.to(el, { height: 0, opacity: 0, duration: 0.25, ease: 'power3.out' });
+    });
+    animate();
+  }, []);
+
+  // Only attach hover events on hover-capable devices
+  const supportsHover = useRef(false);
+  useEffect(() => {
+    supportsHover.current = window.matchMedia('(hover: hover)').matches;
+  }, []);
+
   return (
     <section ref={sectionRef} id="experience" className="bg-bg-feature py-section scroll-mt-20">
       <div className="max-w-container mx-auto px-8">
@@ -83,8 +123,18 @@ export function Experience() {
           <div className="absolute left-3 top-2 bottom-2 w-px bg-accent/30" />
 
           <div className="space-y-10">
-            {experiences.map((exp) => (
-              <div key={exp.company} data-reveal="entry" className="relative pl-10">
+            {experiences.map((exp, index) => (
+              <div
+                key={exp.company}
+                data-reveal="entry"
+                className="relative pl-10"
+                onPointerEnter={() => {
+                  if (supportsHover.current) expandEntry(index);
+                }}
+                onPointerLeave={() => {
+                  if (supportsHover.current) collapseEntry(index);
+                }}
+              >
                 {/* Dot */}
                 <div className="absolute left-1.5 top-2 w-3 h-3 rounded-full bg-accent border-2 border-bg-feature" />
 
@@ -96,6 +146,31 @@ export function Experience() {
                 <p className="font-body text-sm text-text-muted mt-1">
                   {exp.oneLiner}
                 </p>
+
+                {/* Expandable details (hidden by default) */}
+                <div
+                  ref={(el) => { detailRefs.current[index] = el; }}
+                  className="overflow-hidden"
+                  style={{ height: 0, opacity: 0 }}
+                >
+                  <div className="pt-3 pb-1">
+                    {/* Tech stack pills */}
+                    <div className="flex flex-wrap gap-2 mb-2">
+                      {exp.techStack.map((tech) => (
+                        <span
+                          key={tech}
+                          className="bg-accent/10 text-accent rounded-full px-2 py-0.5 text-xs font-body"
+                        >
+                          {tech}
+                        </span>
+                      ))}
+                    </div>
+                    {/* Key achievement */}
+                    <p className="font-body text-sm italic text-text-muted">
+                      {exp.keyAchievement}
+                    </p>
+                  </div>
+                </div>
               </div>
             ))}
           </div>

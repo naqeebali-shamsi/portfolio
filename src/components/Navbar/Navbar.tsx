@@ -39,7 +39,7 @@ export function Navbar() {
               <a
                 key={link.href}
                 href={link.href}
-                className="font-body text-sm text-text-muted hover:text-accent transition-colors"
+                className="nav-link relative font-body text-sm text-text-muted hover:text-accent transition-colors"
               >
                 {link.label}
               </a>
@@ -91,6 +91,23 @@ export function Navbar() {
           </div>
         </div>
       )}
+
+      {/* Nav link underline animation styles */}
+      <style>{`
+        .nav-link::after {
+          content: '';
+          position: absolute;
+          bottom: -2px;
+          left: 0;
+          width: 0;
+          height: 1.5px;
+          background-color: var(--color-accent);
+          transition: width 250ms cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        .nav-link:hover::after {
+          width: 100%;
+        }
+      `}</style>
     </>
   );
 }

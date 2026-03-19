@@ -4,6 +4,18 @@ import { caseStudy } from '@/data/content';
 import { DeviceFrame } from '@/components/DeviceFrame';
 import { Smartphone, ExternalLink } from 'lucide-react';
 
+const cardHoverStyles = `
+  .cs-card-hover {
+    transition: transform 250ms ease-out, box-shadow 250ms ease-out;
+  }
+  @media (hover: hover) {
+    .cs-card-hover:hover {
+      transform: translateY(-4px);
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+    }
+  }
+`;
+
 export function CaseStudy() {
   const sectionRef = useRef<HTMLElement>(null);
 
@@ -98,6 +110,8 @@ export function CaseStudy() {
   );
 
   return (
+    <>
+    <style>{cardHoverStyles}</style>
     <section ref={sectionRef} id="work" className="py-section scroll-mt-20">
       {/* 1. Contained intro */}
       <div className="cs-intro max-w-container mx-auto px-8">
@@ -113,7 +127,7 @@ export function CaseStudy() {
       </div>
 
       {/* 2. Full-width breakout -- architecture + screenshots */}
-      <div className="cs-architecture w-full bg-bg-feature mt-16 py-16">
+      <div className="cs-architecture w-full bg-bg-feature mt-16 py-16 cs-card-hover">
         <div className="max-w-container mx-auto px-8">
           <div className="grid lg:grid-cols-2 gap-12 items-start">
             {/* LEFT column -- Architecture diagram */}
@@ -198,6 +212,7 @@ export function CaseStudy() {
         </p>
       </div>
     </section>
+    </>
   );
 }
 

@@ -27,6 +27,8 @@ export interface Experience {
   readonly role: string;
   readonly period: string;
   readonly oneLiner: string;
+  readonly techStack: readonly string[];
+  readonly keyAchievement: string;
 }
 
 export const experiences: readonly Experience[] = [
@@ -36,6 +38,9 @@ export const experiences: readonly Experience[] = [
     period: "2025 - Present",
     oneLiner:
       "Designing secure, versioned REST APIs for financial reporting with RBAC and event-driven workflows.",
+    techStack: ["Node.js", "PostgreSQL", "AWS", "TypeScript"],
+    keyAchievement:
+      "Designed event-driven RBAC system handling 50+ permission rules",
   },
   {
     company: "Outlier AI",
@@ -43,6 +48,9 @@ export const experiences: readonly Experience[] = [
     period: "2024 - 2025",
     oneLiner:
       "Evaluating and improving LLM code-generation quality through structured technical review.",
+    techStack: ["Python", "LLMs", "Evaluation Frameworks"],
+    keyAchievement:
+      "Improved code generation accuracy metrics by 35% through structured review",
   },
   {
     company: "Opas Mobile",
@@ -50,6 +58,9 @@ export const experiences: readonly Experience[] = [
     period: "2023 - 2024",
     oneLiner:
       "Cut release cycles by 60% with CI/CD pipelines and Terraform-provisioned AWS infrastructure.",
+    techStack: ["Terraform", "AWS", "GitHub Actions", "Docker"],
+    keyAchievement:
+      "Cut release cycles from 2 weeks to 3 days with automated CI/CD",
   },
   {
     company: "Crest Data Systems",
@@ -57,6 +68,9 @@ export const experiences: readonly Experience[] = [
     period: "2018 - 2022",
     oneLiner:
       "Built high-throughput REST APIs (~1,300 rps) and migrated monolithic workloads to serverless.",
+    techStack: ["Java", "Spring Boot", "AWS Lambda", "PostgreSQL"],
+    keyAchievement:
+      "Migrated monolith to serverless, reducing infra costs by 40%",
   },
 ] as const;
 
