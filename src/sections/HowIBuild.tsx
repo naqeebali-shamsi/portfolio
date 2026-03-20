@@ -33,8 +33,8 @@ export function HowIBuild() {
 
   return (
     <section ref={sectionRef} id="how-i-build" className="bg-bg-feature py-section scroll-mt-20">
-      <div className="max-w-container mx-auto px-8">
-        <div data-cursor="text" className="space-y-16 md:space-y-24">
+      <div className="max-w-container mx-auto px-5 sm:px-6 lg:px-8">
+        <div data-cursor="text" className="space-y-10 sm:space-y-16 lg:space-y-24">
           {howIBuildStatements.map((statement, index) => (
             <p
               key={index}

@@ -114,11 +114,11 @@ export function CaseStudy() {
     <style>{cardHoverStyles}</style>
     <section ref={sectionRef} id="work" data-cursor="project" className="py-section scroll-mt-20">
       {/* 1. Contained intro */}
-      <div className="cs-intro max-w-container mx-auto px-8">
+      <div className="cs-intro max-w-container mx-auto px-5 sm:px-6 lg:px-8">
         <p className="text-sm uppercase tracking-wide text-text-muted font-heading">
           Case Study
         </p>
-        <h2 className="text-4xl md:text-5xl font-heading font-bold mt-3">
+        <h2 className="text-3xl sm:text-4xl lg:text-5xl font-heading font-bold mt-3">
           {caseStudy.name}
         </h2>
         <p className="font-body text-lg text-text-muted max-w-3xl mt-6">
@@ -128,7 +128,7 @@ export function CaseStudy() {
 
       {/* 2. Full-width breakout -- architecture + screenshots */}
       <div className="cs-architecture w-full bg-bg-feature mt-16 py-16 cs-card-hover">
-        <div className="max-w-container mx-auto px-8">
+        <div className="max-w-container mx-auto px-5 sm:px-6 lg:px-8">
           <div className="grid lg:grid-cols-2 gap-12 items-start">
             {/* LEFT column -- Architecture diagram */}
             <div>
@@ -141,7 +141,7 @@ export function CaseStudy() {
                 <ArchBox label="React Native" sublabel="Mobile Client" />
                 <Arrow />
                 <ArchBox label="Go API" sublabel="REST + WebSockets" />
-                <div className="flex gap-8 items-start">
+                <div className="flex gap-4 sm:gap-8 items-start">
                   <div className="flex flex-col items-center gap-0">
                     <Arrow />
                     <ArchBox label="PostgreSQL" sublabel="Relational Data" />
@@ -175,7 +175,7 @@ export function CaseStudy() {
                     <span>App Screenshot</span>
                   </div>
                 </DeviceFrame>
-                <DeviceFrame className="flex-shrink-0">
+                <DeviceFrame className="hidden sm:block flex-shrink-0">
                   <div className="flex flex-col items-center justify-center h-full bg-bg text-text-muted text-sm gap-3">
                     <Smartphone className="w-8 h-8 opacity-40" />
                     <span>App Screenshot</span>
@@ -204,7 +204,7 @@ export function CaseStudy() {
       </div>
 
       {/* 3. Contained outro -- approach */}
-      <div className="cs-approach max-w-container mx-auto px-8 mt-16">
+      <div className="cs-approach max-w-container mx-auto px-5 sm:px-6 lg:px-8 mt-16">
         <p className="text-sm uppercase tracking-wide text-text-muted font-heading mb-4">
           Approach
         </p>
@@ -230,7 +230,7 @@ function ArchBox({
 }) {
   return (
     <div
-      className={`border rounded-lg px-6 py-3 text-center w-52 ${
+      className={`border rounded-lg px-6 py-3 text-center w-40 sm:w-52 ${
         accent
           ? 'border-accent/40 bg-accent/5'
           : 'border-accent/20 bg-white'

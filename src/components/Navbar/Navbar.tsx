@@ -50,7 +50,7 @@ export function Navbar() {
 
           {/* Hamburger button (mobile) */}
           <button
-            className="md:hidden relative w-6 h-5 flex flex-col justify-between"
+            className="md:hidden relative w-6 h-5 flex flex-col justify-between p-3 -m-3 box-content"
             onClick={() => setMobileOpen((prev) => !prev)}
             aria-label="Toggle menu"
           >
@@ -85,7 +85,7 @@ export function Navbar() {
                 key={link.href}
                 href={link.href}
                 onClick={() => setMobileOpen(false)}
-                className="font-heading text-4xl font-bold uppercase tracking-heading text-text hover:text-accent transition-colors"
+                className="min-h-11 flex items-center font-heading text-4xl font-bold uppercase tracking-heading text-text hover:text-accent transition-colors"
               >
                 {link.label}
               </a>

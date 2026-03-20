@@ -3,7 +3,7 @@ import { Typewriter } from './Typewriter';
 
 export function HeroText() {
   return (
-    <div className="flex flex-col justify-center">
+    <div className="flex flex-col justify-center pb-8 lg:pb-0">
       <h1 className="font-heading text-display uppercase tracking-heading font-bold leading-[0.95]">
         Naqeebali
         <br />

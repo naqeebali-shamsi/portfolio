@@ -32,7 +32,7 @@ const socials = [
 
 export function SocialLinks() {
   return (
-    <div className="flex items-center gap-6">
+    <div className="flex items-center gap-8 sm:gap-6">
       {socials.map((social) => (
         <a
           key={social.name}
@@ -40,7 +40,7 @@ export function SocialLinks() {
           target="_blank"
           rel="noopener noreferrer"
           data-cursor="link"
-          className="text-text-muted hover:text-accent hover:scale-110 transition-all duration-200"
+          className="min-h-11 min-w-11 flex items-center justify-center text-text-muted hover:text-accent hover:scale-110 transition-all duration-200"
           aria-label={social.name}
         >
           {social.icon}

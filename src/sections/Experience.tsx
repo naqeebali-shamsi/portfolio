@@ -1,4 +1,4 @@
-import { useRef, useCallback, useEffect } from 'react';
+import { useRef, useState, useCallback, useEffect } from 'react';
 import { gsap, useGSAP } from '@/lib/gsap';
 import { experiences, education } from '@/data/content';
 
@@ -103,16 +103,29 @@ export function Experience() {
 
   // Only attach hover events on hover-capable devices
   const supportsHover = useRef(false);
+  const [touchOpen, setTouchOpen] = useState<number | null>(null);
   useEffect(() => {
     supportsHover.current = window.matchMedia('(hover: hover)').matches;
   }, []);
 
+  const handleTouchToggle = useCallback((index: number) => {
+    if (supportsHover.current) return;
+    if (touchOpen === index) {
+      collapseEntry(index);
+      setTouchOpen(null);
+    } else {
+      if (touchOpen !== null) collapseEntry(touchOpen);
+      expandEntry(index);
+      setTouchOpen(index);
+    }
+  }, [touchOpen, expandEntry, collapseEntry]);
+
   return (
     <section ref={sectionRef} id="experience" className="bg-bg-feature py-section scroll-mt-20">
-      <div className="max-w-container mx-auto px-8">
+      <div className="max-w-container mx-auto px-5 sm:px-6 lg:px-8">
         <h2
           data-reveal="heading"
-          className="font-heading text-4xl md:text-5xl uppercase tracking-heading font-bold mb-12"
+          className="font-heading text-3xl sm:text-4xl lg:text-5xl uppercase tracking-heading font-bold mb-12"
         >
           EXPERIENCE
         </h2>
@@ -128,6 +141,7 @@ export function Experience() {
                 key={exp.company}
                 data-reveal="entry"
                 className="relative pl-10"
+                onClick={() => handleTouchToggle(index)}
                 onPointerEnter={() => {
                   if (supportsHover.current) expandEntry(index);
                 }}

@@ -38,7 +38,7 @@ export function Contact() {
     <section
       ref={sectionRef}
       id="contact"
-      className="min-h-screen flex flex-col items-center justify-center py-section px-8 scroll-mt-20"
+      className="min-h-[80vh] sm:min-h-screen flex flex-col items-center justify-center py-section px-5 sm:px-6 lg:px-8 scroll-mt-20"
     >
       <div data-reveal="contact" className="flex flex-col items-center">
         <p className="font-heading text-sm uppercase tracking-wide text-text-muted mb-8">
