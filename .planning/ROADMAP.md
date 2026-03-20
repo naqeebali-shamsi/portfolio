@@ -16,7 +16,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 2: Content Sections** - How I Build, NomadCrew case study, experience timeline, contact
 - [x] **Phase 3: Hero Section** - Name, typewriter, tagline with CSS layout and 3D geometric element
 - [x] **Phase 4: Scroll Animations** - GSAP ScrollTrigger for all section reveals, parallax, and micro-interactions
-- [ ] **Phase 5: Custom Cursor** - Desktop cursor that morphs on interactive elements
+- [x] **Phase 5: Custom Cursor** - Desktop cursor that morphs on interactive elements
 - [ ] **Phase 6: Ship** - Mobile responsive, performance budget, SEO, Vercel deployment
 
 ## Phase Details
@@ -92,7 +92,7 @@ Plans:
 **Plans:** 1 plan
 
 Plans:
-- [ ] 05-01-PLAN.md — CustomCursor component with GSAP quickSetter tracking, morph state machine, and data-cursor attributes on all interactive elements
+- [x] 05-01-PLAN.md — CustomCursor component with GSAP quickSetter tracking, morph state machine, and data-cursor attributes on all interactive elements
 
 ### Phase 6: Ship
 **Goal**: The site is live at naqeebali.me, fast on mobile, findable by search engines, and passes performance budget
@@ -122,5 +122,5 @@ Note: Phases 2 and 3 can execute in parallel (both depend only on Phase 1).
 | 2. Content Sections | 3/3 | ✓ Complete | 2026-03-18 |
 | 3. Hero Section | 2/2 | ✓ Complete | 2026-03-18 |
 | 4. Scroll Animations | 2/2 | ✓ Complete | 2026-03-20 |
-| 5. Custom Cursor | 0/1 | Not started | - |
+| 5. Custom Cursor | 1/1 | ✓ Complete | 2026-03-20 |
 | 6. Ship | 0/2 | Not started | - |
