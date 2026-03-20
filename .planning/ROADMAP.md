@@ -89,10 +89,10 @@ Plans:
   1. Default system cursor is replaced by a custom cursor on desktop viewports
   2. Cursor morphs when hovering interactive elements — grows on links, shows text mask on project cards
   3. Custom cursor is not rendered on touch/mobile devices
-**Plans**: TBD
+**Plans:** 1 plan
 
 Plans:
-- [ ] 05-01: Custom cursor component with contextual morphing
+- [ ] 05-01-PLAN.md — CustomCursor component with GSAP quickSetter tracking, morph state machine, and data-cursor attributes on all interactive elements
 
 ### Phase 6: Ship
 **Goal**: The site is live at naqeebali.me, fast on mobile, findable by search engines, and passes performance budget
