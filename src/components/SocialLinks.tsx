@@ -39,6 +39,7 @@ export function SocialLinks() {
           href={social.href}
           target="_blank"
           rel="noopener noreferrer"
+          data-cursor="link"
           className="text-text-muted hover:text-accent hover:scale-110 transition-all duration-200"
           aria-label={social.name}
         >

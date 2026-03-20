@@ -47,6 +47,7 @@ export function Contact() {
 
         <button
           type="button"
+          data-cursor="link"
           onClick={() => copy(contactInfo.email)}
           className={`font-heading text-2xl md:text-4xl lg:text-5xl font-bold tracking-tight transition-colors cursor-pointer ${
             copied ? 'text-accent' : 'text-text hover:text-accent'

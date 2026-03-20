@@ -112,7 +112,7 @@ export function CaseStudy() {
   return (
     <>
     <style>{cardHoverStyles}</style>
-    <section ref={sectionRef} id="work" className="py-section scroll-mt-20">
+    <section ref={sectionRef} id="work" data-cursor="project" className="py-section scroll-mt-20">
       {/* 1. Contained intro */}
       <div className="cs-intro max-w-container mx-auto px-8">
         <p className="text-sm uppercase tracking-wide text-text-muted font-heading">
@@ -190,6 +190,7 @@ export function CaseStudy() {
                     href={caseStudy.repoUrl}
                     target="_blank"
                     rel="noopener noreferrer"
+                    data-cursor="link"
                     className="inline-flex items-center gap-2 text-accent hover:underline font-body text-base"
                   >
                     View on GitHub

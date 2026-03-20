@@ -28,6 +28,7 @@ export function Navbar() {
           {/* Logo */}
           <a
             href="#"
+            data-cursor="link"
             className="font-heading text-lg font-bold tracking-heading text-text"
           >
             NS
@@ -39,6 +40,7 @@ export function Navbar() {
               <a
                 key={link.href}
                 href={link.href}
+                data-cursor="link"
                 className="nav-link relative font-body text-sm text-text-muted hover:text-accent transition-colors"
               >
                 {link.label}
