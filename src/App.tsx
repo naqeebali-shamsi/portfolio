@@ -25,6 +25,9 @@ export default function App() {
         <Experience />
         <Contact />
       </main>
+      <footer className="text-center text-sm text-stone-400 py-4">
+        &copy; 2026 Naqeebali Shamsi
+      </footer>
     </div>
   );
 }
