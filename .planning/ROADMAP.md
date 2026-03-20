@@ -17,7 +17,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 3: Hero Section** - Name, typewriter, tagline with CSS layout and 3D geometric element
 - [x] **Phase 4: Scroll Animations** - GSAP ScrollTrigger for all section reveals, parallax, and micro-interactions
 - [x] **Phase 5: Custom Cursor** - Desktop cursor that morphs on interactive elements
-- [ ] **Phase 6: Ship** - Mobile responsive, performance budget, SEO, Vercel deployment
+- [x] **Phase 6: Ship** - Mobile responsive, performance budget, SEO, Vercel deployment
 
 ## Phase Details
 
@@ -104,11 +104,11 @@ Plans:
   3. Meta tags, Open Graph tags, and JSON-LD person schema are present and validate with structured data testing tools
   4. Site is deployed on Vercel, accessible at naqeebali.me, and serves via CDN
   5. Lighthouse score is 90+ on Performance, Accessibility, Best Practices, and SEO
-**Plans**: TBD
+**Plans:** 2 plans
 
 Plans:
-- [ ] 06-01: Mobile responsive pass and performance optimization
-- [ ] 06-02: SEO markup and Vercel deployment
+- [x] 06-01-PLAN.md — Mobile responsive pass for all sections with touch-friendly interactions, font subsetting, and dependency cleanup
+- [x] 06-02-PLAN.md — SEO markup (meta, OG, Twitter Card, JSON-LD), static OG image, and Vercel deployment config
 
 ## Progress
 
@@ -123,4 +123,4 @@ Note: Phases 2 and 3 can execute in parallel (both depend only on Phase 1).
 | 3. Hero Section | 2/2 | ✓ Complete | 2026-03-18 |
 | 4. Scroll Animations | 2/2 | ✓ Complete | 2026-03-20 |
 | 5. Custom Cursor | 1/1 | ✓ Complete | 2026-03-20 |
-| 6. Ship | 0/2 | Not started | - |
+| 6. Ship | 2/2 | ✓ Complete | 2026-03-20 |
