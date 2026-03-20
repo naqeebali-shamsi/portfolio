@@ -43,4 +43,11 @@
     color: inherit;
     font: inherit;
   }
+
+  .custom-cursor-active,
+  .custom-cursor-active *,
+  .custom-cursor-active *::before,
+  .custom-cursor-active *::after {
+    cursor: none !important;
+  }
 }
