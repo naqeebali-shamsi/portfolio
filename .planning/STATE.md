@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-03-18)
 
 **Core value:** A visitor feels the craft within 2 seconds, reads sharp copy, sees engineering depth, and leaves thinking "this person builds things properly."
-**Current focus:** Phase 6 in progress — Ship (Mobile Responsive & Performance Polish complete).
+**Current focus:** Phase 6 complete — Ship. All phases done.
 
 ## Current Position
 
-Phase: 6 of 6 (Ship)
-Plan: 1 of 2 in current phase
-Status: In progress
-Last activity: 2026-03-20 — Completed 06-01-PLAN.md
+Phase: 6 of 6 (Ship) -- COMPLETE
+Plan: 2 of 2 in current phase
+Status: Phase complete
+Last activity: 2026-03-20 — Completed 06-02-PLAN.md
 
-Progress: [███████████░] 92%
+Progress: [████████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 11
-- Average duration: 4.5min
-- Total execution time: 0.83 hours
+- Total plans completed: 12
+- Average duration: 4.4min
+- Total execution time: 0.88 hours
 
 **By Phase:**
 
@@ -32,10 +32,10 @@ Progress: [███████████░] 92%
 | 03-hero-section | 2/2 | 6min | 3min |
 | 04-scroll-animations | 2/2 | 18min | 9min |
 | 05-custom-cursor | 1/1 | 4min | 4min |
-| 06-ship | 1/2 | 5min | 5min |
+| 06-ship | 2/2 | 9min | 4.5min |
 
 **Recent Trend:**
-- Last 5 plans: 3min, 13min, 5min, 4min, 5min
+- Last 5 plans: 13min, 5min, 4min, 5min, 4min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -81,17 +81,20 @@ Recent decisions affecting current work:
 - useState-based tap-to-expand for Experience entries on touch devices
 - Latin-only font subsets (20+ font files reduced to 4)
 - framer-motion and lodash removed from dependencies
+- Removed keywords meta tag (ignored by Google since 2009)
+- Puppeteer-based OG image generation for reproducibility
+- Footer as separate landmark outside main (preserves scroll animations)
 
 ### Pending Todos
 
-None yet.
+None.
 
 ### Blockers/Concerns
 
-None yet.
+None.
 
 ## Session Continuity
 
 Last session: 2026-03-20
-Stopped at: Completed 06-01-PLAN.md (mobile responsive & performance polish)
+Stopped at: Completed 06-02-PLAN.md (SEO markup, OG image, Vercel config)
 Resume file: None
