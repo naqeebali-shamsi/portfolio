@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-03-18)
 
 **Core value:** A visitor feels the craft within 2 seconds, reads sharp copy, sees engineering depth, and leaves thinking "this person builds things properly."
-**Current focus:** Phase 4 complete — Scroll Animations. Ready for Phase 5 (Custom Cursor).
+**Current focus:** Phase 5 complete — Custom Cursor. Ready for Phase 6 (Final Polish).
 
 ## Current Position
 
-Phase: 4 of 6 (Scroll Animations) -- COMPLETE
-Plan: 2 of 2 in current phase
+Phase: 5 of 6 (Custom Cursor) -- COMPLETE
+Plan: 1 of 1 in current phase
 Status: Phase complete
-Last activity: 2026-03-19 — Completed 04-02-PLAN.md
+Last activity: 2026-03-20 — Completed 05-01-PLAN.md
 
-Progress: [█████████░] 75%
+Progress: [██████████░] 83%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 9
-- Average duration: 4.6min
-- Total execution time: 0.69 hours
+- Total plans completed: 10
+- Average duration: 4.5min
+- Total execution time: 0.75 hours
 
 **By Phase:**
 
@@ -31,9 +31,10 @@ Progress: [█████████░] 75%
 | 02-content-sections | 3/3 | 10min | 3.3min |
 | 03-hero-section | 2/2 | 6min | 3min |
 | 04-scroll-animations | 2/2 | 18min | 9min |
+| 05-custom-cursor | 1/1 | 4min | 4min |
 
 **Recent Trend:**
-- Last 5 plans: 3min, 3min, 3min, 13min, 5min
+- Last 5 plans: 3min, 3min, 13min, 5min, 4min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -72,6 +73,9 @@ Recent decisions affecting current work:
 - Pin on section element (not nested child) for pin-and-scrub to avoid layout breaks
 - pointerenter + hover media query guard for touch device compatibility
 - fromTo() for scrubbed animations to avoid immediateRender conflict
+- GSAP quickSetter for cursor position (zero re-renders at 60fps)
+- Event delegation via data-cursor attributes (components stay cursor-unaware)
+- Four cursor morph states: link, project, text, default
 
 ### Pending Todos
 
@@ -83,6 +87,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-19
-Stopped at: Completed 04-02-PLAN.md (parallax, pin-and-scrub, hover micro-interactions)
+Last session: 2026-03-20
+Stopped at: Completed 05-01-PLAN.md (custom cursor with morph state machine)
 Resume file: None
