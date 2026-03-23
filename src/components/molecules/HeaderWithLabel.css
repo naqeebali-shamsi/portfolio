@@ -1,0 +1,9 @@
+.header-with-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.header-with-label--center {
+  text-align: center;
+}

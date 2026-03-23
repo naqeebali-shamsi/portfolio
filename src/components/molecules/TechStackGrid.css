@@ -1,0 +1,25 @@
+.tech-stack-grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.tech-stack-grid--gap-sm {
+  gap: 0.375rem;
+}
+
+.tech-stack-grid--gap-md {
+  gap: 0.5rem;
+}
+
+.tech-stack-grid--gap-lg {
+  gap: 0.75rem;
+}
+
+.tech-stack-grid__overflow {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  line-height: 1;
+  opacity: 0.7;
+}

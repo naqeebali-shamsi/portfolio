@@ -1,0 +1,94 @@
+.firmware-panel {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-lg);
+  padding: 1.25rem 1.5rem;
+  max-width: 44rem;
+}
+
+.firmware-panel__header,
+.firmware-panel__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+
+.firmware-panel__badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-full);
+  font-size: 0.65rem;
+}
+
+.firmware-panel__divider {
+  height: 1px;
+  background: var(--border);
+  margin: 0.75rem 0;
+}
+
+.firmware-panel__body {
+  padding: 0.5rem 0;
+}
+
+.firmware-panel__entry {
+  display: flex;
+  gap: 1rem;
+  padding: 1rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.firmware-panel__entry:last-child {
+  border-bottom: none;
+}
+
+.firmware-panel__number {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--primary);
+  line-height: 1.6;
+  flex-shrink: 0;
+  padding-top: 0.15rem;
+}
+
+.firmware-panel__text {
+  font-family: var(--font-heading);
+  font-size: 1.25rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  line-height: 1.6;
+}
+
+@media (max-width: 640px) {
+  .firmware-panel {
+    padding: 1rem 1.25rem;
+  }
+  .firmware-panel__text {
+    font-size: 1.1rem;
+  }
+}
+
+.firmware-panel__status {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.firmware-panel__status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--primary);
+  animation: firmware-pulse 2s ease-in-out infinite;
+}
+
+@keyframes firmware-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}

@@ -1,5 +1,5 @@
 .figma {
-    padding: var(--section-padding) 2rem;
+    padding: var(--section-padding) 1rem;
     max-width: var(--container-max-width);
     margin: 0 auto;
 }
@@ -70,7 +70,7 @@
     border: 1px solid var(--border);
     border-radius: 0.5rem;
     color: var(--text-primary);
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 0.8rem;
     transition: all 0.2s;
 }
@@ -79,4 +79,22 @@
     background-color: var(--primary);
     color: var(--bg-primary);
     border-color: var(--primary);
+}
+
+@media (max-width: 768px) {
+    .figma {
+        padding: var(--section-padding) 1rem;
+    }
+
+    .figma-card {
+        padding: 1.75rem;
+    }
+
+    .figma-content h3 {
+        font-size: 1.25rem;
+    }
+
+    .figma-content p {
+        margin-bottom: 1.5rem;
+    }
 }

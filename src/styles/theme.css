@@ -20,8 +20,22 @@
   --color-accent-light: #99E1D9;
 
   /* Fonts */
-  --font-heading: 'Space Grotesk', system-ui, sans-serif;
-  --font-body: 'Inter', system-ui, sans-serif;
+  --font-heading: 'Cal Sans', system-ui, sans-serif;
+  --font-body: 'SUSE', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  /* Semantic tokens */
+  --bg-primary: #FAFAF5;
+  --bg-secondary: rgba(50, 41, 47, 0.03);
+  --surface: rgba(50, 41, 47, 0.02);
+  --border: rgba(50, 41, 47, 0.1);
+  --border-glow: rgba(112, 171, 175, 0.15);
+  --primary: #70ABAF;
+  --primary-glow: 112, 171, 175;
+  --text-primary: #32292F;
+  --text-secondary: #705D56;
+  --container-max-width: 87.5rem;
+  --section-padding: clamp(5rem, 8vw, 6.25rem);
 
   /* Type scale */
   --text-sm: 0.875rem;
@@ -40,7 +54,7 @@
   --text-4xl--line-height: 1.1;
   --text-5xl: 5rem;
   --text-5xl--line-height: 1.05;
-  --text-display: clamp(4rem, 8vw, 8rem);
+  --text-display: clamp(3.25rem, 6.5vw, 6.5rem);
   --text-display--line-height: 0.95;
   --text-display--letter-spacing: 0.05em;
   --text-display--font-weight: 700;
@@ -56,7 +70,7 @@
 
   /* Named spacing tokens */
   --spacing-section: clamp(5rem, 8vw, 6.25rem);
-  --spacing-container: 87.5rem;
+  --spacing-container: 100rem;
 
   /* Border radius */
   --radius-sm: 0.25rem;

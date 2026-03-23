@@ -1,0 +1,104 @@
+/* ---- Container ---- */
+
+.arch-container {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  min-height: 340px;
+}
+
+/* ---- Nodes ---- */
+
+.arch-node {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 140px;
+  height: 70px;
+  background: var(--bg-primary);
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-md);
+  text-align: center;
+  z-index: 2;
+  padding: 0.5rem 0.75rem;
+  transform: translate(-50%, -50%);
+}
+
+.arch-node--accent {
+  border-color: var(--primary);
+}
+
+.arch-node__icon {
+  color: var(--text-secondary);
+  margin-bottom: 0.2rem;
+}
+
+.arch-node--accent .arch-node__icon {
+  color: var(--primary);
+}
+
+.arch-node__label {
+  font-family: var(--font-heading);
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.arch-node__sublabel {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: var(--text-secondary);
+  line-height: 1.2;
+  margin-top: 0.1rem;
+  white-space: nowrap;
+}
+
+/* ---- SVG Beams ---- */
+
+.arch-beams {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
+
+.arch-beam {
+  stroke: var(--border);
+  stroke-width: 1.5;
+  stroke-dasharray: 6 4;
+  stroke-linecap: round;
+  animation: beam-flow 2s linear infinite;
+}
+
+@keyframes beam-flow {
+  0% { stroke-dashoffset: 10; }
+  100% { stroke-dashoffset: 0; }
+}
+
+/* ---- Responsive ---- */
+
+@media (max-width: 639px) {
+  .arch-container {
+    aspect-ratio: 3 / 4;
+    min-height: 400px;
+  }
+
+  .arch-node {
+    width: 110px;
+    height: 56px;
+    left: var(--node-x-m) !important;
+    top: var(--node-y-m) !important;
+  }
+
+  .arch-node__label {
+    font-size: 0.7rem;
+  }
+
+  .arch-node__sublabel {
+    font-size: 0.55rem;
+  }
+}

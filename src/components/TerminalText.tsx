@@ -1,5 +1,5 @@
 import React from 'react';
-import { useTypingEffect } from '../hooks/useTypingEffect';
+import { useTypingEffect } from '@/hooks/useTypingEffect';
 import './TerminalText.css';
 
 const TerminalText = ({ text, speed = 50, delay, prefix = '', showCursor = true }) => {

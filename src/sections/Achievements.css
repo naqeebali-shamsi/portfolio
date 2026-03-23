@@ -1,5 +1,5 @@
 .achievements {
-    padding: var(--section-padding) 2rem;
+    padding: var(--section-padding) 1rem;
     max-width: var(--container-max-width);
     margin: 0 auto;
 }
@@ -58,8 +58,27 @@
 }
 
 .cert-links a {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 0.8rem;
     color: var(--primary);
     font-weight: 700;
+}
+
+@media (max-width: 768px) {
+    .achievements {
+        padding: var(--section-padding) 1rem;
+    }
+
+    .cert-card {
+        padding: 1.25rem;
+    }
+
+    .cert-image {
+        height: 160px;
+        margin-bottom: 1.5rem;
+    }
+
+    .cert-content h3 {
+        font-size: 1.1rem;
+    }
 }

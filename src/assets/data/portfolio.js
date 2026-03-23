@@ -29,7 +29,7 @@ const greeting = {
   username: "Naqeebali Shamsi",
   title: "Hi, I'm",
   subTitle:
-    "Full Stack Engineer with 3+ years of experience building production-grade APIs and data workflows. Specialized in Go, Node.js, and AWS with a focus on security and privacy.",
+    "Full Stack Engineer with 5+ years of experience building production-grade APIs and data workflows. Specialized in Go, Node.js, and AWS with a focus on security and privacy.",
   resumeLink:
     "https://www.dropbox.com/scl/fi/8bqjawyqh8vdkfz3nbyyn/Naqeebali_Shamsi_Resume.pdf?rlkey=h9dbrtmc3cf8q4030s9zyoz46&dl=0", // Set to empty to hide the button
   displayGreeting: true // Set false to hide this section, defaults to true

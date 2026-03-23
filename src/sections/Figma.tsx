@@ -6,10 +6,9 @@ const Figma = ({ figmaData }) => {
 
     return (
         <section className="figma" id="figma">
-            <div className="section-header">
-                <span className="terminal-prompt">~/naqeebali/design$</span>
-                <span className="terminal-command">open design_portfolio.fig</span>
-            </div>
+            <h2 className="text-4xl md:text-5xl font-bold mb-8 text-neutral-100 font-sans tracking-tight">
+                Design Portfolio
+            </h2>
 
             <div className="figma-grid">
                 {figmaData.prototypes.map((design, index) => (

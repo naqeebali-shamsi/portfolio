@@ -6,10 +6,9 @@ const Achievements = ({ achievementData }) => {
 
     return (
         <section className="achievements" id="achievements">
-            <div className="section-header">
-                <span className="terminal-prompt">~/naqeebali/certs$</span>
-                <span className="terminal-command">ls -l</span>
-            </div>
+            <h2 className="text-4xl md:text-5xl font-bold mb-8 text-neutral-100 font-sans tracking-tight">
+                Achievements & Certifications
+            </h2>
 
             <div className="achievements-grid">
                 {achievementData.achievementsCards.map((cert, index) => (

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import gsap from 'gsap';
+import { gsap } from '@/lib/gsap';
 
 interface TypewriterProps {
   titles: readonly string[];

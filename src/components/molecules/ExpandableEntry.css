@@ -1,0 +1,24 @@
+/* ExpandableEntry — expand/collapse container */
+
+.expandable-entry__trigger {
+  cursor: pointer;
+  width: 100%;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.expandable-entry__trigger:focus-visible {
+  outline: 2px solid var(--color-accent, currentColor);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.expandable-entry__content {
+  overflow: hidden;
+  height: 0;
+  opacity: 0;
+}
+
+.expandable-entry--open .expandable-entry__content {
+  height: auto;
+}

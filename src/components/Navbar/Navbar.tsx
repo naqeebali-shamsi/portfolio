@@ -24,7 +24,7 @@ export function Navbar() {
           !isAtTop && 'bg-bg/80 backdrop-blur-md border-b border-accent-light/20',
         )}
       >
-        <div className="max-w-container mx-auto h-full px-6 flex items-center justify-between">
+        <div className="max-w-container mx-auto h-full px-4 sm:px-5 lg:px-6 flex items-center justify-between">
           {/* Logo */}
           <a
             href="#"

@@ -1,0 +1,150 @@
+/* -------------------------------------------------------------------------- */
+/* CareerMap                                                                  */
+/* -------------------------------------------------------------------------- */
+
+.career-map {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  aspect-ratio: 16 / 7;
+}
+
+/* Inner wrapper scales and shifts to zoom into northern hemisphere */
+.career-map__inner {
+  position: absolute;
+  inset: 0;
+  transform: scale(1.8) translateY(-18%);
+  transform-origin: center top;
+}
+
+.career-map__bg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0.25;
+  filter: saturate(0) brightness(0.85);
+  pointer-events: none;
+  user-select: none;
+}
+
+.career-map__overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* Pin dot -- interactive */
+.career-map__pin {
+  cursor: pointer;
+  transition: r 0.2s var(--ease-smooth);
+}
+.career-map__pin:hover {
+  r: 7;
+}
+
+/* Pulse ring animation */
+@keyframes career-map-pulse {
+  0% {
+    r: 12;
+    opacity: 0.35;
+  }
+  100% {
+    r: 22;
+    opacity: 0;
+  }
+}
+.career-map__pulse {
+  animation: career-map-pulse 2s ease-out infinite;
+  pointer-events: none;
+}
+
+/* City labels */
+.career-map__city-label {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  fill: var(--text-primary, #32292F);
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Experience card overlay */
+.career-map__card {
+  position: absolute;
+  background: var(--bg-primary, #FAFAF5);
+  border: 1px solid var(--border, rgba(50, 41, 47, 0.1));
+  border-radius: var(--radius-lg, 0.75rem);
+  padding: 1rem 1.25rem;
+  box-shadow: 0 4px 20px rgba(50, 41, 47, 0.08);
+  max-width: 260px;
+  z-index: 10;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(8px);
+  transition:
+    opacity 0.2s var(--ease-smooth),
+    transform 0.2s var(--ease-smooth);
+}
+.career-map__card--visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.career-map__card-type {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--primary, #70ABAF);
+  margin-bottom: 0.5rem;
+}
+
+.career-map__card-role {
+  font-family: var(--font-heading);
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary, #32292F);
+  margin: 0 0 0.25rem;
+}
+
+.career-map__card-company {
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  color: var(--text-primary, #32292F);
+  margin: 0 0 0.25rem;
+}
+
+.career-map__card-period,
+.career-map__card-location {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-secondary, #705D56);
+  margin: 0;
+}
+
+.career-map__card-period {
+  margin-bottom: 0.125rem;
+}
+
+/* Mobile adjustments */
+@media (max-width: 768px) {
+  .career-map__city-label {
+    font-size: 7px;
+  }
+
+  .career-map__card {
+    max-width: 200px;
+    padding: 0.75rem 1rem;
+  }
+
+  .career-map__card-role {
+    font-size: 0.85rem;
+  }
+
+  .career-map__card-company {
+    font-size: 0.75rem;
+  }
+}

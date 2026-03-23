@@ -1,16 +1,19 @@
 .blogs {
-    padding: var(--section-padding) 2rem;
+    padding: var(--section-padding) 1rem;
     max-width: var(--container-max-width);
     margin: 0 auto;
+    overflow-x: hidden;
 }
 
-.blogs-grid {
+/* Featured cards grid — 2 columns desktop, 1 mobile */
+.blogs-featured {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+    grid-template-columns: repeat(2, 1fr);
     gap: 2rem;
     margin-top: 2rem;
 }
 
+/* Existing card styles */
 .blog-card {
     background-color: var(--surface);
     border: 1px solid var(--border);
@@ -34,7 +37,7 @@
 }
 
 .blog-tag {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 0.7rem;
     color: var(--primary);
     border: 1px solid var(--primary);
@@ -43,7 +46,7 @@
 }
 
 .blog-date {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 0.7rem;
     color: var(--text-secondary);
 }
@@ -64,7 +67,7 @@
 }
 
 .blog-link {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 0.8rem;
     color: var(--primary);
     font-weight: 700;
@@ -81,9 +84,44 @@
     transform: translateX(4px);
 }
 
+/* Archive toggle section */
+.blogs-archive {
+    margin-top: 2rem;
+}
+
+.blogs-archive__toggle {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--primary);
+    cursor: pointer;
+    background: none;
+    border: none;
+    padding: 1rem 0;
+    width: 100%;
+    text-align: left;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.blogs-archive__toggle:hover {
+    opacity: 0.8;
+}
+
+.blogs-archive__chevron {
+    font-size: 0.6rem;
+    transition: transform 0.3s var(--ease-smooth);
+    display: inline-block;
+}
+
+.blogs-archive__chevron--open {
+    transform: rotate(180deg);
+}
+
+/* Status messages */
 .blogs-status {
     margin-top: 2rem;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 0.9rem;
     color: var(--text-secondary);
 }
@@ -98,7 +136,6 @@
 }
 
 @keyframes dots {
-
     0%,
     20% {
         content: '';
@@ -114,5 +151,23 @@
 
     80% {
         content: '...';
+    }
+}
+
+@media (max-width: 768px) {
+    .blogs {
+        padding: 4rem 1rem;
+    }
+
+    .blogs-featured {
+        grid-template-columns: 1fr;
+    }
+
+    .blog-card {
+        padding: 1.5rem;
+    }
+
+    .blog-card h3 {
+        font-size: 1.1rem;
     }
 }

@@ -1,5 +1,5 @@
 .contact {
-    padding: 8rem 2rem;
+    padding: 8rem 1rem;
     max-width: 1200px;
     margin: 0 auto;
 }
@@ -27,7 +27,7 @@
 
 .email-link {
     display: inline-block;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 1.5rem;
     font-weight: 700;
     color: var(--primary);
@@ -60,7 +60,7 @@
 }
 
 .social-icon {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 0.875rem;
     color: var(--text-secondary);
     display: flex;
@@ -108,7 +108,19 @@
 }
 
 @media (max-width: 768px) {
+    .contact {
+        padding: 4rem 1rem;
+    }
+
+    .contact-title {
+        font-size: 2rem;
+    }
+
     .email-link {
         font-size: 1.1rem;
+    }
+
+    .social-links {
+        gap: 0.75rem;
     }
 }

@@ -1,0 +1,28 @@
+.circular-text {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.circular-text__svg {
+  width: 100%;
+  height: 100%;
+  will-change: transform;
+}
+
+.circular-text__svg text {
+  font-family: var(--font-heading);
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.3em;
+  fill: var(--text-primary);
+}
+
+.circular-text__center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}

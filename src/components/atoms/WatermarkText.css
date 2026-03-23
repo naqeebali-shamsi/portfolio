@@ -1,0 +1,14 @@
+.watermark {
+  position: absolute;
+  z-index: 0;
+  pointer-events: none;
+  user-select: none;
+  white-space: nowrap;
+  font-family: var(--font-heading);
+  font-size: clamp(8rem, 15vw, 20rem);
+  font-weight: 800;
+  letter-spacing: -0.05em;
+  line-height: 1;
+  color: rgba(50, 41, 47, 0.04);
+  will-change: transform;
+}

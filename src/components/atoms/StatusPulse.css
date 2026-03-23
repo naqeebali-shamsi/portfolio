@@ -1,0 +1,63 @@
+.status-pulse {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* Dot container — holds both layers */
+.status-pulse__dot {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Outer pulsing ring */
+.status-pulse__ring {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius-full);
+  opacity: 0.5;
+}
+
+/* Static inner dot */
+.status-pulse__core {
+  position: relative;
+  border-radius: var(--radius-full);
+}
+
+/* Label */
+.status-pulse__label {
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  line-height: var(--text-sm--line-height);
+  color: var(--text-secondary);
+}
+
+/* Size variants */
+.status-pulse--sm .status-pulse__dot {
+  width: 16px;
+  height: 16px;
+}
+.status-pulse--sm .status-pulse__core {
+  width: 6px;
+  height: 6px;
+}
+
+.status-pulse--md .status-pulse__dot {
+  width: 24px;
+  height: 24px;
+}
+.status-pulse--md .status-pulse__core {
+  width: 8px;
+  height: 8px;
+}
+
+.status-pulse--lg .status-pulse__dot {
+  width: 32px;
+  height: 32px;
+}
+.status-pulse--lg .status-pulse__core {
+  width: 10px;
+  height: 10px;
+}

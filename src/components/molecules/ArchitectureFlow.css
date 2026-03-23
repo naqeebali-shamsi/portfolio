@@ -1,0 +1,105 @@
+.architecture-flow {
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
+.architecture-flow--vertical {
+  flex-direction: column;
+}
+
+.architecture-flow--horizontal {
+  flex-direction: row;
+}
+
+.architecture-flow--branching {
+  flex-direction: column;
+}
+
+/* ---- Node (ArchBox) ---- */
+
+.architecture-flow__node {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 0.75rem 1.5rem;
+  background: var(--surface);
+  text-align: center;
+  min-width: 10rem;
+}
+
+.architecture-flow__node--accent {
+  border-color: var(--primary);
+  background: rgba(var(--primary-glow), 0.05);
+}
+
+.architecture-flow__node-label {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.3;
+}
+
+.architecture-flow__node-sublabel {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-top: 0.125rem;
+  line-height: 1.3;
+}
+
+/* ---- Connector (ArchArrow) ---- */
+
+.architecture-flow__connector {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(var(--primary-glow), 0.4);
+}
+
+.architecture-flow__connector--vertical {
+  flex-direction: column;
+  padding: 0.25rem 0;
+}
+
+.architecture-flow__connector--vertical .architecture-flow__connector-line {
+  width: 1px;
+  height: 1.5rem;
+  background: rgba(var(--primary-glow), 0.3);
+}
+
+.architecture-flow__connector--horizontal {
+  flex-direction: row;
+  padding: 0 0.25rem;
+}
+
+.architecture-flow__connector--horizontal .architecture-flow__connector-line {
+  height: 1px;
+  width: 1.5rem;
+  background: rgba(var(--primary-glow), 0.3);
+}
+
+.architecture-flow__connector-head {
+  font-size: 0.625rem;
+  line-height: 1;
+}
+
+/* ---- Branch row ---- */
+
+.architecture-flow__branch-row {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.architecture-flow__branch-row > .architecture-flow__branch-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+
+@media (min-width: 640px) {
+  .architecture-flow__branch-row {
+    gap: 2rem;
+  }
+}

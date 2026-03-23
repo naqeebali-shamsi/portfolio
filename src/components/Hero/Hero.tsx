@@ -1,13 +1,11 @@
-import React, { Suspense, useRef } from 'react';
+import { useRef } from 'react';
 import { gsap, useGSAP } from '@/lib/gsap';
 import { HeroText } from './HeroText';
-import { HeroCSSFallback } from './HeroCSSFallback';
-import { useDeviceCapability } from '@/hooks/useDeviceCapability';
-
-const HeroScene = React.lazy(() => import('./HeroScene'));
+import { HeroPortrait } from './HeroPortrait';
+import GravityGrid from '@/components/atoms/GravityGrid';
+import { heroTitles } from '@/data/content';
 
 export function Hero() {
-  const { canRender3D } = useDeviceCapability();
   const sectionRef = useRef<HTMLElement>(null);
 
   useGSAP(
@@ -54,23 +52,28 @@ export function Hero() {
     <section
       ref={sectionRef}
       id="hero"
-      className="min-h-[100dvh] flex items-center px-8 max-w-container mx-auto"
+      className="relative min-h-[100dvh] flex items-center overflow-hidden"
     >
-      <div className="flex flex-col lg:flex-row items-center w-full gap-12 lg:gap-16 py-16">
-        {/* Left -- Text content */}
-        <div data-parallax="text" className="flex-1 w-full">
-          <HeroText />
+      <GravityGrid cellSize={30} strength={0.5} radius={150} stiffness={0.05} damping={0.92} color="rgba(50, 41, 47, 0.08)" />
+      <div className="relative z-10 flex flex-col items-center w-full gap-10 py-12 px-4 sm:px-5 lg:px-6 max-w-container mx-auto">
+        {/* Portrait with marquee behind */}
+        <div data-parallax="visual" className="relative">
+          {/* Title marquee behind the pill */}
+          <div className="hero-marquee" aria-hidden="true">
+            <div className="hero-marquee__track">
+              {[...heroTitles, ...heroTitles, ...heroTitles, ...heroTitles].map((title, i) => (
+                <span key={i} className="hero-marquee__item">{title}</span>
+              ))}
+            </div>
+          </div>
+          <div className="relative z-10">
+            <HeroPortrait />
+          </div>
         </div>
 
-        {/* Right -- 3D element or CSS fallback */}
-        <div data-parallax="visual" className="flex-1 w-full hidden lg:flex items-center justify-center">
-          {canRender3D ? (
-            <Suspense fallback={<HeroCSSFallback />}>
-              <HeroScene />
-            </Suspense>
-          ) : (
-            <HeroCSSFallback />
-          )}
+        {/* Text content */}
+        <div data-parallax="text" className="text-center">
+          <HeroText />
         </div>
       </div>
     </section>

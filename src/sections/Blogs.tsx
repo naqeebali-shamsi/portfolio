@@ -1,20 +1,33 @@
-import React from 'react';
-import useMediumBlogs from '../hooks/useMediumBlogs';
+import React, { useState } from 'react';
+import useMediumBlogs from '@/hooks/useMediumBlogs';
+import SectionLabel from '@/components/atoms/SectionLabel';
+import ExternalLink from '@/components/atoms/ExternalLink';
+import ExpandableEntry from '@/components/molecules/ExpandableEntry';
+import BlogList from '@/components/molecules/BlogList';
 import './Blogs.css';
 
 const Blogs = ({ blogData }) => {
-    const { blogs, isLoading, error } = useMediumBlogs(blogData.displayMediumBlogs === "true" ? 'naqeebali-shamsi' : null);
+    const [expanded, setExpanded] = useState(false);
+    const { blogs, isLoading, error } = useMediumBlogs(
+        blogData.displayMediumBlogs === "true" ? 'naqeebali-shamsi' : null
+    );
 
     if (!blogData.display) return null;
 
-    const displayBlogs = blogData.displayMediumBlogs === "true" ? blogs : blogData.blogs;
+    const displayBlogs = blogData.displayMediumBlogs === "true"
+        ? (isLoading ? blogData.blogs : blogs)
+        : blogData.blogs;
+
+    const featured = displayBlogs.slice(0, 2);
+    const rest = displayBlogs.slice(2);
 
     return (
         <section className="blogs" id="blogs">
-            <div className="section-header">
-                <span className="terminal-prompt">~/naqeebali/blog$</span>
-                <span className="terminal-command">cat latest_posts.json</span>
-            </div>
+            <SectionLabel className="blogs-section-label">posts</SectionLabel>
+
+            <h2 className="text-4xl md:text-5xl font-bold mb-8 text-neutral-100 font-sans tracking-tight">
+                Latest Writing
+            </h2>
 
             {isLoading && blogData.displayMediumBlogs === "true" ? (
                 <div className="blogs-status">
@@ -26,8 +39,8 @@ const Blogs = ({ blogData }) => {
                 </div>
             ) : null}
 
-            <div className="blogs-grid">
-                {(isLoading && blogData.displayMediumBlogs === "true" ? blogData.blogs : displayBlogs).map((blog, index) => (
+            <div className="blogs-featured">
+                {featured.map((blog, index) => (
                     <div key={index} className="blog-card">
                         <div className="blog-header">
                             <span className="blog-tag">POST</span>
@@ -35,12 +48,35 @@ const Blogs = ({ blogData }) => {
                         </div>
                         <h3>{blog.title}</h3>
                         <p>{blog.description}</p>
-                        <a href={blog.url} target="_blank" rel="noopener noreferrer" className="blog-link">
-                            Read More <span>→</span>
-                        </a>
+                        <ExternalLink
+                            href={blog.url}
+                            className="blog-link"
+                            arrow="→"
+                        >
+                            Read More
+                        </ExternalLink>
                     </div>
                 ))}
             </div>
+
+            {rest.length > 0 && (
+                <div className="blogs-archive">
+                    <ExpandableEntry
+                        isOpen={expanded}
+                        onToggle={() => setExpanded(!expanded)}
+                        trigger={
+                            <button className="blogs-archive__toggle" type="button">
+                                <span>View all posts ({displayBlogs.length})</span>
+                                <span className={`blogs-archive__chevron ${expanded ? 'blogs-archive__chevron--open' : ''}`}>
+                                    &#9660;
+                                </span>
+                            </button>
+                        }
+                    >
+                        <BlogList blogs={rest} />
+                    </ExpandableEntry>
+                </div>
+            )}
         </section>
     );
 };

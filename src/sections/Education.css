@@ -1,5 +1,5 @@
 .education {
-    padding: var(--section-padding) 2rem;
+    padding: var(--section-padding) 1rem;
     max-width: var(--container-max-width);
     margin: 0 auto;
 }
@@ -57,7 +57,7 @@
 .degree {
     display: block;
     color: var(--primary);
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 0.9rem;
     margin-bottom: 0.25rem;
 }
@@ -89,13 +89,30 @@
     position: absolute;
     left: 0;
     color: var(--primary);
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
 }
 
 @media (max-width: 768px) {
+    .education {
+        padding: var(--section-padding) 1rem;
+    }
+
     .school-header {
         flex-direction: column;
         align-items: flex-start;
         gap: 1rem;
+    }
+
+    .school-info h3 {
+        font-size: 1.25rem;
+    }
+
+    .school-card {
+        padding: 1.25rem;
+    }
+
+    .school-logo {
+        width: 60px;
+        height: 60px;
     }
 }

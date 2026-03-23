@@ -1,133 +1,75 @@
 import React from "react";
-import { Timeline } from "../components/ui/timeline";
+import { Timeline } from "@/components/ui/timeline";
 
 export default function Journey() {
   const data = [
     {
+      title: "2026",
+      content: (
+        <div>
+          <img src="https://ui-avatars.com/api/?name=Propwise&background=0D8ABC&color=fff&rounded=true" alt="Propwise Logo" className="h-12 w-12 rounded-full mb-4 object-cover" />
+          <h3 className="text-xl md:text-2xl font-bold text-neutral-100 mb-2">Propwise - Full Stack Engineer</h3>
+          <p className="text-neutral-400 text-xs md:text-sm font-normal mb-8 uppercase tracking-wider">Remote</p>
+          <ul className="list-disc pl-5 text-neutral-300 text-sm md:text-base space-y-2 mb-8">
+            <li>Built Python (FastAPI) backend services for property report generation and exports, moving synchronous flows to async job pipelines (SQS + Lambda) and reducing average report latency by ~35%.</li>
+            <li>Designed RBAC-secured APIs and audit logging for investor and advisor roles, hardening multi-tenant access and preventing cross-tenant data exposure in production.</li>
+            <li>Implemented signed URL–based delivery for sensitive reports and enforced short-lived access tokens, aligning document delivery with enterprise security requirements.</li>
+            <li>Introduced prompt versioning and basic regression tests for LLM-assisted features, reducing prompt-related production incidents by ~60% across model and prompt updates.</li>
+          </ul>
+        </div>
+      ),
+    },
+    {
       title: "2024",
       content: (
         <div>
-          <p className="text-neutral-200 text-xs md:text-sm font-normal mb-8">
-            Built and launched Aceternity UI and Aceternity UI Pro from scratch
-          </p>
-          <div className="grid grid-cols-2 gap-4">
-            <img
-              src="https://images.unsplash.com/photo-1555949963-aa79dcee981c?auto=format&fit=crop&w=800&q=80"
-              alt="startup template"
-              className="rounded-lg object-cover h-20 md:h-44 lg:h-60 w-full shadow-[0_0_24px_rgba(34,_42,_53,_0.06),_0_1px_1px_rgba(0,_0,_0,_0.05),_0_0_0_1px_rgba(34,_42,_53,_0.04),_0_0_4px_rgba(34,_42,_53,_0.08),_0_16px_68px_rgba(47,_48,_55,_0.05),_0_1px_0_rgba(255,_255,_255,_0.1)_inset]"
-            />
-            <img
-              src="https://images.unsplash.com/photo-1618401471353-b98afee0b2eb?auto=format&fit=crop&w=800&q=80"
-              alt="startup template"
-              className="rounded-lg object-cover h-20 md:h-44 lg:h-60 w-full shadow-[0_0_24px_rgba(34,_42,_53,_0.06),_0_1px_1px_rgba(0,_0,_0,_0.05),_0_0_0_1px_rgba(34,_42,_53,_0.04),_0_0_4px_rgba(34,_42,_53,_0.08),_0_16px_68px_rgba(47,_48,_55,_0.05),_0_1px_0_rgba(255,_255,_255,_0.1)_inset]"
-            />
-            <img
-              src="https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=800&q=80"
-              alt="startup template"
-              className="rounded-lg object-cover h-20 md:h-44 lg:h-60 w-full shadow-[0_0_24px_rgba(34,_42,_53,_0.06),_0_1px_1px_rgba(0,_0,_0,_0.05),_0_0_0_1px_rgba(34,_42,_53,_0.04),_0_0_4px_rgba(34,_42,_53,_0.08),_0_16px_68px_rgba(47,_48,_55,_0.05),_0_1px_0_rgba(255,_255,_255,_0.1)_inset]"
-            />
-            <img
-              src="https://images.unsplash.com/photo-1525547719571-a2d4ac8945e2?auto=format&fit=crop&w=800&q=80"
-              alt="startup template"
-              className="rounded-lg object-cover h-20 md:h-44 lg:h-60 w-full shadow-[0_0_24px_rgba(34,_42,_53,_0.06),_0_1px_1px_rgba(0,_0,_0,_0.05),_0_0_0_1px_rgba(34,_42,_53,_0.04),_0_0_4px_rgba(34,_42,_53,_0.08),_0_16px_68px_rgba(47,_48,_55,_0.05),_0_1px_0_rgba(255,_255,_255,_0.1)_inset]"
-            />
-          </div>
+          <img src="https://ui-avatars.com/api/?name=Opas+Mobile&background=4CAF50&color=fff&rounded=true" alt="Opas Mobile Logo" className="h-12 w-12 rounded-full mb-4 object-cover" />
+          <h3 className="text-xl md:text-2xl font-bold text-neutral-100 mb-2">Opas Mobile - Software Developer Co-op</h3>
+          <p className="text-neutral-400 text-xs md:text-sm font-normal mb-8 uppercase tracking-wider">Halifax, NS</p>
+          <ul className="list-disc pl-5 text-neutral-300 text-sm md:text-base space-y-2 mb-8">
+            <li>Architected Nightly and QA servers on AWS using Terraform.</li>
+            <li>Upgraded the app deployment process on GitHub Actions, cutting down build times by 78%.</li>
+            <li>Implemented a containerization strategy using Docker and Kubernetes for the OPAS Mobile app.</li>
+            <li>Produced rich technical documentation and user guides on the company’s internal wiki on Notion.</li>
+          </ul>
         </div>
       ),
     },
     {
-      title: "Early 2023",
+      title: "2022",
       content: (
         <div>
-          <p className="text-neutral-200 text-xs md:text-sm font-normal mb-8">
-            I usually run out of copy, but when I see content this big, I try to
-            integrate lorem ipsum.
-          </p>
-          <p className="text-neutral-200 text-xs md:text-sm font-normal mb-8">
-            Lorem ipsum is for people who are too lazy to write copy. But we are
-            not. Here are some more example of beautiful designs I built.
-          </p>
-          <div className="grid grid-cols-2 gap-4">
-            <img
-               src="https://images.unsplash.com/photo-1620712943543-bcc4688e7485?auto=format&fit=crop&w=800&q=80"
-              alt="hero template"
-              className="rounded-lg object-cover h-20 md:h-44 lg:h-60 w-full shadow-[0_0_24px_rgba(34,_42,_53,_0.06),_0_1px_1px_rgba(0,_0,_0,_0.05),_0_0_0_1px_rgba(34,_42,_53,_0.04),_0_0_4px_rgba(34,_42,_53,_0.08),_0_16px_68px_rgba(47,_48,_55,_0.05),_0_1px_0_rgba(255,_255,_255,_0.1)_inset]"
-            />
-            <img
-               src="https://images.unsplash.com/photo-1526374965328-7f61d4dc18c5?auto=format&fit=crop&w=800&q=80"
-              alt="feature template"
-              className="rounded-lg object-cover h-20 md:h-44 lg:h-60 w-full shadow-[0_0_24px_rgba(34,_42,_53,_0.06),_0_1px_1px_rgba(0,_0,_0,_0.05),_0_0_0_1px_rgba(34,_42,_53,_0.04),_0_0_4px_rgba(34,_42,_53,_0.08),_0_16px_68px_rgba(47,_48,_55,_0.05),_0_1px_0_rgba(255,_255,_255,_0.1)_inset]"
-            />
-            <img
-               src="https://images.unsplash.com/photo-1550439062-609e1531270e?auto=format&fit=crop&w=800&q=80"
-              alt="bento template"
-              className="rounded-lg object-cover h-20 md:h-44 lg:h-60 w-full shadow-[0_0_24px_rgba(34,_42,_53,_0.06),_0_1px_1px_rgba(0,_0,_0,_0.05),_0_0_0_1px_rgba(34,_42,_53,_0.04),_0_0_4px_rgba(34,_42,_53,_0.08),_0_16px_68px_rgba(47,_48,_55,_0.05),_0_1px_0_rgba(255,_255,_255,_0.1)_inset]"
-            />
-            <img
-              src="https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=800&q=80"
-              alt="cards template"
-              className="rounded-lg object-cover h-20 md:h-44 lg:h-60 w-full shadow-[0_0_24px_rgba(34,_42,_53,_0.06),_0_1px_1px_rgba(0,_0,_0,_0.05),_0_0_0_1px_rgba(34,_42,_53,_0.04),_0_0_4px_rgba(34,_42,_53,_0.08),_0_16px_68px_rgba(47,_48,_55,_0.05),_0_1px_0_rgba(255,_255,_255,_0.1)_inset]"
-            />
-          </div>
+          <img src="/company/dalLogo.png" alt="Dalhousie Logo" className="h-12 w-12 rounded-full mb-4 object-cover" />
+          <h3 className="text-xl md:text-2xl font-bold text-neutral-100 mb-2">Dalhousie University</h3>
+          <p className="text-primary text-sm md:text-base font-medium mb-1">Master of Applied Computer Science</p>
+          <p className="text-neutral-400 text-xs md:text-sm font-normal mb-8 uppercase tracking-wider">Halifax, NS • GPA: 4.0/4.3</p>
         </div>
       ),
     },
     {
-      title: "Changelog",
+      title: "2019",
       content: (
         <div>
-          <p className="text-neutral-200 text-xs md:text-sm font-normal mb-4">
-            Deployed 5 new components on Aceternity today
-          </p>
-          <div className="mb-8">
-            <div className="flex gap-2 items-center text-neutral-300 text-xs md:text-sm">
-              ✅ Card grid component
-            </div>
-            <div className="flex gap-2 items-center text-neutral-300 text-xs md:text-sm">
-              ✅ Startup template Aceternity
-            </div>
-            <div className="flex gap-2 items-center text-neutral-300 text-xs md:text-sm">
-              ✅ Random file upload lol
-            </div>
-            <div className="flex gap-2 items-center text-neutral-300 text-xs md:text-sm">
-              ✅ Himesh Reshammiya Music CD
-            </div>
-            <div className="flex gap-2 items-center text-neutral-300 text-xs md:text-sm">
-              ✅ Salman Bhai Fan Club registrations open
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <img
-              src="https://images.unsplash.com/photo-1523961131990-5ea7c61b2107?auto=format&fit=crop&w=800&q=80"
-              alt="hero template"
-              className="rounded-lg object-cover h-20 md:h-44 lg:h-60 w-full shadow-[0_0_24px_rgba(34,_42,_53,_0.06),_0_1px_1px_rgba(0,_0,_0,_0.05),_0_0_0_1px_rgba(34,_42,_53,_0.04),_0_0_4px_rgba(34,_42,_53,_0.08),_0_16px_68px_rgba(47,_48,_55,_0.05),_0_1px_0_rgba(255,_255,_255,_0.1)_inset]"
-            />
-            <img
-              src="https://images.unsplash.com/photo-1498050108023-c5249f4df085?auto=format&fit=crop&w=800&q=80"
-              alt="feature template"
-              className="rounded-lg object-cover h-20 md:h-44 lg:h-60 w-full shadow-[0_0_24px_rgba(34,_42,_53,_0.06),_0_1px_1px_rgba(0,_0,_0,_0.05),_0_0_0_1px_rgba(34,_42,_53,_0.04),_0_0_4px_rgba(34,_42,_53,_0.08),_0_16px_68px_rgba(47,_48,_55,_0.05),_0_1px_0_rgba(255,_255,_255,_0.1)_inset]"
-            />
-            <img
-              src="https://images.unsplash.com/photo-1542831371-29b0f74f9713?auto=format&fit=crop&w=800&q=80"
-              alt="bento template"
-              className="rounded-lg object-cover h-20 md:h-44 lg:h-60 w-full shadow-[0_0_24px_rgba(34,_42,_53,_0.06),_0_1px_1px_rgba(0,_0,_0,_0.05),_0_0_0_1px_rgba(34,_42,_53,_0.04),_0_0_4px_rgba(34,_42,_53,_0.08),_0_16px_68px_rgba(47,_48,_55,_0.05),_0_1px_0_rgba(255,_255,_255,_0.1)_inset]"
-            />
-            <img
-              src="https://images.unsplash.com/photo-1551033406-611cf9a28f67?auto=format&fit=crop&w=800&q=80"
-              alt="cards template"
-              className="rounded-lg object-cover h-20 md:h-44 lg:h-60 w-full shadow-[0_0_24px_rgba(34,_42,_53,_0.06),_0_1px_1px_rgba(0,_0,_0,_0.05),_0_0_0_1px_rgba(34,_42,_53,_0.04),_0_0_4px_rgba(34,_42,_53,_0.08),_0_16px_68px_rgba(47,_48,_55,_0.05),_0_1px_0_rgba(255,_255,_255,_0.1)_inset]"
-            />
-          </div>
+          <img src="/company/cds.png" alt="Crest Data Systems Logo" className="h-12 w-12 rounded-full mb-4 object-cover" />
+          <h3 className="text-xl md:text-2xl font-bold text-neutral-100 mb-2">Crest Data Systems - Software Engineer</h3>
+          <p className="text-neutral-400 text-xs md:text-sm font-normal mb-8 uppercase tracking-wider">Ahmedabad, India</p>
+          <ul className="list-disc pl-5 text-neutral-300 text-sm md:text-base space-y-2 mb-8">
+            <li>Enabled real-time stock synchronization across platforms using Kafka, matching a 90% latency reduction.</li>
+            <li>Designed and implemented 100+ scalable REST APIs on a microservices architecture using Java and Python.</li>
+            <li>Crafted a custom, TypeScript-compatible UI library with ReactJS for real-time data visualization.</li>
+            <li>Developed and maintained 11 full-stack Splunk applications in collaboration with Fortune 500 clients.</li>
+            <li>Engineered Jenkins-driven CI/CD pipelines reducing deployment failures by 40%.</li>
+            <li>Streamlined the app-vetting process by developing an AWS Lambda automation script, saving $75,000 annually.</li>
+          </ul>
         </div>
       ),
     },
   ];
   return (
     <section className="about" id="journey">
-      <div className="section-header">
-          <span className="terminal-prompt">~/naqeebali/journey$</span>
-          <span className="terminal-command">cat timeline.md</span>
-      </div>
+      <h2 className="text-4xl md:text-5xl font-bold mb-8 text-neutral-100 font-sans tracking-tight">
+        My Journey
+      </h2>
       <div className="w-full mx-auto" style={{ maxWidth: "1280px" }}>
         <Timeline data={data} />
       </div>

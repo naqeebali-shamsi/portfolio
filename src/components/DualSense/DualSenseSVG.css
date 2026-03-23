@@ -1,0 +1,40 @@
+/* ── DualSense SVG Controller ─────────────────────────────── */
+
+.dualsense {
+  width: 100%;
+  color: var(--text-primary);
+}
+
+/* ── Active button: ONLY the pressed button changes color ─── */
+
+.dualsense-btn--pressed path,
+.dualsense-btn--pressed circle,
+.dualsense-btn--pressed line,
+.dualsense-btn--pressed polygon {
+  stroke: var(--primary) !important;
+  transition: stroke 0.15s ease;
+}
+
+/* D-pad arrow icons use fill="currentColor" — recolor them too */
+.dualsense-btn--pressed path[fill="currentColor"] {
+  fill: var(--primary) !important;
+}
+
+/* ── Clickable buttons ────────────────────────────────────── */
+
+[data-btn] {
+  cursor: pointer;
+}
+
+/* Make the full shape interior clickable, not just the stroke outline */
+[data-btn] path,
+[data-btn] circle,
+[data-btn] polygon {
+  pointer-events: all;
+}
+
+/* ── Trigger path stroke fix ──────────────────────────────── */
+
+.dualsense-trigger-path {
+  stroke: currentColor !important;
+}

@@ -4,10 +4,9 @@ import './About.css';
 const About = ({ education, work, stats, skills }) => {
     return (
         <section className="about" id="about">
-            <div className="section-header">
-                <span className="terminal-prompt">~/naqeebali/about$</span>
-                <span className="terminal-command">cat info.md</span>
-            </div>
+            <h2 className="text-4xl md:text-5xl font-bold mb-8 text-neutral-100 font-sans tracking-tight">
+                About Me
+            </h2>
 
             <div className="about-grid">
                 <div className="about-main">

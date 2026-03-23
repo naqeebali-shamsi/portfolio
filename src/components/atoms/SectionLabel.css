@@ -1,0 +1,10 @@
+.section-label {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  font-weight: 400;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-primary);
+  opacity: 0.5;
+  user-select: none;
+}

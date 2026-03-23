@@ -1,0 +1,68 @@
+.pill-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5em;
+  border: none;
+  border-radius: var(--radius-full);
+  font-family: var(--font-body);
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  text-decoration: none;
+  transition: transform 0.2s var(--ease-smooth),
+              filter 0.2s var(--ease-smooth),
+              background-color 0.2s var(--ease-smooth);
+}
+
+.pill-button:hover {
+  transform: scale(1.02);
+}
+
+/* Variants */
+
+.pill-button--primary {
+  background-color: var(--primary);
+  color: var(--color-white);
+}
+
+.pill-button--primary:hover {
+  filter: brightness(1.08);
+}
+
+.pill-button--secondary {
+  background-color: var(--surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+}
+
+.pill-button--secondary:hover {
+  filter: brightness(0.97);
+}
+
+.pill-button--ghost {
+  background-color: transparent;
+  color: var(--text-secondary);
+  border: none;
+}
+
+.pill-button--ghost:hover {
+  filter: brightness(0.85);
+}
+
+/* Sizes */
+
+.pill-button--sm {
+  padding: 0.375rem 1rem;
+  font-size: var(--text-sm);
+}
+
+.pill-button--md {
+  padding: 0.625rem 1.5rem;
+  font-size: var(--text-base);
+}
+
+.pill-button--lg {
+  padding: 0.75rem 2rem;
+  font-size: var(--text-lg);
+}

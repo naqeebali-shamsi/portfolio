@@ -1,0 +1,120 @@
+/* ── CardWithHeader molecule ── */
+
+.card__anchor {
+  text-decoration: none;
+  color: inherit;
+  display: block;
+}
+
+.card {
+  position: relative;
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  transition: all 0.3s cubic-bezier(0.19, 1, 0.22, 1);
+}
+
+.card:hover {
+  transform: translateY(-4px);
+  border-color: rgba(var(--primary-glow), 0.5);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+
+/* ── Header bar ── */
+
+.card__header {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  padding: 0.85rem 1.25rem;
+  background-color: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+}
+
+/* ── Terminal dots ── */
+
+.card__dots {
+  display: flex;
+  gap: 6px;
+  margin-right: 1.25rem;
+}
+
+.card__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.card__dot--red {
+  background-color: #ff5f56;
+}
+
+.card__dot--yellow {
+  background-color: #ffbd2e;
+}
+
+.card__dot--green {
+  background-color: #27c93f;
+}
+
+/* ── Header text ── */
+
+.card__header-title {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.card__header-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+}
+
+/* ── Body ── */
+
+.card__body {
+  padding: 2rem 1.5rem;
+  flex-grow: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.card__title {
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 0.75rem;
+}
+
+.card__description {
+  font-family: var(--font-body);
+  font-size: 0.95rem;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  margin-bottom: 1.5rem;
+}
+
+/* ── Footer ── */
+
+.card__footer {
+  padding: 0 1.5rem 1.5rem;
+  margin-top: auto;
+}
+
+/* ── Interactive cards (onClick) ── */
+
+.card[role='button'] {
+  cursor: pointer;
+}
+
+.card[role='button']:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}

@@ -1,0 +1,63 @@
+.reveal-email {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  padding: 0.5rem 1.5rem 0.5rem 0.5rem;
+  background: transparent;
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: var(--text-base--line-height);
+  color: var(--text-primary);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* Arrow circle on the left */
+.reveal-email__arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-full);
+  background-color: var(--primary);
+  color: var(--color-white);
+}
+
+.reveal-email__arrow svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* Label shown before reveal */
+.reveal-email__label {
+  white-space: nowrap;
+}
+
+/* Email shown after reveal */
+.reveal-email__email {
+  position: absolute;
+  left: calc(0.5rem + 40px + 0.75rem); /* padding + arrow + gap */
+  opacity: 0;
+  white-space: nowrap;
+  color: var(--text-primary);
+  text-decoration: none;
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: var(--text-base--line-height);
+}
+
+.reveal-email__email:hover {
+  text-decoration: underline;
+  color: var(--primary);
+}
+
+/* Revealed state — disable button cursor */
+.reveal-email--revealed {
+  cursor: default;
+}

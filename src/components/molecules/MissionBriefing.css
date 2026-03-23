@@ -1,0 +1,159 @@
+/* ── MissionBriefing molecule ── */
+
+.mission-briefing {
+  position: relative;
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 1.5rem 2rem;
+  overflow: hidden;
+}
+
+/* Scan-line overlay */
+.mission-briefing::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(50, 41, 47, 0.015) 2px,
+    rgba(50, 41, 47, 0.015) 4px
+  );
+}
+
+/* ── Header ── */
+
+.mission-briefing__header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.mission-briefing__id {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-secondary);
+}
+
+.mission-briefing__divider {
+  font-family: var(--font-mono);
+  color: var(--border);
+  font-size: 0.75rem;
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.mission-briefing__status {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.mission-briefing__status--active {
+  color: var(--primary);
+  animation: flicker 3s ease-in-out infinite;
+}
+
+.mission-briefing__status--complete {
+  color: #27c93f;
+}
+
+.mission-briefing__status--locked {
+  color: var(--text-secondary);
+  opacity: 0.5;
+}
+
+@keyframes flicker {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+/* ── Body ── */
+
+.mission-briefing__body {
+  margin-bottom: 1.25rem;
+}
+
+.mission-briefing__statement {
+  font-family: var(--font-heading);
+  font-size: var(--text-xl);
+  line-height: var(--text-xl--line-height);
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.mission-briefing__desc {
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  line-height: var(--text-sm--line-height);
+  color: var(--text-secondary);
+  margin: 0.5rem 0 0;
+}
+
+/* ── Progress ── */
+
+.mission-briefing__progress {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.mission-briefing__bar-track {
+  flex: 1;
+  height: 3px;
+  background-color: var(--border);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+}
+
+.mission-briefing__bar {
+  height: 100%;
+  background-color: var(--primary);
+  border-radius: var(--radius-full);
+  transition: width 0.6s var(--ease-smooth);
+}
+
+.mission-briefing__percent {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  min-width: 2.5em;
+  text-align: right;
+}
+
+@media (max-width: 640px) {
+  .mission-briefing {
+    padding: 1.25rem 1rem;
+  }
+
+  .mission-briefing__statement {
+    font-size: var(--text-base);
+    line-height: var(--text-base--line-height);
+  }
+
+  .mission-briefing__header {
+    gap: 0.5rem;
+  }
+
+  .mission-briefing__divider {
+    display: none;
+  }
+
+  .mission-briefing__header {
+    justify-content: space-between;
+  }
+}

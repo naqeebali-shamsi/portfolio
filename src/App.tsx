@@ -4,10 +4,14 @@ import { ScrollTrigger } from '@/lib/gsap';
 import { CustomCursor } from '@/components/CustomCursor';
 import { Navbar } from '@/components/Navbar/Navbar';
 import { Hero } from '@/components/Hero/Hero';
-import { HowIBuild } from '@/sections/HowIBuild';
-import { CaseStudy } from '@/sections/CaseStudy';
+import { Skills } from '@/sections/Skills';
 import { Experience } from '@/sections/Experience';
+import { CaseStudy } from '@/sections/CaseStudy';
+import { HowIBuild } from '@/sections/HowIBuild';
+import Projects from '@/sections/Projects';
+import Blogs from '@/sections/Blogs';
 import { Contact } from '@/sections/Contact';
+import { blogSection } from '@/assets/data/portfolio';
 
 export default function App() {
   useEffect(() => {
@@ -20,9 +24,12 @@ export default function App() {
       <Navbar />
       <main>
         <Hero />
-        <HowIBuild />
-        <CaseStudy />
+        <Skills />
         <Experience />
+        <CaseStudy />
+        <HowIBuild />
+        <Projects />
+        <Blogs blogData={blogSection} />
         <Contact />
       </main>
       <footer className="text-center text-sm text-stone-400 py-4">

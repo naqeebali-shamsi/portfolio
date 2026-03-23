@@ -6,10 +6,9 @@ const Education = ({ educationInfo }) => {
 
     return (
         <section className="education" id="education">
-            <div className="section-header">
-                <span className="terminal-prompt">~/naqeebali/edu$</span>
-                <span className="terminal-command">ls -R</span>
-            </div>
+            <h2 className="text-4xl md:text-5xl font-bold mb-8 text-neutral-100 font-sans tracking-tight">
+                Education
+            </h2>
 
             <div className="education-list">
                 {educationInfo.schools.map((school, index) => (

@@ -1,0 +1,282 @@
+.dualsense-wrapper {
+  position: relative;
+  width: 100%;
+}
+
+/* -- Side-by-side layout -- */
+.dualsense-layout {
+  display: grid;
+  grid-template-columns: 3fr 2fr;
+  gap: 2rem;
+  align-items: center;
+  width: 100%;
+}
+
+/* -- Controller -- */
+.dualsense-controller {
+  position: relative;
+  width: 100%;
+  max-width: 900px;
+  justify-self: end;
+  animation: float 4.8s ease-in-out infinite;
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-8px); }
+}
+
+.dualsense-controller__svg-container {
+  position: relative;
+  width: 100%;
+}
+
+.dualsense-controller__waveform-overlay {
+  position: absolute;
+  top: 31%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 19%;
+  height: 19%;
+  pointer-events: none;
+  z-index: 2;
+  overflow: hidden;
+  border-radius: 8%;
+}
+
+/* -- Keyboard hint -- */
+.dualsense-controller__hint {
+  margin-top: 1rem;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  opacity: 0.5;
+  line-height: 1.8;
+}
+
+.dualsense-controller__hint kbd {
+  display: inline-block;
+  padding: 0.1rem 0.35rem;
+  margin: 0 0.1rem;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: var(--text-primary);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  line-height: 1;
+}
+
+/* ── Monitor Display ─────────────────────────────────────── */
+
+.skill-monitor {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.skill-monitor__bezel {
+  width: 100%;
+  background: var(--text-primary);
+  border-radius: 12px;
+  padding: 2px;
+  box-shadow:
+    0 8px 32px rgba(50, 41, 47, 0.15),
+    0 2px 8px rgba(50, 41, 47, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.skill-monitor__top-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.skill-monitor__dots {
+  display: flex;
+  gap: 5px;
+}
+
+.skill-monitor__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.skill-monitor__dot--red { background: #ff5f56; }
+.skill-monitor__dot--yellow { background: #ffbd2e; }
+.skill-monitor__dot--green { background: #27c93f; }
+
+.skill-monitor__title {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: rgba(255, 255, 255, 0.4);
+  letter-spacing: 0.05em;
+}
+
+.skill-monitor__screen {
+  background: #1a1a1a;
+  margin: 0 2px 2px;
+  border-radius: 0 0 10px 10px;
+  min-height: 220px;
+  padding: 1.25rem 1.5rem;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Subtle scan-line texture */
+.skill-monitor__screen::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(255, 255, 255, 0.015) 2px,
+    rgba(255, 255, 255, 0.015) 4px
+  );
+  pointer-events: none;
+}
+
+/* -- Monitor content (active state) -- */
+.skill-monitor__content {
+  animation: monitor-on 0.3s ease-out;
+}
+
+@keyframes monitor-on {
+  0% { opacity: 0; transform: translateY(4px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+.skill-monitor__header {
+  margin-bottom: 1rem;
+}
+
+.skill-monitor__accent-line {
+  width: 2.5rem;
+  height: 2px;
+  border-radius: var(--radius-full);
+  margin-bottom: 0.75rem;
+}
+
+.skill-monitor__label {
+  font-family: var(--font-heading);
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: #f5f5f5;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.5rem;
+}
+
+.skill-monitor__keys {
+  display: flex;
+  gap: 0.3rem;
+}
+
+.skill-monitor__kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.5rem;
+  height: 1.5rem;
+  padding: 0 0.3rem;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: #ccc;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 3px;
+}
+
+.skill-monitor__description {
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.5);
+  margin: 0 0 1rem;
+  line-height: 1.5;
+}
+
+.skill-monitor__tags {
+  margin: 0;
+}
+
+/* Override TechTag colors for dark screen */
+.skill-monitor__tags .tech-tag {
+  color: rgba(255, 255, 255, 0.7);
+  border-color: rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* -- Monitor idle state -- */
+.skill-monitor__idle {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 180px;
+  gap: 1rem;
+}
+
+.skill-monitor__cursor {
+  font-family: var(--font-mono);
+  font-size: 1.5rem;
+  color: var(--primary);
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.skill-monitor__idle-text {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.25);
+  margin: 0;
+}
+
+/* -- Monitor stand -- */
+.skill-monitor__stand {
+  width: 3px;
+  height: 24px;
+  background: var(--border);
+  margin: 0 auto;
+}
+
+.skill-monitor__base {
+  width: 60px;
+  height: 3px;
+  background: var(--border);
+  border-radius: var(--radius-full);
+  margin: 0 auto;
+}
+
+/* -- Mobile -- */
+@media (max-width: 768px) {
+  .dualsense-layout {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+  }
+
+  .dualsense-controller {
+    max-width: 100%;
+    justify-self: center;
+  }
+
+  .dualsense-controller__hint {
+    display: none;
+  }
+
+  .skill-monitor__screen {
+    min-height: 160px;
+  }
+
+  .skill-monitor__label {
+    font-size: 1.1rem;
+  }
+}
