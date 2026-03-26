@@ -174,15 +174,15 @@ export const projects: Project[] = [
     description: 'Mobile-first group travel coordination with real-time chat, expense splitting, and location sharing.',
     techStack: ['Go', 'React Native', 'Expo', 'PostgreSQL', 'Redis', 'WebSockets', 'AWS'],
     links: [{ name: 'GitHub', url: 'https://github.com/NomadCrew' }],
-    status: 'in-progress',
+    status: 'active',
     tier: 1,
   },
   {
-    name: 'Audit Pro',
+    name: 'Audex',
     description: 'Desktop app for financial audit automation — Excel workbook generation and PDF reporting.',
     techStack: ['Electron', 'TypeScript', 'VBA', 'Excel Automation', 'PDF'],
     links: [],
-    status: 'in-progress',
+    status: 'active',
     tier: 1,
   },
   {
@@ -190,7 +190,7 @@ export const projects: Project[] = [
     description: 'AI-powered document processing and form automation with multi-agent workflows.',
     techStack: ['Node.js', 'React', 'Prisma', 'PostgreSQL', 'LangGraph', 'Docker', 'AWS'],
     links: [],
-    status: 'in-progress',
+    status: 'active',
     tier: 1,
   },
   // TIER 2 — Strong secondary
@@ -199,7 +199,7 @@ export const projects: Project[] = [
     description: 'Transparent accountability dashboard for Indian politicians with evidence-backed scorecards.',
     techStack: ['Next.js', 'Python', 'PostgreSQL', 'Docker'],
     links: [],
-    status: 'in-progress',
+    status: 'active',
     tier: 2,
   },
   {
@@ -207,7 +207,7 @@ export const projects: Project[] = [
     description: 'Cross-platform TUI for orchestrating multiple AI coding CLIs with unified auth and routing.',
     techStack: ['TypeScript', 'React Ink', 'Node.js', 'Commander.js'],
     links: [],
-    status: 'in-progress',
+    status: 'active',
     tier: 2,
   },
   {
@@ -238,6 +238,6 @@ export const contactInfo: ContactInfo = {
   socials: {
     github: "https://github.com/naqeebali-shamsi",
     linkedin: "https://www.linkedin.com/in/naqeebali-shamsi/",
-    twitter: "https://x.com/",
+    twitter: "https://x.com/NaqeebaliS",
   },
 } as const;

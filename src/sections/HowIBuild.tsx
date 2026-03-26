@@ -6,7 +6,7 @@ import WatermarkText from '@/components/atoms/WatermarkText';
 
 export function HowIBuild() {
   return (
-    <section id="how-i-build" className="relative overflow-hidden bg-bg-feature py-section scroll-mt-20">
+    <section id="how-i-build" className="relative overflow-hidden bg-bg py-section scroll-mt-20">
       <WatermarkText text="ENGINEER" />
 
       <div className="relative z-10 max-w-container mx-auto px-4 sm:px-5 lg:px-6">

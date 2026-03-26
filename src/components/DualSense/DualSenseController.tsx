@@ -1,8 +1,8 @@
-import { useRef, useState, useCallback, useEffect } from 'react'
+import { useRef, useState, useCallback, useEffect, useMemo } from 'react'
 import { skillZones, keyToButton, type SkillZone } from './constants'
 import DualSenseSVG from './DualSenseSVG'
-import TrackpadWaveform from './TrackpadWaveform'
 import TechStackGrid from '@/components/molecules/TechStackGrid'
+import { techIcons } from '@/assets/icons/tech'
 import './DualSenseController.css'
 
 interface ControllerState {
@@ -29,7 +29,34 @@ export default function DualSenseController() {
     ? skillZones[state.activeZone] ?? null
     : null
 
-  // Keyboard: press-and-hold
+  // Collect all skills for mobile grid and icon cycling
+  const allSkills = useMemo(() => {
+    const skills: string[] = []
+    Object.values(skillZones).forEach((zone) => {
+      zone.skills.forEach((s) => {
+        if (!skills.includes(s.name)) skills.push(s.name)
+      })
+    })
+    return skills
+  }, [])
+
+  // All skills that have icons — for the rotating display on the controller
+  const allIconSkills = useMemo(
+    () => allSkills.filter((name) => techIcons[name]),
+    [allSkills]
+  )
+
+  // Cycle through icons on the controller trackpad area
+  const [iconIndex, setIconIndex] = useState(0)
+  useEffect(() => {
+    if (allIconSkills.length === 0) return
+    const interval = setInterval(() => {
+      setIconIndex((prev) => (prev + 1) % allIconSkills.length)
+    }, 1500)
+    return () => clearInterval(interval)
+  }, [allIconSkills.length])
+
+  // Keyboard: toggle on press
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.repeat) return
@@ -46,53 +73,54 @@ export default function DualSenseController() {
       if (!mapping) return
 
       e.preventDefault()
-      setState({
-        activeZone: mapping.zone,
-        activeButton: mapping.button,
-        source: 'keyboard',
-      })
-    }
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      const key = e.key.length === 1 ? e.key.toLowerCase() : e.key
-      const mapping = keyToButton[key]
-      if (!mapping) return
-
-      if (mapping.button === activeButtonRef.current) {
+      // Toggle: if same zone is already active, deactivate
+      if (activeButtonRef.current === mapping.button) {
         setState(initialState)
+      } else {
+        setState({
+          activeZone: mapping.zone,
+          activeButton: mapping.button,
+          source: 'keyboard',
+        })
       }
     }
 
     window.addEventListener('keydown', handleKeyDown)
-    window.addEventListener('keyup', handleKeyUp)
     return () => {
       window.removeEventListener('keydown', handleKeyDown)
-      window.removeEventListener('keyup', handleKeyUp)
     }
   }, [])
 
-  // Mouse: press-and-hold
+  // Mouse/touch: toggle on click
   const handleButtonDown = useCallback((zone: string, button: string) => {
-    if (sourceRef.current === 'keyboard') return
-    setState({ activeZone: zone, activeButton: button, source: 'click' })
-  }, [])
-
-  useEffect(() => {
-    const handleMouseUp = () => {
-      if (sourceRef.current === 'click') {
-        setState(initialState)
-      }
-    }
-
-    window.addEventListener('mouseup', handleMouseUp)
-    window.addEventListener('touchend', handleMouseUp)
-    return () => {
-      window.removeEventListener('mouseup', handleMouseUp)
-      window.removeEventListener('touchend', handleMouseUp)
+    // Toggle: if same button is already active, deactivate
+    if (activeButtonRef.current === button) {
+      setState(initialState)
+    } else {
+      setState({ activeZone: zone, activeButton: button, source: 'click' })
     }
   }, [])
 
   return (
+    <>
+    {/* Mobile: static grid only */}
+    <div className="skills-mobile-grid">
+      {Object.values(skillZones).map((zone) => (
+        <div key={zone.id} className="skills-mobile-group">
+          <h3 className="skills-mobile-group__label">{zone.label}</h3>
+          <div className="skills-mobile-group__tags">
+            {zone.skills.map((s) => (
+              <span key={s.name} className="skills-mobile-tag">
+                {techIcons[s.name] && <img src={techIcons[s.name]} alt="" className="skills-mobile-tag__icon" />}
+                {s.name}
+              </span>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+
+    {/* Desktop: controller + monitor */}
     <div className="dualsense-wrapper">
       <div className="dualsense-layout">
         {/* Controller */}
@@ -103,11 +131,17 @@ export default function DualSenseController() {
               activeButton={state.activeButton}
               onButtonDown={handleButtonDown}
             />
-            <div className="dualsense-controller__waveform-overlay">
-              <TrackpadWaveform
-                isHovered={state.activeZone === 'trackpad'}
-              />
-            </div>
+            {/* Cycling tech icon on the trackpad area */}
+            {allIconSkills.length > 0 && (
+              <div className="dualsense-controller__icon-display">
+                <img
+                  key={iconIndex}
+                  src={techIcons[allIconSkills[iconIndex]]}
+                  alt={allIconSkills[iconIndex]}
+                  className="dualsense-controller__cycling-icon"
+                />
+              </div>
+            )}
           </div>
 
           <p className="dualsense-controller__hint">
@@ -158,9 +192,16 @@ export default function DualSenseController() {
                 </div>
               ) : (
                 <div className="skill-monitor__idle">
-                  <div className="skill-monitor__cursor">_</div>
+                  {allIconSkills.length > 0 && (
+                    <img
+                      key={iconIndex}
+                      src={techIcons[allIconSkills[iconIndex]]}
+                      alt=""
+                      className="skill-monitor__idle-icon"
+                    />
+                  )}
                   <p className="skill-monitor__idle-text">
-                    Press a button to load skills...
+                    {allIconSkills[iconIndex] ?? 'Select a zone'}
                   </p>
                 </div>
               )}
@@ -171,5 +212,6 @@ export default function DualSenseController() {
         </div>
       </div>
     </div>
+    </>
   )
 }

@@ -65,7 +65,7 @@
   font-family: var(--font-mono);
   font-size: 13px;
   font-weight: 500;
-  fill: var(--text-primary, #32292F);
+  fill: var(--text-primary, #171219);
   pointer-events: none;
   user-select: none;
 }
@@ -106,14 +106,14 @@
   font-family: var(--font-heading);
   font-size: 1rem;
   font-weight: 600;
-  color: var(--text-primary, #32292F);
+  color: var(--text-primary, #171219);
   margin: 0 0 0.25rem;
 }
 
 .career-map__card-company {
   font-family: var(--font-body);
   font-size: 0.85rem;
-  color: var(--text-primary, #32292F);
+  color: var(--text-primary, #171219);
   margin: 0 0 0.25rem;
 }
 

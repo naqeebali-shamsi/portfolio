@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <g>
+    <!-- Two-way arrows representing real-time bidirectional communication -->
+    <path d="M24 44h80" stroke="#E4602E" stroke-width="6" stroke-linecap="round"/>
+    <path d="M88 32l16 12-16 12" stroke="#E4602E" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M104 84H24" stroke="#E4602E" stroke-width="6" stroke-linecap="round"/>
+    <path d="M40 96L24 84l16-12" stroke="#E4602E" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- Plug/connection dots -->
+    <circle cx="16" cy="44" r="6" fill="#E4602E"/>
+    <circle cx="112" cy="44" r="6" fill="#E4602E"/>
+    <circle cx="16" cy="84" r="6" fill="#E4602E"/>
+    <circle cx="112" cy="84" r="6" fill="#E4602E"/>
+    <!-- WS label -->
+    <text x="64" y="68" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#E4602E">WS</text>
+  </g>
+</svg>

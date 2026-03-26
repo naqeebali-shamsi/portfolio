@@ -6,8 +6,7 @@ import { Navbar } from '@/components/Navbar/Navbar';
 import { Hero } from '@/components/Hero/Hero';
 import { Skills } from '@/sections/Skills';
 import { Experience } from '@/sections/Experience';
-import { CaseStudy } from '@/sections/CaseStudy';
-import { HowIBuild } from '@/sections/HowIBuild';
+import { CaseStudyTeaser } from '@/sections/CaseStudyTeaser';
 import Projects from '@/sections/Projects';
 import Blogs from '@/sections/Blogs';
 import { Contact } from '@/sections/Contact';
@@ -19,20 +18,19 @@ export default function App() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-bg text-text">
+    <div className="min-h-screen bg-bg text-text overflow-x-hidden">
       <CustomCursor />
       <Navbar />
       <main>
         <Hero />
-        <Skills />
         <Experience />
-        <CaseStudy />
-        <HowIBuild />
+        <Skills />
+        <CaseStudyTeaser />
         <Projects />
         <Blogs blogData={blogSection} />
         <Contact />
       </main>
-      <footer className="text-center text-sm text-stone-400 py-4">
+      <footer className="text-center text-sm py-4 bg-bg-dark text-white/40">
         &copy; 2026 Naqeebali Shamsi
       </footer>
     </div>

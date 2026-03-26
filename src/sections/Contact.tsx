@@ -8,7 +8,7 @@ export function Contact() {
   return (
     <section
       id="contact"
-      className="min-h-[60vh] flex flex-col items-center justify-center py-section px-4 sm:px-5 lg:px-6 scroll-mt-20"
+      className="section-dark min-h-[60vh] flex flex-col items-center justify-center py-section px-4 sm:px-5 lg:px-6 scroll-mt-20"
     >
       <SectionWithReveal className="flex flex-col items-center">
         <HeaderWithLabel label="contact" align="center" className="mb-8" />

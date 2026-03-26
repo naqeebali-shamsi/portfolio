@@ -10,14 +10,14 @@
   --color-transparent: transparent;
   --color-current: currentColor;
 
-  /* Brand palette */
-  --color-bg: #FAFAF5;
-  --color-bg-feature: #F0F7F4;
-  --color-bg-dark: #32292F;
-  --color-text: #32292F;
-  --color-text-muted: #705D56;
-  --color-accent: #70ABAF;
-  --color-accent-light: #99E1D9;
+  /* Brand palette — coffee-bean / carrot-orange / ghost-white / emerald / frozen-lake */
+  --color-bg: #FFFAFF;
+  --color-bg-feature: #F5F0F5;
+  --color-bg-dark: #171219;
+  --color-text: #171219;
+  --color-text-muted: #4A3F4E;
+  --color-accent: #63D2FF;
+  --color-accent-light: #63D2FF;
 
   /* Fonts */
   --font-heading: 'Cal Sans', system-ui, sans-serif;
@@ -25,15 +25,15 @@
   --font-mono: 'JetBrains Mono', monospace;
 
   /* Semantic tokens */
-  --bg-primary: #FAFAF5;
-  --bg-secondary: rgba(50, 41, 47, 0.03);
-  --surface: rgba(50, 41, 47, 0.02);
-  --border: rgba(50, 41, 47, 0.1);
-  --border-glow: rgba(112, 171, 175, 0.15);
-  --primary: #70ABAF;
-  --primary-glow: 112, 171, 175;
-  --text-primary: #32292F;
-  --text-secondary: #705D56;
+  --bg-primary: #FFFAFF;
+  --bg-secondary: rgba(23, 18, 25, 0.03);
+  --surface: rgba(23, 18, 25, 0.02);
+  --border: rgba(23, 18, 25, 0.1);
+  --border-glow: rgba(99, 210, 255, 0.15);
+  --primary: #63D2FF;
+  --primary-glow: 99, 210, 255;
+  --text-primary: #171219;
+  --text-secondary: #4A3F4E;
   --container-max-width: 87.5rem;
   --section-padding: clamp(5rem, 8vw, 6.25rem);
 
@@ -82,4 +82,29 @@
   --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
   --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
   --ease-reveal: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ── Dark section utility ────────────────────────────────── */
+.section-dark {
+  --color-text: #FFFAFF;
+  --color-text-muted: rgba(255, 250, 255, 0.6);
+  --color-accent: #63D2FF;
+  --text-primary: #FFFAFF;
+  --text-secondary: rgba(255, 250, 255, 0.72);
+  --border: rgba(255, 250, 255, 0.1);
+  --surface: rgba(255, 250, 255, 0.04);
+  --primary: #63D2FF;
+  --primary-glow: 99, 210, 255;
+  background-color: #171219;
+  color: #FFFAFF;
+}
+
+.section-dark .tech-tag {
+  color: rgba(255, 250, 255, 0.75);
+  background: rgba(255, 250, 255, 0.06);
+  border-color: rgba(255, 250, 255, 0.12);
+}
+
+.section-dark .tech-tag__icon {
+  filter: brightness(0) invert(0.9);
 }

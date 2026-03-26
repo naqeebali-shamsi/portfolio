@@ -6,7 +6,6 @@
   padding: 8rem 1rem;
   max-width: var(--container-max-width);
   margin: 0 auto;
-  background-color: transparent;
   overflow-x: hidden;
 }
 
@@ -24,12 +23,8 @@
   color: var(--text-secondary);
 }
 
-.projects-cli-header .cli-path {
-  color: #a3e635;
-}
-
 .blinking-cursor {
-  color: #a3e635;
+  color: var(--primary);
   animation: terminal-blink 1s step-end infinite;
 }
 
@@ -43,7 +38,7 @@
 }
 
 .projects-description .green {
-  color: #53bc28;
+  color: #32de8a;
   margin-right: 0.75rem;
 }
 
@@ -96,7 +91,7 @@
 
 .project-card {
   position: relative;
-  background-color: rgba(9, 9, 11, 0.5);
+  background-color: var(--surface);
   border: 1px solid var(--border);
   border-radius: 0.75rem;
   transition: all 0.3s cubic-bezier(0.19, 1, 0.22, 1);
@@ -105,8 +100,8 @@
 
 .project-card:hover {
   transform: translateY(-4px);
-  border-color: rgba(var(--primary-glow), 0.5);
-  background-color: rgba(255, 255, 255, 0.02);
+  border-color: var(--primary);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.15);
 }
 
 /* ---------------------------------------------------------------
@@ -190,7 +185,7 @@
   display: flex;
   gap: 1.5rem;
   padding-top: 1.25rem;
-  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+  border-top: 1px dashed var(--border);
 }
 
 .project-link {
@@ -265,15 +260,15 @@
   border-radius: 50%;
 }
 
-/* active — green */
+/* active — emerald */
 .project-status--active {
-  color: #27c93f;
-  border: 1px solid rgba(39, 201, 63, 0.3);
-  background: rgba(39, 201, 63, 0.05);
+  color: #32de8a;
+  border: 1px solid rgba(50, 222, 138, 0.3);
+  background: rgba(50, 222, 138, 0.08);
 }
 
 .project-status--active .project-status__dot {
-  background-color: #27c93f;
+  background-color: #32de8a;
 }
 
 /* shipped — teal primary */
@@ -306,10 +301,20 @@
   font-family: var(--font-mono);
   font-size: 0.7rem;
   color: var(--text-secondary);
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  padding: 0.2rem 0.6rem;
+  background: rgba(0, 0, 0, 0.03);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  padding: 0.25rem 0.6rem;
   border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.tech-tag__icon {
+  width: 14px;
+  height: 14px;
+  object-fit: contain;
+  flex-shrink: 0;
 }
 
 /* ---------------------------------------------------------------

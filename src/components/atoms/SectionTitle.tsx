@@ -13,7 +13,8 @@ interface SectionTitleProps {
 export default function SectionTitle({ children, className = '' }: SectionTitleProps) {
   return (
     <h2
-      className={`text-4xl md:text-5xl font-bold mb-8 text-neutral-100 font-sans tracking-tight ${className}`.trim()}
+      className={`text-4xl md:text-5xl font-bold mb-8 font-heading tracking-heading ${className}`.trim()}
+      style={{ color: 'var(--text-primary)' }}
     >
       {children}
     </h2>

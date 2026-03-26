@@ -39,10 +39,10 @@ const techLogos: TechLogo[] = [
 ];
 
 const CATEGORY_COLORS: Record<string, string> = {
-    ai: '#70ABAF',
-    framework: '#99E1D9',
-    cloud: '#705D56',
-    language: '#32292F',
+    ai: '#63D2FF',
+    framework: '#32de8a',
+    cloud: '#f9a03f',
+    language: '#171219',
 };
 
 const BASE_FONT_SIZE = 10;

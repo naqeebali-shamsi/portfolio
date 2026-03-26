@@ -113,40 +113,27 @@ const Tier2Card: React.FC<{ project: Project }> = ({ project }) => {
 
 const Projects: React.FC = () => {
   return (
-    <section className="projects" id="projects">
-      <SectionLabel className="projects-section-label">projects</SectionLabel>
+    <section className="section-dark" id="projects">
+      <div className="projects">
+        <SectionLabel className="projects-section-label">projects</SectionLabel>
 
-      <div className="projects-cli-header">
-        <span className="cli-path">cd</span> ../projects
-        <span className="blinking-cursor">_</span>
-      </div>
+        {/* Tier 1 — Featured */}
+        <p className="projects-tier-label">Featured</p>
+        <div className="projects-grid projects-grid--tier1">
+          {tier1.map((project) => (
+            <Tier1Card key={project.name} project={project} />
+          ))}
+        </div>
 
-      <div className="projects-description">
-        <span className="green">{'>'}</span> Featured projects showcasing
-        full-stack development, cloud architecture, and open source
-        contributions.
-      </div>
-
-      <div className="projects-meta">
-        total {projects.length}
-      </div>
-
-      {/* Tier 1 — Featured */}
-      <p className="projects-tier-label">Featured</p>
-      <div className="projects-grid projects-grid--tier1">
-        {tier1.map((project) => (
-          <Tier1Card key={project.name} project={project} />
-        ))}
-      </div>
-
-      {/* Tier 2 — More Projects */}
-      <p className="projects-tier-label projects-tier-label--secondary">
-        More Projects
-      </p>
-      <div className="projects-grid projects-grid--tier2">
-        {tier2.map((project) => (
-          <Tier2Card key={project.name} project={project} />
-        ))}
+        {/* Tier 2 — More Projects */}
+        <p className="projects-tier-label projects-tier-label--secondary">
+          More Projects
+        </p>
+        <div className="projects-grid projects-grid--tier2">
+          {tier2.map((project) => (
+            <Tier2Card key={project.name} project={project} />
+          ))}
+        </div>
       </div>
     </section>
   );

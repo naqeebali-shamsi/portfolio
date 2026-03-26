@@ -12,9 +12,9 @@ export function Skills() {
       <div className="skills-content">
         <SectionWithReveal>
           <SectionLabel>skills</SectionLabel>
-          <h2 className="skills-heading">What I Play With</h2>
+          <h2 className="skills-heading">The Stack</h2>
           <p className="skills-subtitle">
-            Hover the controller to explore my toolkit
+            Click the controller buttons to explore
           </p>
         </SectionWithReveal>
 

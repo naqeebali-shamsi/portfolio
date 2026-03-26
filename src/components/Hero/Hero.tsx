@@ -54,7 +54,7 @@ export function Hero() {
       id="hero"
       className="relative min-h-[100dvh] flex items-center overflow-hidden"
     >
-      <GravityGrid cellSize={30} strength={0.5} radius={150} stiffness={0.05} damping={0.92} color="rgba(50, 41, 47, 0.08)" />
+      <GravityGrid cellSize={30} strength={0.5} radius={150} stiffness={0.05} damping={0.92} color="rgba(23, 18, 25, 0.08)" />
       <div className="relative z-10 flex flex-col items-center w-full gap-10 py-12 px-4 sm:px-5 lg:px-6 max-w-container mx-auto">
         {/* Portrait with marquee behind */}
         <div data-parallax="visual" className="relative">

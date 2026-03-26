@@ -42,7 +42,7 @@ export function CustomCursor() {
                 width: 48,
                 height: 48,
                 borderWidth: 1.5,
-                backgroundColor: 'rgba(26,26,26,0.08)',
+                backgroundColor: 'rgba(255,250,255,0.15)',
                 opacity: 1,
                 duration: morphDuration,
                 ease: morphEase,
@@ -148,7 +148,7 @@ export function CustomCursor() {
         width: 24,
         height: 24,
         visibility: 'hidden',
-        color: '#1a1a1a',
+        color: '#FFFAFF',
       }}
     />
   );

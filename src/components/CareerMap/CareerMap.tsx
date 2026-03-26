@@ -37,10 +37,11 @@ interface CareerMapProps {
 interface LabelPos { dx: number; dy: number; anchor: 'start' | 'middle' | 'end' }
 
 // Directional slots in priority order — spread labels around the pin
+// For Y-sorted clusters: top pin → above, middle pin → right, bottom pin → below
 const LABEL_SLOTS: LabelPos[] = [
-  { dx: 0, dy: -18, anchor: 'middle' },   // above
-  { dx: 0, dy: 30, anchor: 'middle' },    // below
-  { dx: 22, dy: 5, anchor: 'start' },     // right
+  { dx: 0, dy: -18, anchor: 'middle' },   // above (assigned to topmost)
+  { dx: 22, dy: 5, anchor: 'start' },     // right (assigned to middle)
+  { dx: 0, dy: 30, anchor: 'middle' },    // below (assigned to bottommost)
   { dx: -22, dy: 5, anchor: 'end' },      // left
   { dx: 18, dy: -14, anchor: 'start' },   // top-right
   { dx: -18, dy: -14, anchor: 'end' },    // top-left
@@ -74,6 +75,10 @@ function computeLabelPositions(
 
     if (cluster.length <= 1) continue
 
+    // Sort cluster members by Y coordinate (top-to-bottom) so labels
+    // are assigned spatially: topmost pin gets "above", etc.
+    cluster.sort((a, b) => pins[a].y - pins[b].y)
+
     // Assign each cluster member a unique slot
     cluster.forEach((pinIdx, slotIdx) => {
       positions[pinIdx] = LABEL_SLOTS[slotIdx % LABEL_SLOTS.length]
@@ -86,12 +91,12 @@ function computeLabelPositions(
 
 // Unique color per pin for visual distinction
 const PIN_COLORS = [
-  '#E05E36', // Surat — warm orange
-  '#70ABAF', // Changa — teal (primary)
-  '#5465FF', // Ahmedabad — blue
-  '#2DA677', // Halifax — green
-  '#F2C3F0', // Toronto — pink
-  '#FF8C42', // Dubai — amber
+  '#e76f51', // Surat — burnt peach
+  '#2a9d8f', // Changa — verdigris
+  '#264653', // Ahmedabad — charcoal blue
+  '#e9c46a', // Halifax — tuscan sun
+  '#f4a261', // Toronto — sandy brown
+  '#e76f51', // Dubai — burnt peach
 ]
 
 /* ---------------------------------------------------------------------- */

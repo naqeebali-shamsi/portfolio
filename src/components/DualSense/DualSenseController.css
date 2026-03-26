@@ -10,6 +10,11 @@
   gap: 2rem;
   align-items: center;
   width: 100%;
+  min-width: 0;
+}
+
+.dualsense-layout > * {
+  min-width: 0;
 }
 
 /* -- Controller -- */
@@ -31,7 +36,8 @@
   width: 100%;
 }
 
-.dualsense-controller__waveform-overlay {
+/* Cycling icon on the controller trackpad */
+.dualsense-controller__icon-display {
   position: absolute;
   top: 31%;
   left: 50%;
@@ -40,32 +46,84 @@
   height: 19%;
   pointer-events: none;
   z-index: 2;
-  overflow: hidden;
-  border-radius: 8%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
-/* -- Keyboard hint -- */
+/* PS5-style light bar — glows from within the trackpad */
+.dualsense-controller__icon-display::before {
+  content: '';
+  position: absolute;
+  top: -2px;
+  left: 15%;
+  right: 15%;
+  height: 1px;
+  background: rgba(99, 210, 255, 0.6);
+  border-radius: 1px;
+  filter: blur(0.5px);
+}
+
+/* Diffused light spill upward — the "from within" effect */
+.dualsense-controller__icon-display::after {
+  content: '';
+  position: absolute;
+  top: -14px;
+  left: 5%;
+  right: 5%;
+  height: 16px;
+  background: radial-gradient(
+    ellipse 80% 100% at 50% 100%,
+    rgba(99, 210, 255, 0.2) 0%,
+    rgba(99, 210, 255, 0.08) 40%,
+    transparent 100%
+  );
+  pointer-events: none;
+  animation: lightbar-breathe 3s ease-in-out infinite;
+}
+
+@keyframes lightbar-breathe {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 1; }
+}
+
+.dualsense-controller__cycling-icon {
+  width: 60%;
+  height: 60%;
+  object-fit: contain;
+  animation: icon-fade-in 0.4s ease-out;
+  opacity: 0.7;
+}
+
+@keyframes icon-fade-in {
+  0% { opacity: 0; transform: scale(0.7); }
+  100% { opacity: 0.7; transform: scale(1); }
+}
+
+/* -- Keyboard hint (more prominent) -- */
 .dualsense-controller__hint {
-  margin-top: 1rem;
+  margin-top: 1.5rem;
   text-align: center;
   font-family: var(--font-mono);
-  font-size: 0.7rem;
+  font-size: 0.8rem;
   color: var(--text-secondary);
-  opacity: 0.5;
-  line-height: 1.8;
+  opacity: 0.7;
+  line-height: 2;
 }
 
 .dualsense-controller__hint kbd {
   display: inline-block;
-  padding: 0.1rem 0.35rem;
-  margin: 0 0.1rem;
+  padding: 0.2rem 0.5rem;
+  margin: 0 0.15rem;
   font-family: var(--font-mono);
-  font-size: 0.6rem;
+  font-size: 0.7rem;
+  font-weight: 600;
   color: var(--text-primary);
-  background: var(--surface);
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   line-height: 1;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
 }
 
 /* ── Monitor Display ─────────────────────────────────────── */
@@ -74,6 +132,7 @@
   display: flex;
   flex-direction: column;
   align-items: center;
+  overflow: hidden;
 }
 
 .skill-monitor__bezel {
@@ -81,10 +140,6 @@
   background: var(--text-primary);
   border-radius: 12px;
   padding: 2px;
-  box-shadow:
-    0 8px 32px rgba(50, 41, 47, 0.15),
-    0 2px 8px rgba(50, 41, 47, 0.1),
-    inset 0 1px 0 rgba(255, 255, 255, 0.05);
 }
 
 .skill-monitor__top-bar {
@@ -211,7 +266,13 @@
   background: rgba(255, 255, 255, 0.05);
 }
 
-/* -- Monitor idle state -- */
+.skill-monitor__tags .tech-tag__icon {
+  width: 16px;
+  height: 16px;
+  filter: brightness(0) invert(0.85);
+}
+
+/* -- Monitor idle state — cycling icon -- */
 .skill-monitor__idle {
   display: flex;
   flex-direction: column;
@@ -221,55 +282,104 @@
   gap: 1rem;
 }
 
-.skill-monitor__cursor {
-  font-family: var(--font-mono);
-  font-size: 1.5rem;
-  color: var(--primary);
-  animation: blink 1s step-end infinite;
-}
-
-@keyframes blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0; }
+.skill-monitor__idle-icon {
+  width: 48px;
+  height: 48px;
+  object-fit: contain;
+  filter: brightness(0) invert(0.8);
+  animation: icon-fade-in 0.4s ease-out;
 }
 
 .skill-monitor__idle-text {
   font-family: var(--font-mono);
-  font-size: 0.75rem;
-  color: rgba(255, 255, 255, 0.25);
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.4);
   margin: 0;
+  text-align: center;
+  animation: icon-fade-in 0.4s ease-out;
 }
+
+/* -- Mobile skills grid -- */
+.skills-mobile-grid {
+  display: none;
+}
+
+/* -- Mobile grid visible, controller hidden -- */
 
 /* -- Monitor stand -- */
 .skill-monitor__stand {
-  width: 3px;
-  height: 24px;
-  background: var(--border);
+  width: 6px;
+  height: 28px;
+  background: var(--text-primary);
   margin: 0 auto;
+  border-radius: 0 0 2px 2px;
 }
 
 .skill-monitor__base {
-  width: 60px;
-  height: 3px;
-  background: var(--border);
+  width: 80px;
+  height: 6px;
+  background: var(--text-primary);
   border-radius: var(--radius-full);
   margin: 0 auto;
 }
 
-/* -- Mobile -- */
+/* -- Mobile: show grid, hide controller -- */
 @media (max-width: 768px) {
-  .dualsense-layout {
-    grid-template-columns: 1fr;
+  .dualsense-wrapper {
+    display: none;
+  }
+
+  .skills-mobile-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
     gap: 1.5rem;
   }
 
-  .dualsense-controller {
-    max-width: 100%;
-    justify-self: center;
+  .skills-mobile-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
   }
 
-  .dualsense-controller__hint {
-    display: none;
+  .skills-mobile-group__label {
+    font-family: var(--font-heading);
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin: 0;
+  }
+
+  .skills-mobile-group__tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+
+  .skills-mobile-tag {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    background: rgba(0, 0, 0, 0.03);
+    border: 1px solid var(--border);
+    padding: 0.25rem 0.6rem;
+    border-radius: var(--radius-full);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .skills-mobile-tag__icon {
+    width: 14px;
+    height: 14px;
+    object-fit: contain;
+  }
+}
+
+/* Tablet: smaller controller */
+@media (min-width: 769px) and (max-width: 1024px) {
+  .dualsense-layout {
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
   }
 
   .skill-monitor__screen {

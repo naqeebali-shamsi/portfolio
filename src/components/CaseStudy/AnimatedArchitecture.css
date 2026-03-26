@@ -17,8 +17,8 @@
   justify-content: center;
   width: 140px;
   height: 70px;
-  background: var(--bg-primary);
-  border: 1.5px solid var(--border);
+  background: rgba(255, 250, 255, 0.95);
+  border: 1.5px solid rgba(23, 18, 25, 0.15);
   border-radius: var(--radius-md);
   text-align: center;
   z-index: 2;
@@ -31,19 +31,19 @@
 }
 
 .arch-node__icon {
-  color: var(--text-secondary);
+  color: #4A3F4E;
   margin-bottom: 0.2rem;
 }
 
 .arch-node--accent .arch-node__icon {
-  color: var(--primary);
+  color: #63D2FF;
 }
 
 .arch-node__label {
   font-family: var(--font-heading);
   font-size: 0.8rem;
   font-weight: 700;
-  color: var(--text-primary);
+  color: #171219;
   line-height: 1.2;
   white-space: nowrap;
 }
@@ -51,7 +51,7 @@
 .arch-node__sublabel {
   font-family: var(--font-mono);
   font-size: 0.6rem;
-  color: var(--text-secondary);
+  color: #4A3F4E;
   line-height: 1.2;
   margin-top: 0.1rem;
   white-space: nowrap;
@@ -67,7 +67,7 @@
 }
 
 .arch-beam {
-  stroke: var(--border);
+  stroke: rgba(255, 250, 255, 0.25);
   stroke-width: 1.5;
   stroke-dasharray: 6 4;
   stroke-linecap: round;
@@ -77,6 +77,60 @@
 @keyframes beam-flow {
   0% { stroke-dashoffset: 10; }
   100% { stroke-dashoffset: 0; }
+}
+
+/* ---- Real App Screenshot Frames ---- */
+
+.app-screen-frame {
+  width: 240px;
+  flex-shrink: 0;
+  border-radius: 1.75rem;
+  overflow: hidden;
+  background: #1a1520;
+  padding: 3px;
+  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.app-screen-frame img {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 1.5rem;
+}
+
+/* 3D perspective floating effect */
+.app-screen-frame--left {
+  transform: perspective(1200px) rotateY(12deg) rotateX(2deg) translateZ(0);
+  box-shadow:
+    -20px 20px 60px rgba(0, 0, 0, 0.35),
+    -5px 5px 20px rgba(0, 0, 0, 0.2);
+}
+
+.app-screen-frame--left:hover {
+  transform: perspective(1200px) rotateY(6deg) rotateX(1deg) translateZ(20px);
+}
+
+.app-screen-frame--right {
+  transform: perspective(1200px) rotateY(-12deg) rotateX(2deg) translateY(30px) translateZ(0);
+  box-shadow:
+    20px 20px 60px rgba(0, 0, 0, 0.35),
+    5px 5px 20px rgba(0, 0, 0, 0.2);
+}
+
+.app-screen-frame--right:hover {
+  transform: perspective(1200px) rotateY(-6deg) rotateX(1deg) translateY(30px) translateZ(20px);
+}
+
+@media (max-width: 639px) {
+  .app-screen-frame {
+    width: 200px;
+  }
+  .app-screen-frame--left {
+    transform: perspective(800px) rotateY(8deg) rotateX(2deg);
+  }
+  .app-screen-frame--right {
+    transform: perspective(800px) rotateY(-8deg) rotateX(2deg) translateY(20px);
+  }
 }
 
 /* ---- Responsive ---- */

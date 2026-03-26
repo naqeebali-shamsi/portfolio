@@ -3,7 +3,6 @@ import { caseStudy } from '@/data/content';
 import HeaderWithLabel from '@/components/molecules/HeaderWithLabel';
 import SectionLabel from '@/components/atoms/SectionLabel';
 import AnimatedArchitecture from '@/components/CaseStudy/AnimatedArchitecture';
-import PhoneMockup from '@/components/CaseStudy/PhoneMockup';
 import ExternalLink from '@/components/atoms/ExternalLink';
 
 const fadeUp = {
@@ -19,7 +18,7 @@ const stagger = {
 
 export function CaseStudy() {
   return (
-    <section id="work" data-cursor="project" className="py-section scroll-mt-20">
+    <section id="work" data-cursor="project" className="section-dark py-section scroll-mt-20">
       {/* 1. Intro */}
       <motion.div
         className="max-w-container mx-auto px-4 sm:px-5 lg:px-6"
@@ -37,7 +36,7 @@ export function CaseStudy() {
 
       {/* 2. Full-width architecture + phone mockups */}
       <motion.div
-        className="w-full bg-bg-feature mt-10 py-12"
+        className="w-full bg-white/5 mt-10 py-12"
         variants={fadeUp}
         initial="hidden"
         whileInView="visible"
@@ -74,7 +73,7 @@ export function CaseStudy() {
               </motion.ul>
             </div>
 
-            {/* RIGHT -- Phone mockups */}
+            {/* RIGHT -- Real app screenshots */}
             <motion.div
               variants={fadeUp}
               initial="hidden"
@@ -83,9 +82,11 @@ export function CaseStudy() {
               transition={{ duration: 0.7, delay: 0.2, ease: [0.16, 1, 0.3, 1] }}
             >
               <div className="flex gap-6 justify-center items-center">
-                <PhoneMockup screen={1} rotation="left" />
-                <div className="hidden sm:block">
-                  <PhoneMockup screen={2} rotation="right" />
+                <div className="app-screen-frame app-screen-frame--left">
+                  <img src="/nomadcrew-screens/trip-list.png" alt="NomadCrew trip list showing active trips with planning status" />
+                </div>
+                <div className="app-screen-frame app-screen-frame--right hidden sm:block">
+                  <img src="/nomadcrew-screens/live-map.png" alt="NomadCrew live location sharing map view" />
                 </div>
               </div>
 

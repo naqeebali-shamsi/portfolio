@@ -42,7 +42,7 @@ export const skillZones: Record<string, SkillZone> = {
     id: 'dpad',
     label: 'Core Languages',
     description: 'The foundation of everything I build',
-    color: '#32292F',
+    color: '#171219',
     keys: ['W', 'A', 'S', 'D'],
     skills: [
       { name: 'TypeScript', category: 'language' },
@@ -56,7 +56,7 @@ export const skillZones: Record<string, SkillZone> = {
     id: 'face-buttons',
     label: 'Frameworks & Libraries',
     description: 'The tools I reach for daily',
-    color: '#99E1D9',
+    color: '#32de8a',
     keys: ['↑', '↓', '←', '→'],
     skills: [
       { name: 'React', category: 'framework' },
@@ -70,7 +70,7 @@ export const skillZones: Record<string, SkillZone> = {
     id: 'left-stick',
     label: 'DevOps & Cloud',
     description: 'Infrastructure that scales',
-    color: '#705D56',
+    color: '#f9a03f',
     keys: ['Z'],
     skills: [
       { name: 'AWS', category: 'cloud' },
@@ -84,7 +84,7 @@ export const skillZones: Record<string, SkillZone> = {
     id: 'right-stick',
     label: 'Databases',
     description: 'Where the data lives',
-    color: '#70ABAF',
+    color: '#63D2FF',
     keys: ['C'],
     skills: [
       { name: 'PostgreSQL', category: 'database' },
@@ -98,7 +98,7 @@ export const skillZones: Record<string, SkillZone> = {
     id: 'left-triggers',
     label: 'Design & UX',
     description: 'Making it look and feel right',
-    color: '#F2C3F0',
+    color: '#f9a03f',
     keys: ['Q', 'Tab'],
     skills: [
       { name: 'Figma', category: 'design' },
@@ -111,7 +111,7 @@ export const skillZones: Record<string, SkillZone> = {
     id: 'right-triggers',
     label: 'AI & ML',
     description: 'The future I\'m building with',
-    color: '#70ABAF',
+    color: '#63D2FF',
     keys: ['E', 'R'],
     skills: [
       { name: 'OpenAI', category: 'ai' },

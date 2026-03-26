@@ -25,7 +25,7 @@ const Blogs = ({ blogData }) => {
         <section className="blogs" id="blogs">
             <SectionLabel className="blogs-section-label">posts</SectionLabel>
 
-            <h2 className="text-4xl md:text-5xl font-bold mb-8 text-neutral-100 font-sans tracking-tight">
+            <h2 className="text-4xl md:text-5xl font-bold mb-8 font-heading tracking-heading" style={{ color: 'var(--text-primary)' }}>
                 Latest Writing
             </h2>
 
