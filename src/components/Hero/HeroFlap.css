@@ -1,0 +1,23 @@
+/* Split flap display layout for hero section */
+
+.hero-flap-name {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.hero-flap-role {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Mobile */
+@media (max-width: 768px) {
+  .hero-flap-name {
+    align-items: center;
+  }
+  .hero-flap-role {
+    display: flex;
+    justify-content: center;
+  }
+}

@@ -15,14 +15,11 @@ export function Navbar() {
   const { direction, isAtTop } = useScrollDirection();
   const [mobileOpen, setMobileOpen] = useState(false);
 
-  const isHidden = direction === 'down' && !isAtTop && !mobileOpen;
-
   return (
     <>
       <nav
         className={clsx(
-          'fixed top-0 left-0 right-0 z-50 h-16 transition-transform duration-300 ease-smooth',
-          isHidden && '-translate-y-full',
+          'fixed top-0 left-0 right-0 z-50 h-16 transition-all duration-300 ease-smooth',
           !isAtTop && 'bg-bg-dark/70 backdrop-blur-md border-b border-white/10 text-white',
         )}
       >

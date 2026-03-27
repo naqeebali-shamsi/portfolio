@@ -95,8 +95,8 @@ const PIN_COLORS = [
   '#2a9d8f', // Changa — verdigris
   '#264653', // Ahmedabad — charcoal blue
   '#e9c46a', // Halifax — tuscan sun
-  '#f4a261', // Toronto — sandy brown
-  '#e76f51', // Dubai — burnt peach
+  '#9b5de5', // Toronto — amethyst
+  '#f9a03f', // Dubai — carrot orange
 ]
 
 /* ---------------------------------------------------------------------- */

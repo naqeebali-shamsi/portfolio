@@ -60,8 +60,8 @@ const PIN_COLORS = [
   '#2a9d8f', // Changa — verdigris
   '#264653', // Ahmedabad — charcoal blue
   '#e9c46a', // Halifax — tuscan sun
-  '#f4a261', // Toronto — sandy brown
-  '#e76f51', // Dubai — burnt peach
+  '#9b5de5', // Toronto — amethyst
+  '#f9a03f', // Dubai — carrot orange
 ] as const;
 
 /** Build a city→color lookup from the sorted career locations */
@@ -143,7 +143,7 @@ export function Experience() {
       <div className="max-w-container mx-auto px-4 sm:px-5 lg:px-6">
         {/* Section header */}
         <SectionWithReveal duration={0.6} triggerStart="top 85%">
-          <p className="font-mono text-sm text-accent tracking-wide mb-3">/experience</p>
+          <p className="font-mono text-sm text-accent tracking-wide uppercase mb-3">/EXPERIENCE</p>
           <h2 className="font-heading text-3xl sm:text-4xl lg:text-5xl uppercase tracking-heading font-bold mb-12">
             Career Journey
           </h2>
@@ -249,7 +249,6 @@ export function Experience() {
                   />
                   <p className="font-mono text-xs uppercase tracking-wide" style={{ color: cityColors['Surat'] }}>Origin</p>
                   <p className="font-heading text-base font-bold text-text mt-1">Surat, India</p>
-                  <p className="font-body text-sm text-text-muted mt-0.5">Where it all began · 1997</p>
                 </div>
               </SectionWithReveal>
             </div>
