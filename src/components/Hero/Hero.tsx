@@ -17,6 +17,16 @@ export function Hero() {
   const lineRef = useRef<HTMLDivElement>(null);
 
   const [roleIndex, setRoleIndex] = useState(0);
+  const [isMobile, setIsMobile] = useState(false);
+
+  useEffect(() => {
+    const mql = window.matchMedia('(max-width: 768px)');
+    setIsMobile(mql.matches);
+    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
+    mql.addEventListener('change', handler);
+    return () => mql.removeEventListener('change', handler);
+  }, []);
+
   useEffect(() => {
     const interval = setInterval(() => {
       setRoleIndex((prev) => (prev + 1) % ROLES.length);
@@ -108,14 +118,14 @@ export function Hero() {
               <SplitFlapDisplay
                 characterSet={ALPHA}
                 value={ROLES[roleIndex].toUpperCase()}
-                fontSize="clamp(1rem, 1.8vw, 1.4rem)"
-                characterWidth="2em"
+                fontSize={isMobile ? '0.7rem' : 'clamp(1rem, 1.8vw, 1.4rem)'}
+                characterWidth={isMobile ? '1.4em' : '2em'}
                 step={60}
                 borderColor="#2a2230"
                 background="#1a1520"
                 textColor="#FFFAFF"
                 padDirection="right"
-                minLength={22}
+                minLength={isMobile ? 19 : 22}
               />
             </div>
 

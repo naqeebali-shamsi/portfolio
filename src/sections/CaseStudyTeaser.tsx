@@ -28,12 +28,12 @@ export function CaseStudyTeaser() {
           {/* Left — text */}
           <div>
             <h2
-              className="text-4xl md:text-5xl font-bold font-heading tracking-heading mb-6"
+              className="text-3xl sm:text-4xl md:text-5xl font-bold font-heading tracking-heading mb-6 break-words"
               style={{ color: 'var(--text-primary)' }}
             >
               {caseStudy.name}
             </h2>
-            <p className="font-body text-lg max-w-2xl mb-8" style={{ color: 'var(--text-secondary)' }}>
+            <p className="font-body text-base sm:text-lg max-w-2xl mb-8" style={{ color: 'var(--text-secondary)' }}>
               {caseStudy.problem}
             </p>
             <Link
