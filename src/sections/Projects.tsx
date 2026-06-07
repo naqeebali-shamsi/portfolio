@@ -89,29 +89,76 @@ const Tier1Card: React.FC<{ project: Project }> = ({ project }) => {
 // ---------------------------------------------------------------------------
 
 const Tier2Card: React.FC<{ project: Project }> = ({ project }) => {
-  return (
-    <div className="project-card project-card--tier2">
-      <div className="project-card--tier2__top">
-        <span className="project-card__name--compact">{project.name}</span>
-        <StatusBadge status={project.status} />
-      </div>
-      <p className="project-card__description--compact">{project.description}</p>
-      <TechStackGrid
-        technologies={project.techStack}
-        variant="css"
-        gap="sm"
-        maxVisible={3}
-        className="project-card__tech"
-      />
+  const [flipped, setFlipped] = React.useState(false);
 
-      {project.links.length > 0 && (
-        <ExternalLinkGroup
-          links={project.links}
-          arrow="↗"
-          className="project-card__links project-card__links--compact"
-          linkClassName="project-link"
-        />
-      )}
+  // Flip on card click/keypress — but never when the interaction targets a link.
+  const toggle = (e: React.MouseEvent | React.KeyboardEvent) => {
+    if ((e.target as HTMLElement).closest('a')) return;
+    setFlipped((f) => !f);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      toggle(e);
+    }
+  };
+
+  return (
+    <div
+      className={`project-flip${flipped ? ' is-flipped' : ''}`}
+      onClick={toggle}
+      onKeyDown={handleKeyDown}
+      role="button"
+      tabIndex={0}
+      aria-pressed={flipped}
+      aria-label={`${project.name} — ${flipped ? 'show summary' : 'show more detail'}`}
+    >
+      <div className="project-flip__inner">
+        {/* Front — compact summary */}
+        <div className="project-card project-card--tier2 project-flip__face project-flip__front">
+          <div className="project-card--tier2__top">
+            <span className="project-card__name--compact">{project.name}</span>
+            <StatusBadge status={project.status} />
+          </div>
+          <p className="project-card__description--compact">{project.description}</p>
+          <TechStackGrid
+            technologies={project.techStack}
+            variant="css"
+            gap="sm"
+            maxVisible={3}
+            className="project-card__tech"
+          />
+
+          {project.links.length > 0 && (
+            <ExternalLinkGroup
+              links={project.links}
+              arrow="↗"
+              className="project-card__links project-card__links--compact"
+              linkClassName="project-link"
+            />
+          )}
+          <span className="project-flip__hint" aria-hidden="true">↻ details</span>
+        </div>
+
+        {/* Back — fuller detail + full tech stack */}
+        <div className="project-card project-card--tier2 project-flip__face project-flip__back">
+          <div className="project-card--tier2__top">
+            <span className="project-card__name--compact">{project.name}</span>
+            <StatusBadge status={project.status} />
+          </div>
+          <p className="project-card__description--full">
+            {project.details ?? project.description}
+          </p>
+          <TechStackGrid
+            technologies={project.techStack}
+            variant="css"
+            gap="sm"
+            className="project-card__tech"
+          />
+          <span className="project-flip__hint" aria-hidden="true">↺ back</span>
+        </div>
+      </div>
     </div>
   );
 };

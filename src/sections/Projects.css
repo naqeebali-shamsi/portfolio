@@ -245,6 +245,95 @@
 }
 
 /* ---------------------------------------------------------------
+   Tier 2 flip card — click (anywhere but a link) flips to fuller detail
+   --------------------------------------------------------------- */
+
+.project-flip {
+  perspective: 1200px;
+  display: flex;
+  cursor: pointer;
+  border-radius: 0.75rem;
+  transition: transform 0.3s cubic-bezier(0.19, 1, 0.22, 1);
+}
+
+.project-flip:hover {
+  transform: translateY(-4px);
+}
+
+.project-flip:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 3px;
+}
+
+.project-flip__inner {
+  flex: 1;
+  display: grid;
+  transform-style: preserve-3d;
+  transition: transform 0.6s cubic-bezier(0.4, 0.15, 0.2, 1);
+}
+
+.project-flip.is-flipped .project-flip__inner {
+  transform: rotateY(180deg);
+}
+
+/* Both faces share one grid cell, so the card sizes to the taller (back) face. */
+.project-flip__face {
+  grid-area: 1 / 1;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+
+.project-flip__back {
+  transform: rotateY(180deg);
+}
+
+/* The base .project-card:hover lift is a transform — it would clobber the 3D
+   rotation on the faces. Neutralize it on faces (the outer .project-flip lifts
+   instead) and keep the back face rotated even while hovered. */
+.project-flip__face:hover {
+  transform: none;
+}
+.project-flip__back,
+.project-flip__back:hover {
+  transform: rotateY(180deg);
+}
+
+/* Only the face the user is looking at captures pointer events. Without this the
+   rotated back face (later in DOM, so stacked on top) swallows clicks meant for
+   the front, and the card never flips. */
+.project-flip__back {
+  pointer-events: none;
+}
+.project-flip.is-flipped .project-flip__front {
+  pointer-events: none;
+}
+.project-flip.is-flipped .project-flip__back {
+  pointer-events: auto;
+}
+
+.project-flip__hint {
+  margin-top: auto;
+  align-self: flex-end;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  opacity: 0.55;
+}
+
+.project-card__description--full {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  line-height: 1.55;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .project-flip,
+  .project-flip__inner {
+    transition: none;
+  }
+}
+
+/* ---------------------------------------------------------------
    Status badge
    --------------------------------------------------------------- */
 

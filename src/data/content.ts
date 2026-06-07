@@ -161,6 +161,8 @@ export const caseStudy: CaseStudy = {
 export interface Project {
   name: string
   description: string
+  /** Fuller description shown on the back of flippable Tier 2 cards; falls back to `description`. */
+  details?: string
   techStack: string[]
   links: Array<{ name: string; url: string }>
   status?: 'active' | 'shipped' | 'in-progress'
@@ -212,6 +214,8 @@ export const projects: Project[] = [
   {
     name: 'Politia',
     description: 'Transparent accountability dashboard for Indian politicians with evidence-backed scorecards.',
+    details:
+      'Aggregates official public data on every Indian Member of Parliament into one searchable, source-backed dashboard — each metric traces to an official record (500k+ election records ingested). Politically neutral by design: it presents the data and lets citizens, journalists, and researchers draw their own conclusions.',
     techStack: ['Next.js', 'Python', 'PostgreSQL', 'Docker'],
     links: [],
     status: 'active',
@@ -220,6 +224,8 @@ export const projects: Project[] = [
   {
     name: 'RideSkipper',
     description: 'Trip booking platform with real-time reservations, full testing suite, and Prisma ORM.',
+    details:
+      'A trip-booking platform with real-time seat reservations on a fully-typed Next.js + Prisma/PostgreSQL stack. Booking and checkout forms are built with React Hook Form, and the critical flows are covered end-to-end by a Playwright test suite.',
     techStack: ['Next.js', 'Prisma', 'PostgreSQL', 'React Hook Form', 'Playwright'],
     links: [],
     status: 'shipped',
@@ -228,6 +234,8 @@ export const projects: Project[] = [
   {
     name: 'IntelliFill',
     description: 'AI-powered document processing and form automation with multi-agent workflows.',
+    details:
+      'An intelligent document-processing platform that extracts data from source files and auto-fills target forms using multi-agent LLM workflows. Built on Node.js and React with a Prisma/PostgreSQL backend, orchestrated with LangGraph, and deployed on AWS via Docker.',
     techStack: ['Node.js', 'React', 'Prisma', 'PostgreSQL', 'LangGraph', 'Docker', 'AWS'],
     links: [],
     status: 'active',
@@ -236,6 +244,8 @@ export const projects: Project[] = [
   {
     name: 'AI RunSpec',
     description: 'Spotify-style catalog of AI models and frameworks that checks which ones your hardware specs can run.',
+    details:
+      'A Spotify-style library for browsing AI models and frameworks — LLMs, vision, video, audio, and agent frameworks like LangChain and CrewAI. Enter your hardware specs and it flags which models you can realistically run locally, with featured, trending, and new-release shelves.',
     techStack: ['React', 'TypeScript', 'Gemini', 'Vite', 'Cloud Run'],
     links: [{ name: 'Live', url: 'https://can-i-run-ai-369652278516.us-west1.run.app' }],
     status: 'active',
