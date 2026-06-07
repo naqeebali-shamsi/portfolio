@@ -186,10 +186,12 @@ export default function CareerMap({ locations, className = '' }: CareerMapProps)
       const leftPct = (pin.x / 2000) * 100
       const topPct = (pin.y / 857) * 100
       const nudgeX = leftPct < 50 ? 12 : -112
+      // If pin is near the top, place card below; otherwise center vertically
+      const nudgeY = topPct < 30 ? '10%' : '-50%'
       return {
         left: `${leftPct}%`,
         top: `${topPct}%`,
-        transform: `translate(${nudgeX}%, -50%)`,
+        transform: `translate(${nudgeX}%, ${nudgeY})`,
       }
     },
     [pins]

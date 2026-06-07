@@ -88,7 +88,7 @@ export default function CaseStudyPage() {
             </Link>
             <SectionLabel>case study</SectionLabel>
             <h1
-              className="text-5xl md:text-7xl font-bold font-heading tracking-heading mt-4 mb-6"
+              className="text-3xl sm:text-5xl md:text-7xl font-bold font-heading tracking-heading mt-4 mb-6"
               style={{ color: 'var(--text-primary)' }}
             >
               {caseStudy.name}
@@ -103,6 +103,14 @@ export default function CaseStudyPage() {
                   className="inline-flex items-center gap-2 font-mono text-sm font-semibold uppercase tracking-wide px-6 py-3 rounded border border-accent text-accent hover:bg-accent hover:text-bg-dark transition-all"
                 >
                   View on GitHub
+                </ExternalLink>
+              )}
+              {caseStudy.appStoreUrl && (
+                <ExternalLink
+                  href={caseStudy.appStoreUrl}
+                  className="inline-flex items-center gap-2 font-mono text-sm font-semibold uppercase tracking-wide px-6 py-3 rounded border border-accent text-accent hover:bg-accent hover:text-bg-dark transition-all"
+                >
+                  App Store
                 </ExternalLink>
               )}
             </div>
@@ -348,13 +356,21 @@ export default function CaseStudyPage() {
             <h2 className="font-heading text-3xl md:text-5xl font-bold tracking-heading max-w-4xl mx-auto leading-tight" style={{ color: 'var(--text-primary)' }}>
               The best group trip is the one where nobody gets left behind — in the planning or on the ground.
             </h2>
-            <div className="mt-12">
+            <div className="mt-12 flex flex-wrap justify-center gap-4">
               {caseStudy.repoUrl && (
                 <ExternalLink
                   href={caseStudy.repoUrl}
                   className="inline-flex items-center gap-2 font-mono text-sm font-semibold uppercase tracking-wide px-6 py-3 rounded border border-accent text-accent hover:bg-accent hover:text-bg-dark transition-all"
                 >
                   View on GitHub
+                </ExternalLink>
+              )}
+              {caseStudy.appStoreUrl && (
+                <ExternalLink
+                  href={caseStudy.appStoreUrl}
+                  className="inline-flex items-center gap-2 font-mono text-sm font-semibold uppercase tracking-wide px-6 py-3 rounded border border-accent text-accent hover:bg-accent hover:text-bg-dark transition-all"
+                >
+                  App Store
                 </ExternalLink>
               )}
             </div>

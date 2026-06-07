@@ -90,17 +90,25 @@ export function CaseStudy() {
                 </div>
               </div>
 
-              {/* GitHub link */}
-              {caseStudy.repoUrl && (
-                <div className="mt-8 text-center">
+              {/* Project links */}
+              <div className="mt-8 flex items-center justify-center gap-6 flex-wrap">
+                {caseStudy.repoUrl && (
                   <ExternalLink
                     href={caseStudy.repoUrl}
                     className="inline-flex items-center gap-2 text-accent hover:underline font-body text-base"
                   >
                     View on GitHub
                   </ExternalLink>
-                </div>
-              )}
+                )}
+                {caseStudy.appStoreUrl && (
+                  <ExternalLink
+                    href={caseStudy.appStoreUrl}
+                    className="inline-flex items-center gap-2 text-accent hover:underline font-body text-base"
+                  >
+                    App Store
+                  </ExternalLink>
+                )}
+              </div>
             </motion.div>
           </div>
         </div>
