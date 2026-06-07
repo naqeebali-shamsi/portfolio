@@ -176,6 +176,7 @@ export const projects: Project[] = [
     links: [
       { name: 'GitHub', url: 'https://github.com/NomadCrew' },
       { name: 'App Store', url: 'https://apps.apple.com/au/app/nomad-crew/id6743161123' },
+      { name: 'Live', url: 'https://nomadcrew.uk' },
     ],
     status: 'active',
     tier: 1,
@@ -193,14 +194,6 @@ export const projects: Project[] = [
     description: 'Lead-gen site for a Dubai-based American car-parts supplier. Bilingual EN/AR with full RTL, Payload CMS for editorial, scroll-pinned GSAP imagery, WhatsApp-first conversion.',
     techStack: ['Next.js 16', 'TypeScript', 'Payload CMS', 'PostgreSQL', 'Prisma', 'Tailwind', 'GSAP', 'Vercel'],
     links: [{ name: 'Live', url: 'https://mecanum.ae' }],
-    status: 'active',
-    tier: 1,
-  },
-  {
-    name: 'IntelliFill',
-    description: 'AI-powered document processing and form automation with multi-agent workflows.',
-    techStack: ['Node.js', 'React', 'Prisma', 'PostgreSQL', 'LangGraph', 'Docker', 'AWS'],
-    links: [],
     status: 'active',
     tier: 1,
   },
@@ -230,6 +223,14 @@ export const projects: Project[] = [
     techStack: ['Next.js', 'Prisma', 'PostgreSQL', 'React Hook Form', 'Playwright'],
     links: [],
     status: 'shipped',
+    tier: 2,
+  },
+  {
+    name: 'IntelliFill',
+    description: 'AI-powered document processing and form automation with multi-agent workflows.',
+    techStack: ['Node.js', 'React', 'Prisma', 'PostgreSQL', 'LangGraph', 'Docker', 'AWS'],
+    links: [],
+    status: 'active',
     tier: 2,
   },
 ]
