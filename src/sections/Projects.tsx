@@ -2,6 +2,7 @@ import React from 'react';
 import SectionLabel from '@/components/atoms/SectionLabel';
 import TechStackGrid from '@/components/molecules/TechStackGrid';
 import ExternalLinkGroup from '@/components/molecules/ExternalLinkGroup';
+import VideoLightbox from '@/components/VideoLightbox';
 import { projects, type Project } from '@/data/content';
 import './Projects.css';
 
@@ -90,10 +91,12 @@ const Tier1Card: React.FC<{ project: Project }> = ({ project }) => {
 
 const Tier2Card: React.FC<{ project: Project }> = ({ project }) => {
   const [flipped, setFlipped] = React.useState(false);
+  const [demoOpen, setDemoOpen] = React.useState(false);
 
-  // Flip on card click/keypress — but never when the interaction targets a link.
+  // Flip on card click/keypress — but never when the interaction targets a link
+  // or a control opted out via [data-no-flip] (e.g. the "Watch demo" button).
   const toggle = (e: React.MouseEvent | React.KeyboardEvent) => {
-    if ((e.target as HTMLElement).closest('a')) return;
+    if ((e.target as HTMLElement).closest('a, [data-no-flip]')) return;
     setFlipped((f) => !f);
   };
 
@@ -138,6 +141,20 @@ const Tier2Card: React.FC<{ project: Project }> = ({ project }) => {
               linkClassName="project-link"
             />
           )}
+          {project.video && (
+            <button
+              type="button"
+              data-no-flip
+              className="project-demo-btn"
+              aria-haspopup="dialog"
+              onClick={(e) => {
+                e.stopPropagation();
+                setDemoOpen(true);
+              }}
+            >
+              ▶ Watch demo
+            </button>
+          )}
           <span className="project-flip__hint" aria-hidden="true">↻ details</span>
         </div>
 
@@ -159,6 +176,15 @@ const Tier2Card: React.FC<{ project: Project }> = ({ project }) => {
           <span className="project-flip__hint" aria-hidden="true">↺ back</span>
         </div>
       </div>
+      {project.video && (
+        <VideoLightbox
+          open={demoOpen}
+          src={project.video}
+          poster={project.videoPoster}
+          title={`${project.name} — demo`}
+          onClose={() => setDemoOpen(false)}
+        />
+      )}
     </div>
   );
 };
