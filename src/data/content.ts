@@ -204,19 +204,22 @@ export const projects: Project[] = [
     status: 'active',
     tier: 1,
   },
+  {
+    name: 'Aladeen',
+    description: 'Observability and learning layer for agent CLIs (Claude Code, opencode, Codex). Ingests session logs, classifies failures, mines cross-run patterns, and replays known-good blueprints. Published on npm.',
+    techStack: ['TypeScript', 'Node.js', 'Ink', 'MCP', 'Zod', 'Commander'],
+    links: [
+      { name: 'npm', url: 'https://www.npmjs.com/package/aladeen' },
+      { name: 'GitHub', url: 'https://github.com/naqeebali-shamsi/Aladeen' },
+    ],
+    status: 'active',
+    tier: 1,
+  },
   // TIER 2 — Strong secondary
   {
     name: 'Politia',
     description: 'Transparent accountability dashboard for Indian politicians with evidence-backed scorecards.',
     techStack: ['Next.js', 'Python', 'PostgreSQL', 'Docker'],
-    links: [],
-    status: 'active',
-    tier: 2,
-  },
-  {
-    name: 'Aladeen',
-    description: 'Cross-platform TUI for orchestrating multiple AI coding CLIs with unified auth and routing.',
-    techStack: ['TypeScript', 'React Ink', 'Node.js', 'Commander.js'],
     links: [],
     status: 'active',
     tier: 2,
