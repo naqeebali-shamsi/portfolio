@@ -1,0 +1,14 @@
+# Netlify build & deploy config.
+# Makes `netlify deploy --build --prod` work — without this, the CLI finds no
+# build command and publishes the project root (raw /src/main.tsx) instead of dist.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# SPA fallback so client-side routes (e.g. /case-study) resolve on direct load /
+# refresh. Tracked here (public/_redirects is untracked) so routing is reliable.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
