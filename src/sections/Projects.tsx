@@ -103,6 +103,15 @@ const Tier2Card: React.FC<{ project: Project }> = ({ project }) => {
         maxVisible={3}
         className="project-card__tech"
       />
+
+      {project.links.length > 0 && (
+        <ExternalLinkGroup
+          links={project.links}
+          arrow="↗"
+          className="project-card__links project-card__links--compact"
+          linkClassName="project-link"
+        />
+      )}
     </div>
   );
 };

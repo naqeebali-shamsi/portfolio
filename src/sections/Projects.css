@@ -203,6 +203,12 @@
   color: var(--primary);
 }
 
+/* Compact link row for Tier 2 cards — lighter padding/gap than Tier 1 */
+.project-card__links--compact {
+  padding-top: 0.75rem;
+  gap: 1rem;
+}
+
 /* ---------------------------------------------------------------
    Tier 2 card — compact
    --------------------------------------------------------------- */
