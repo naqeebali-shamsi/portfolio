@@ -188,7 +188,7 @@ export const projects: Project[] = [
   },
   {
     name: 'Audex',
-    description: 'Desktop app for financial audit automation — Excel workbook generation and PDF reporting.',
+    description: 'Desktop app for financial audit automation that generates Excel workbooks and PDF reports.',
     techStack: ['Electron', 'TypeScript', 'VBA', 'Excel Automation', 'PDF'],
     links: [{ name: 'Microsoft Store', url: 'https://apps.microsoft.com/detail/9P87TFB7D3TD?hl=en-us&gl=AE&ocid=pdpshare' }],
     status: 'active',
@@ -218,7 +218,7 @@ export const projects: Project[] = [
     name: 'Politia',
     description: 'Transparent accountability dashboard for Indian politicians with evidence-backed scorecards.',
     details:
-      'Aggregates official public data on every Indian Member of Parliament into one searchable, source-backed dashboard — each metric traces to an official record (500k+ election records ingested). Politically neutral by design: it presents the data and lets citizens, journalists, and researchers draw their own conclusions.',
+      'Aggregates official public data on every Indian Member of Parliament into one searchable, source-backed dashboard where each metric traces to an official record (500k+ election records ingested). Politically neutral by design: it presents the data and lets citizens, journalists, and researchers draw their own conclusions.',
     techStack: ['Next.js', 'Python', 'PostgreSQL', 'Docker'],
     links: [],
     status: 'active',
@@ -250,9 +250,29 @@ export const projects: Project[] = [
     name: 'AI RunSpec',
     description: 'Spotify-style catalog of AI models and frameworks that checks which ones your hardware specs can run.',
     details:
-      'A Spotify-style library for browsing AI models and frameworks — LLMs, vision, video, audio, and agent frameworks like LangChain and CrewAI. Enter your hardware specs and it flags which models you can realistically run locally, with featured, trending, and new-release shelves.',
+      'A Spotify-style library for browsing AI models and frameworks: LLMs, vision, video, audio, and agent frameworks like LangChain and CrewAI. Enter your hardware specs and it flags which models you can realistically run locally, with featured, trending, and new-release shelves.',
     techStack: ['React', 'TypeScript', 'Gemini', 'Vite', 'Cloud Run'],
     links: [{ name: 'Live', url: 'https://can-i-run-ai-369652278516.us-west1.run.app' }],
+    status: 'active',
+    tier: 2,
+  },
+  {
+    name: 'Valytech',
+    description: 'AI-automation consultancy that maps process waste with LEAN and Six Sigma, then ships it as agent workflows.',
+    details:
+      'An AI-automation consultancy I built end to end, from the name and brand to the copy and a hand-coded site with no framework. The pitch is calm by design. Find where the work leaks time with LEAN and Six Sigma, then turn proven SOPs into agent workflows. The build is the proof: vanilla JS over a hand-authored design-token CSS system, shipped on Cloudflare.',
+    techStack: ['HTML', 'CSS', 'JavaScript', 'Design Tokens', 'Cloudflare'],
+    links: [{ name: 'Live', url: 'https://valytech.com' }],
+    status: 'active',
+    tier: 2,
+  },
+  {
+    name: 'SpeakingBrand',
+    description: 'A positioning diagnostic that helps founder-led brands sharpen what they stand for before spending on growth.',
+    details:
+      'A positioning diagnostic for founder-led brands, currently in private beta by application. Most early brands pour money into growth before they can say clearly what sets them apart; the tool fixes that first. Designed, written, coded, and shipped solo: a hand-built static site with Rough.js sketched visuals and a custom waitlist, on Cloudflare.',
+    techStack: ['HTML', 'CSS', 'JavaScript', 'Rough.js', 'Cloudflare'],
+    links: [{ name: 'Live', url: 'https://speakingbrand.com' }],
     status: 'active',
     tier: 2,
   },
