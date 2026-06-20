@@ -13,8 +13,8 @@ export const heroTagline = "I make tech work harder so you don't have to";
 // ---------------------------------------------------------------------------
 
 export const howIBuildStatements = [
-  "Good architecture is a series of quiet bets on the future — each one earning trust the moment requirements shift.",
-  "Ship small, verify early, compound gains. The best systems aren't designed in a single pass — they're grown through disciplined iteration.",
+  "Good architecture is a series of quiet bets on the future. Each one earns trust the moment requirements shift.",
+  "Ship small, verify early, compound gains. The best systems aren't designed in a single pass; they're grown through disciplined iteration.",
   "Security and simplicity aren't at odds. The most resilient code is the code that never needed to be clever.",
 ] as const;
 
@@ -139,14 +139,14 @@ export interface CaseStudy {
 export const caseStudy: CaseStudy = {
   name: "NomadCrew",
   problem:
-    "Coordinating group trips across time zones, budgets, and preferences is fragmented — scattered chats, spreadsheets, and lost context make collaboration painful.",
+    "Coordinating group trips across time zones, budgets, and preferences is fragmented. Scattered chats, spreadsheets, and lost context make collaboration painful.",
   approach:
     "A collaborative trip-coordination platform built with Go and React Native, featuring real-time chat, matrix-based authorization, and a relational data model designed for multi-party planning.",
   techDecisions: [
-    "Go for the backend — strong concurrency primitives and low operational overhead at scale.",
-    "React Native for cross-platform mobile — single codebase reaching both iOS and Android.",
-    "PostgreSQL for relational data — enforces referential integrity across trips, members, and permissions.",
-    "WebSockets for real-time updates — instant chat and live trip-state synchronization.",
+    "Go for the backend: strong concurrency primitives and low operational overhead at scale.",
+    "React Native for cross-platform mobile: single codebase reaching both iOS and Android.",
+    "PostgreSQL for relational data: enforces referential integrity across trips, members, and permissions.",
+    "WebSockets for real-time updates: instant chat and live trip-state synchronization.",
   ],
   repoUrl: "https://github.com/naqeebali-shamsi/nomadcrew",
   appStoreUrl: "https://apps.apple.com/au/app/nomad-crew/id6743161123",
