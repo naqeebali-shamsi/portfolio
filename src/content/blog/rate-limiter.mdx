@@ -1,0 +1,200 @@
+export const meta = {
+  slug: 'rate-limiter',
+  title: 'Design a Rate Limiter: Token Bucket vs Sliding Window',
+  description:
+    'Token bucket and sliding window cost the same, so choose by burst intent. The hard part is the atomicity race on Redis, and where you enforce the limit.',
+  headline: 'Design a Rate Limiter: Token Bucket vs Sliding Window',
+  deck: 'The algorithm is the easy half. The interview is won on the race condition between two nodes and the failure mode when Redis is gone.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '13 min',
+  tags: ['rate-limiting', 'distributed-systems', 'redis', 'system-design', 'token-bucket', 'api-design'],
+  faq: [
+    {
+      q: 'Token bucket or sliding window, which should I use?',
+      a: 'They cost the same: two values per key, one atomic script, O(1) memory. So pick by intent rather than efficiency. Use token bucket when a burst is a feature you want to permit, such as a flash sale or a batch job that fires a hundred requests then goes quiet, because the bucket lets a client spend saved tokens up to its capacity before throttling to the steady rate. Use the sliding window counter when you want a smooth rolling cap and there is no saved burst credit to hand out. If a burst is a bug, sliding window. If a burst is a feature, token bucket.',
+    },
+    {
+      q: 'Why does GET then INCR break a distributed rate limiter?',
+      a: 'It is a read-modify-write across the network with a gap in the middle. Between reading the counter and incrementing it, another node interleaves. Under load, several nodes all read 99 against a limit of 100, all decide the request is allowed, and all increment, so the counter overshoots and the limit is breached. This is a time-of-check-to-time-of-use race and it is invisible in any single-node test. The fix is to make check and increment one atomic operation, either with INCR returning the new value or with a Lua script that Redis runs with no other command interleaving.',
+    },
+    {
+      q: 'What status code should a rate limiter return, 429 or 503?',
+      a: 'The cause picks the code. 429 Too Many Requests means the client exceeded its own quota, which is the everyday rate-limit response defined in RFC 6585. 503 Service Unavailable means the server is shedding load to protect its own capacity, which is a different problem owned by the server rather than the client. Stripe deliberately returns 503 for its fleet and worker load shedders. Returning 429 for everything is a junior tell, because it tells a well-behaved client to back off when the real issue was the server reserving capacity.',
+    },
+    {
+      q: 'Should a rate limiter fail open or fail closed when Redis is down?',
+      a: 'Decide it per endpoint rather than globally. Fail open means you allow the request when the limiter cannot decide, which prioritizes availability and is right for most read and content APIs, because a brief unbounded burst beats a full outage. Fail closed means you reject when the limiter cannot decide, which prioritizes protection and is right for auth endpoints and anything guarding fragile infrastructure, where unbounded login attempts are worse than user friction. The mature setup pairs the choice with a permissive local fallback limit and a circuit breaker so a slow Redis does not add its timeout to every request, and you test the failure path in staging because that is where the bugs hide.',
+    },
+    {
+      q: 'What is GCRA and why do staff engineers reach for it?',
+      a: 'GCRA, the Generic Cell Rate Algorithm, is a leaky bucket meter that stores a single timestamp and uses the clock instead of a background drainer. It came from ATM telecom for policing fixed-size cells. It keeps one value per key, the Theoretical Arrival Time, and decides each request with one comparison: reject if the request arrives earlier than that time minus a burst tolerance, otherwise allow and push the time forward by the emission interval. It does the same job as a leaky bucket with half the storage and far less code, has no queue and no drainer to fall behind, and hands you the exact Retry-After delay for free. Stripe and Heroku use it; redis-cell ships it as a native Redis command.',
+    },
+  ],
+}
+
+A rate limiter is the one component whose entire job is to behave well during the exact traffic surge that breaks everything else. That framing disqualifies most of the obvious designs. A limiter that needs a network round trip per request becomes a bottleneck under the load it exists to police. A limiter with one shared counter becomes the hot spot that falls over first. The thing meant to save you is the thing the storm hits hardest.
+
+So this is not really a post about four algorithms and a pros-and-cons table, even though the title pits two of them against each other. The algorithms are the easy half, and they mostly converge. The senior content lives in three claims shallow treatments skip: the two leading algorithms cost the same, so you choose by burst intent rather than efficiency; the genuinely hard part is a race condition solved by atomicity; and real systems layer enforcement across edge, gateway, and service while designing the failure mode on purpose. If you have read [the system design interview framework](/blog/system-design-interview-framework), this is its core move applied to a limiter: name the hard part out loud, then defend a decision.
+
+## The algorithm family, and the flaw each one fixes
+
+Every rate-limiting algorithm answers one question: how do you decide, right now, whether this request fits under a budget. They read best as a sequence, each one fixing the precise failure of the one before it.
+
+### Fixed window counter
+
+Keep one counter per key per time window, reset on the boundary. In Redis this is the famous `INCR` plus `EXPIRE` pair, the cheapest thing that can possibly work: O(1) memory, one or two operations.
+
+It has one sharp flaw. The counter resets at an arbitrary wall-clock instant, so a client can fire its full quota in the last moment of one window and the full quota again in the first moment of the next. A limit of "100 per minute" admits up to 200 requests in a roughly two-second span across the boundary. Cloudflare calls this out directly: the naive approach lets regular traffic spikes sail through because counters reset on a fixed schedule the traffic can exploit.
+
+```
+   window N (100 used)  |  window N+1 (100 used)
+   ........[ 100 reqs ] | [ 100 reqs ]........
+                        ^
+              200 requests in ~2 seconds across the reset
+```
+
+A shorter window does not fix this. The boundary burst is independent of window length, because there is a boundary at the end of every window no matter how short. Fixed window is the right call only when a 2x burst is genuinely fine.
+
+### Sliding window log
+
+Store a timestamp for every request, usually in a Redis sorted set; on each request, drop entries older than the window and count what remains. Exact, no boundary artifact. The cost kills it: O(N) memory per key, so a 10,000-per-minute limit means up to 10,000 timestamps for a single client. Correct-but-does-not-scale. Reach for it only at small N, like a strict 5-per-hour cap on a sensitive action.
+
+### Sliding window counter
+
+The pragmatic middle, and what Cloudflare runs in production. Keep two numbers per key, the count for the previous window and the current window, and interpolate:
+
+```
+estimated_rate = prev_count * ((window - elapsed_in_current) / window) + current_count
+```
+
+Cloudflare's worked example: a limit of 50 per minute, 15 seconds into the current minute, 18 requests so far this minute and 42 in the minute before. The estimate is `42 * ((60 - 15) / 60) + 18 = 42 * 0.75 + 18 = 49.5`, under 50, so the request is allowed. As the current window fills, the weight on the previous window decays to zero.
+
+What makes this safe to ship is not a proof, it is a measurement. Across 400 million requests from 270,000 sources, Cloudflare found only 0.003% of requests wrongly allowed or limited, with an average 6% difference between real and approximate rate, zero false positives, and three false negatives each under 15% over. So the honest claim is not "accurate," it is "approximate, ~6% average error, and that is fine." It assumes the previous window's traffic was roughly uniform, so a wildly bursty prior window skews the estimate, but the skew is bounded.
+
+### Leaky bucket
+
+Requests enter a FIFO queue that drains at a fixed rate; overflow is dropped. Its strength is a perfectly smooth, constant output rate, exactly what you want when the downstream cannot tolerate bursts at all, like a legacy system with a hard concurrency ceiling. Its weakness is the queue and the drainer. As Brandur Leach puts it, if the drip process goes offline or cannot drain all the buckets, new requests get limited incorrectly, and requests wait in line, so the algorithm adds latency by design. Hold that fragility in mind, because the next algorithm exists to delete it.
+
+### GCRA, the staff-level answer
+
+GCRA, the Generic Cell Rate Algorithm, is a leaky bucket that uses the clock instead of a drainer and stores a single timestamp. It was born in ATM telecom, defined by the ITU-T to police fixed-size cells, which is why the name sounds like it escaped a networking textbook. It carries two parameters and one piece of state. `T`, the emission interval, is the ideal spacing between requests, equal to `1 / rate`. `τ` (tau), the burst tolerance, is how much earlier than ideal a request may arrive, the knob that permits bursts. `TAT`, the Theoretical Arrival Time, is the stored state: when the next request should arrive if traffic were perfectly spaced.
+
+The decision, straight from the formal virtual-scheduling definition, is two lines. For a request arriving at `ta`: reject if `ta < TAT - τ`, otherwise allow and set `TAT = max(ta, TAT) + T`. That is the whole algorithm, no queue and no drainer, one timestamp and one comparison. Tony Finch's line is the one to remember: GCRA does the same job as the leaky bucket with half the storage and much less code, and it yields Retry-After for free, since a rejected request's wait until it would conform is exactly `(TAT - τ) - ta`. Stripe and Heroku run it; `redis-cell` ships it as a native `CL.THROTTLE` command. GCRA signals depth in an interview, but it is not the spine. That comes next.
+
+## Token bucket vs sliding window, the head-to-head
+
+Token bucket is Stripe's choice. A bucket of capacity `B` refills at `r` tokens per second. Each request costs one token (or more, for expensive endpoints), allowed only if a token is available. Its defining property is controlled burst: a client spends accumulated tokens in a spike up to `B`, then gets forced down to the steady rate `r`. Stripe's framing is that it lets users burst briefly, like during a flash sale, while still enforcing a steady average.
+
+What makes it cheap on Redis is lazy refill. You do not drip tokens into millions of buckets with a timer; you compute the refill on read from elapsed time: `tokens = min(B, tokens + (now - last_refill) * r)`. State is two values per key, the token count and the last-refill timestamp. O(1).
+
+Here is the comparison that matters:
+
+| Dimension | Token bucket | Sliding window counter |
+| --- | --- | --- |
+| Controls best | Burst shape (spike up to B, then throttle) | Rate over a rolling window |
+| State per key | 2 values (tokens, last-refill ts) | 2 values (prev count, curr count) |
+| Memory | O(1) | O(1) |
+| Accuracy | Exact for its model | Approximate, ~6% average error |
+| Burst handling | First-class, intended | Smooths bursts, no saved credit |
+| Natural Retry-After | Yes (time to next token) | Yes (time for estimate to drop) |
+| Famous user | Stripe | Cloudflare |
+
+Read the memory row twice. They are the same: both O(1), both two values, both fit inside one atomic script. The choice between them is not an efficiency question, which is exactly where most comparisons go wrong by implying one is lighter.
+
+The choice is about intent. Token bucket controls burst size directly through the `B` knob; the sliding window counter controls rate over a window and hands out no saved burst credit at all. So the line to say out loud is token bucket if bursts are a feature, sliding window if bursts are a bug. A flash sale or a batch job that fires a hundred requests then goes quiet wants token bucket. A steady API where any spike is abuse wants the sliding window. (And token bucket is not leaky bucket: one permits bursts by spending saved tokens, the other smooths them with a constant drain. Opposite behavior, often confused because they share the word.)
+
+## The race nobody draws
+
+Everything above is single-node thinking. The moment your limiter runs on more than one instance, which it always does, the counter has to live somewhere shared, and the obvious approach has a bug shallow treatments never mention. This is the heart of the senior answer. The naive distributed limiter is a read-modify-write across the network:
+
+```
+v = GET key            # read
+if v >= limit: deny    # decide
+INCR key               # write
+```
+
+Between the `GET` and the `INCR`, another node's request interleaves. Under real concurrency, K nodes all read `v = 99` against a limit of 100, all decide "allowed," and all `INCR`. The counter sails past 100 and the limit is breached. This is the same time-of-check-to-time-of-use race that haunts [idempotent webhooks](/blog/idempotent-webhooks), where two copies of an event both check, both see nothing, and both proceed. Same shape, different surface, and like there it is invisible in any test that sends one request at a time, which is why it survives review and shows up only under load.
+
+You cannot close the gap with more application code, because the gap is between your process and the database, and another process is living inside it. You close it by making check and write a single atomic operation that the one component able to serialize concurrent writers performs for you. Three correct fixes, in rising sophistication.
+
+First, a single atomic op where the algorithm allows it. For fixed window, `INCR` returns the new value, so increment-then-compare is atomic on the increment. Pair it with `EXPIRE`, and seed that TTL atomically too, or a process dying between `INCR` and `EXPIRE` leaks a key with no expiry.
+
+Second, the standard answer: a Lua script. Redis runs it atomically on the server, with no other command between its reads and writes, so you do the entire token-bucket cycle as one indivisible unit in a single round trip: read the hash, compute the lazy refill, branch on whether a token is available, conditionally decrement, write back. This is exactly what Stripe's production gist does when it says it relies on Redis scripts executing atomically. The point most people miss is that Lua's load-bearing property is atomicity, not saving round trips. It is also why Lua beats the alternatives: `MULTI`/`EXEC` cannot branch on a value read mid-transaction, so it cannot express "decrement only if a token is available," and `WATCH` with optimistic locking can but needs a client retry loop that thrashes under exactly the contention a rate limiter sees.
+
+Third, GCRA in Lua, or `redis-cell` directly, where `CL.THROTTLE` ships the whole TAT update as a native atomic command that even returns the remaining quota and the Retry-After delay.
+
+```
+   Node A          Node B          Redis (counter = 99, limit 100)
+     |  GET ----------|---------------> 99
+     |                |  GET ---------> 99
+     |  decide allow  |  decide allow
+     |  INCR -------->|---------------> 100
+     |                |  INCR --------> 101   <- limit breached
+                       ... wrap read-decide-write in ONE Lua call and
+                       Redis serializes them: only one sees room.
+```
+
+That sequence, and its resolution, separates a senior answer from a junior one. A shallow article describes algorithms. A senior article describes the race condition and where enforcement lives.
+
+## Redis is not the finish line
+
+Per-key atomicity fixes correctness, but a single Redis brings its own problems a staff engineer raises before being asked.
+
+A hot key is the first: one popular tenant serializes all its traffic through a single key, a single Redis slot, a bottleneck no matter how fast Redis is. Shard the key into `key:{bucket_0}` through `key:{bucket_n}` and sum, or demote that whale tenant to local limiting.
+
+Throughput is the second, and the fix is the keystone of the design. Every request hopping to Redis adds latency and load to the component under siege. The two-tier pattern removes that: a local, coarse token bucket on each instance absorbs the bulk of the traffic, and a global Redis-backed limit does the fine accounting for what gets through. Envoy documents this exactly, with the local bucket absorbing large bursts that might otherwise overwhelm the global service before the global descriptor-based limit finishes the job, and Kong's `cluster` and `redis` policies are the same idea with periodic counter sync. The point is structural: the limiter must survive the surge it polices, so you do not put a network hop in front of every request.
+
+Consistency is the third, and it connects to a theme in [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum). Redis replication is asynchronous, so a failover to a replica that lost recent writes briefly under-counts. For rate limiting that is almost always fine, since a handful of extra requests during a failover is a non-event; the senior signal is naming it and explaining why it is acceptable here when it would not be for a balance. Lazy refill and GCRA also lean on a monotonic clock, so skew distorts decisions, which is why the IETF draft specifies windows in seconds to dodge a clock-synchronization dependency.
+
+## Where to enforce: defense in depth
+
+"Put it at the gateway" is half an answer. Rate limiting is layered, each layer catching a threat the others cannot see.
+
+| Layer | Example | Best for | Limitation |
+| --- | --- | --- | --- |
+| Edge / CDN | Cloudflare in front | Volumetric abuse, DDoS, crude per-IP caps before origin | Coarse; blind to identity and cost |
+| API gateway | Kong, Envoy, AWS API Gateway | Per-API-key and per-route business quotas | Adds a shared-state dependency |
+| Service / app | In-process limiter or sidecar | One expensive endpoint or fragile downstream; concurrency | Each service reimplements |
+
+The edge stops the flood before it costs you anything. The gateway enforces business quotas tied to identity. The service protects the specific expensive thing the layers above cannot price, like a search endpoint that hammers a database. Stripe's layering is the canonical example of what to limit, and it makes a point most designs miss: rate limiting in production is several distinct limiters on different axes, not one algorithm. Stripe runs a request rate limiter (token bucket, rejecting millions a month), a concurrent request limiter capping in-flight requests on expensive endpoints (a different axis, around 12,000 times a month), and two load shedders that reserve capacity and tier traffic during incidents. The reservation math is worth stealing: with 20% reserved, any non-critical request over its 80% allocation is rejected, with a 503, not a 429. Concurrency is orthogonal to rate, and sizing these axes is the same back-of-envelope work as [capacity estimation](/blog/capacity-estimation). So one Redis-backed limiter at the gateway is not the architecture; a single global limiter is both a bottleneck and a single point of failure.
+
+## The response is part of the control loop
+
+What you return on rejection is not an afterthought, because the client's reaction feeds straight back into your load, and a bad response manufactures the next wave. Status codes first, with the distinction that trips up juniors. 429 Too Many Requests (RFC 6585) means the client exceeded its own quota. 503 Service Unavailable means the server is shedding load to protect its own capacity. The cause picks the code. Stripe returns 503 for its shedders precisely because the problem there is the server's capacity, not the client's behavior. Returning 429 for everything tells a well-behaved client "you misbehaved, back off" when the truth was "we are protecting ourselves."
+
+Retry-After is the cooperation primitive. Defined in RFC 9110 as an HTTP-date or delay-seconds, paired with 429 by RFC 6585, it tells a client exactly how long to wait. Without it, rejected clients hammer in a tight loop and amplify the overload, and worse, they synchronize into a thundering herd retrying at the same instant. Both token bucket and GCRA compute the exact wait for free, so there is no excuse to omit it; pair it with jittered backoff to desynchronize the retries. How these timeouts shape the latency your callers see is the tension in [latency and the tail](/blog/latency-throughput-tail).
+
+The IETF `RateLimit` header fields go further and tell the client its budget before it hits the wall: `RateLimit: "default";r=50;t=30` says 50 remaining and 30 seconds to reset, and `RateLimit-Policy` advertises the policy. The nuance worth knowing is that the draft does not mandate 429 and takes no position on whether failed responses count against quota, so these headers are advisory, can ride on a 200, and separate "tell the client its budget" from "reject this request."
+
+## The failure mode you design on purpose
+
+The last question separates people who have operated a limiter from people who only built one: what happens when the limiter itself is down, Redis unreachable or slow enough that it might as well be. You have to decide, and the wrong default has burned real teams.
+
+Fail open means you allow the request when the limiter cannot decide. It prioritizes availability, right for most customer-facing read and content APIs, because a brief unbounded burst beats a total outage. The correct degraded behavior is "no limit enforced," not "503 everything," which would turn a limiter outage into a full outage. Fail closed means you reject when the limiter cannot decide. It prioritizes protection, right for auth endpoints and limiters guarding fragile infrastructure, where unbounded login attempts or load on a delicate downstream is worse than friction.
+
+So "fail closed for safety, always" is often backwards. The mature answer is per-endpoint: fail open for content and reads, fail closed for `/login` and capacity-critical paths. Then pair it with a local fallback limit, more permissive than normal but not unbounded, so a Redis outage degrades to coarse local limiting rather than to nothing, and a circuit breaker, so a slow Redis does not add its full timeout to every request and turn a dependency hiccup into a fleet-wide latency catastrophe. The kicker nobody tells you until it bites: test the failure mode in staging, because teams routinely discover their fail-open path has a bug only during a real outage, the worst possible moment to learn the safety net has a hole.
+
+## How to decide
+
+Strip away the algorithm zoo and the decision is short.
+
+| Question | Answer |
+| --- | --- |
+| Token bucket or sliding window? | Same cost. Bursts a feature, token bucket. Bursts a bug, sliding window. |
+| Need a perfectly smooth output rate? | Leaky bucket or GCRA. Prefer GCRA, one timestamp, no drainer. |
+| Tolerate a 2x burst for near-zero cost? | Fixed window. |
+| Correct across nodes? | One atomic operation: Lua script, or INCR-return. Never GET-then-INCR. |
+| Where does it run? | Layered. Edge for floods, gateway for quotas, service for expensive endpoints. Local plus global. |
+| What does rejection return? | 429 for client over quota, 503 for server load shed, always with Retry-After. |
+| What when Redis dies? | Per-endpoint. Fail open for reads, fail closed for auth, with a local fallback and a circuit breaker. |
+
+None of this is exotic. What separates a design that survives production from one that demos cleanly is whether the unglamorous parts are present: the single atomic script instead of a read-then-write, the two-tier local-plus-global structure instead of one global counter, the deliberate fail-open-or-closed call instead of an accident. The same patterns sit behind [event-driven RBAC](/blog/event-driven-rbac) and the sibling builds in this batch, a [URL shortener](/blog/url-shortener), [consistent hashing](/blog/consistent-hashing), and a [distributed cache](/blog/distributed-cache), which all lean on cheap O(1) operations and a clear story for when the shared layer is gone. Limiting abuse traffic in [NomadCrew](/case-study/nomadcrew) and enforcing per-tenant quotas in [IntelliFill](/case-study/intellifill) came down to the same calls every time.
+
+## The honest landing
+
+The title asks you to pick between token bucket and sliding window, and the answer is anticlimactic: they cost the same, so pick by whether a burst is something you want or something you fear. That is the easy half. The real work is the other three. Make the check and the increment one atomic operation, because a distributed limiter is a race condition with an algorithm bolted on, and Lua is how you win it. Layer the enforcement, because one global counter is the bottleneck and the single point of failure dressed up as a solution. And decide, per endpoint, what the limiter does the day it cannot reach Redis, because that day is coming and the default you never chose is the one that pages you. Get those right and the limiter does its job: it stays standing in the exact storm it was built for. Skip them and it becomes the first thing to fall.
+
+## FAQ
+
+<FAQ />

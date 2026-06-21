@@ -1,0 +1,142 @@
+export const meta = {
+  slug: 'data-modeling',
+  title: 'Data Modeling: Normalization, Denormalization, and Designing for Access Patterns',
+  description:
+    "Normalize for write correctness, denormalize for read latency, model for the access patterns you can name. How data shape decides what stays cheap later.",
+  headline: 'Data Modeling: Normalization, Denormalization, and Designing for Access Patterns',
+  deck: 'The senior skill is not picking a side between normalized and denormalized; it is enumerating the access patterns and choosing per workload.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['data-modeling', 'databases', 'normalization', 'nosql', 'dynamodb', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between normalization and denormalization?',
+      a: "Normalization stores each fact exactly once and references it by ID, which keeps writes correct by construction: one logical change touches one row, so you cannot leave the database internally inconsistent. Denormalization deliberately duplicates data so a hot read becomes a single fetch instead of a join, trading that read latency for a write-time obligation to keep every copy in sync. Normalization optimizes correctness of writes and flexibility for queries you did not anticipate; denormalization optimizes latency for the specific reads you did anticipate.",
+    },
+    {
+      q: 'Is NoSQL schemaless?',
+      a: "No. NoSQL is schema-on-read, not schemaless. The schema still exists, but it is enforced by your application code at read time rather than by the database at write time, and it is effectively frozen by the access patterns you baked into the physical layout. You did not eliminate the schema; you moved it from query-time to model-time and spent your flexibility up front. This is why a genuinely new access pattern in a denormalized store can force a data migration rather than a new query.",
+    },
+    {
+      q: 'When should I use single-table design in DynamoDB?',
+      a: "Use single-table design when you need to retrieve multiple heterogeneous item types in a single request and you can enumerate your access patterns up front. It pre-joins related entities into an item collection sharing a partition key, so one Query returns them together at single-digit-millisecond latency. Skip it when you need multiple DynamoDB Streams consumers, when you need clean analytics exports, or when multi-table design is simply easier for your team to reason about. AWS itself names all three cases.",
+    },
+    {
+      q: 'Why does denormalization require a sync mechanism?',
+      a: "Every duplicated field is a standing liability. The moment a fact lives in more than one place, a single logical change has to update every copy, and if any copy is missed the database is now internally inconsistent. That is the update anomaly, live in production. So denormalization is not free read speed; it is read speed financed by a write-time consistency obligation. You discharge that obligation with a mechanism such as a transactional outbox, a change-data-capture stream, or an asynchronous fan-out, and you price the write amplification it creates.",
+    },
+    {
+      q: 'How do I decide between SQL and NoSQL for a new service?',
+      a: "Stop asking SQL or NoSQL and start asking three questions: what are all the access patterns, what is the read-to-write ratio on each, and which ones sit on the hot path. Only then pick a model. Relational with normalization is the safe default when the access patterns are unknown or will change, because schema-on-write mistakes are cheap to fix. A denormalized or single-table design wins when reads dominate, latency is tight, and you can name every pattern, but an access-pattern miss there is a migration, not an ALTER TABLE.",
+    },
+  ],
+}
+
+Every schema is a bet about the future. You are wagering that the questions you will ask of the data tomorrow look like the questions you can name today. Get the bet right and the queries you need are a single cheap fetch. Get it wrong and the query you need is an expensive join, a multi-table dance, or a full data migration. How you shape data decides what is cheap and what is impossible later, and almost everything below is a way of pricing that bet before you place it.
+
+The trap is that the bet feels free at the start. You model the entities, the writes go in, the reads come out, and it works in every test, because in every test the data is small and the access pattern is the one you happened to build. The cost shows up later, at scale, on a path you did not plan for. So the real work is not drawing tables. It is deciding, deliberately, what you optimize for and what you trade to get it.
+
+## One fact, one place
+
+Start with the default, because the default is right far more often than the internet suggests. Normalization is the discipline of storing each fact exactly once and referencing it by ID everywhere else. Third normal form, introduced by Codd in 1972, has a mnemonic that survives because it is genuinely useful: every non-key field must be a fact about the key, the whole key, and nothing but the key. "The key" gets you first normal form, "the whole key" gets you second (no partial dependency), and "nothing but the key" gets you third (no transitive dependency, no non-key field that depends on another non-key field).
+
+That is the exam answer. The senior answer is that normalization is not an aesthetic about tidiness; it is a machine for preventing three specific failures. An insertion anomaly is when you cannot record a fact without inventing unrelated data, like being unable to add a new course because courses only exist inside enrollment rows and nobody has enrolled yet. An update anomaly is when one logical change requires editing many rows, and if you miss one the database is now lying to you. A deletion anomaly is when removing the last row for one thing silently destroys a fact about another, like deleting the last employee at a branch and losing the branch's address with them. Normalization kills all three by construction: if a fact lives in exactly one place, there is no second copy to fall out of sync, nowhere to lose it by accident, and no host row it depends on for its existence.
+
+Here is the canonical worked example, straight from Kleppmann. On a profile, you could store a user's region as the string "Greater Seattle Area" right there in the user row. Normalized, you instead store a `region_id` foreign key pointing at a `regions` table that holds the name once. Why bother? Consistent spelling across every profile. No ambiguity between two cities that share a name. One place to edit when the canonical name changes. Localization, so you can render the region in the user's language. And better search, because a structured ID beats a free-text match. The deepest reason is the quietest one: the advantage of an ID is that because it has no meaning to humans, it never needs to change. The display name is volatile; the key is stable. The price you pay is that anything human-meaningful now lives behind a join.
+
+That price is the whole debate in one sentence. The [database mindmap](/blog/database-mindmap) places this default among the other moves: normalization makes writes correct and cheap and pushes the cost onto reads.
+
+## The economic flip nobody taught you
+
+Why was normalization ever the unquestioned default? Because of an economic fact that has since inverted, and missing the inversion is what makes most database advice feel a decade stale.
+
+Rick Houlihan, who designed some of the largest DynamoDB workloads at Amazon, puts it bluntly. The relational model normalizes to de-duplicate data because, historically, storage was the most expensive resource in the datacenter. In the 1970s and 80s, disk dominated the bill, so you removed every redundant byte and reconstructed the full picture at read time with a join. His rhetorical question is the one to sit with: why would you want to use the technology that is optimizing the least expensive resource in the datacenter? Today storage is nearly free and compute is the expensive resource. A SQL join burns CPU at read time, every single read, forever. NoSQL denormalizes to pre-compute that join once at write time and pay in cheap storage instead. His line lands hard: NoSQL is not a flexible database, it is an efficient database.
+
+```text
+1970s-80s   storage = scarce   ->  normalize, de-duplicate, join at read
+2010s+      compute = scarce   ->  denormalize, pre-compute, store the result
+
+The whole NoSQL movement is this one substitution:
+trade expensive read-time CPU for cheap write-time storage.
+```
+
+Sit with the consequence. Denormalization is not a hack you reach for when normalization gets slow. It is a deliberate decision to spend the resource that got cheap to save the resource that got expensive. Whether it is the right call depends entirely on your workload. But the framing matters: you are not breaking the rules, you are optimizing a different cost function for a different decade.
+
+## The shape of the data, not the count of the tables
+
+The model debate is usually framed as relational versus document, SQL versus NoSQL. That framing hides the thing that actually decides it: the shape of your data and the shape of your access.
+
+A document model fits one specific shape extremely well: a tree of one-to-many relationships. A resume is the clean example. One user has many positions, many education entries, one contact block, the whole thing a tree with the user at the root. Store it as a single JSON document and you get locality, the property that data accessed together lives together physically. The entire resume is one contiguous string, fetched in one read, with no joins and no shredding across half a dozen tables. You also get schema flexibility and closeness to your application objects, which trims the impedance mismatch that ORMs exist to paper over. For loading the whole tree at once, this genuinely wins.
+
+Where does it break? The moment the data stops being a tree. Many-to-one and many-to-many relationships are where the document model gets awkward, because documents have poor join support. If a position references a company, and that company is referenced by thousands of positions, you have two bad options: embed the company into every position (and re-create the update anomaly you just escaped) or emulate the join in application code (and reinvent the query planner badly). Kleppmann's verdict is worth memorizing because it is precise: for highly interconnected data, the document model is awkward, the relational model is acceptable, and graph models are the most natural. The deciding factor is whether your data is a tree or a graph.
+
+This is also the cleanest way to understand schema-on-read versus schema-on-write. Relational is schema-on-write: the database enforces structure at insert time, and exactly one schema is valid at any moment. Document is schema-on-read: the structure is implicit and applied by whatever reads it, so heterogeneous shapes coexist in the same collection. It is static versus dynamic typing, applied to data instead of code. Neither is free. Schema-on-write costs you a migration when the shape changes; schema-on-read costs you the certainty that every record has the shape your code assumes.
+
+## What you are really storing is an aggregate
+
+Martin Fowler gives the unifying abstraction that ties key-value, document, and column-family stores together. They are all aggregate-oriented: they operate on a rich structure of closely related data as a single unit. That aggregate, the order with its line items, the user with their profile, is the boundary for atomic operations. Here is the load-bearing insight most people skip: it is the same boundary for two different things at once.
+
+The aggregate is the transaction boundary. This is precisely why aggregate-oriented stores can drop multi-record ACID transactions and still be safe: the aggregate is the atomic unit, so an operation on one is already atomic by definition. It is also the unit of distribution, because when you shard, you shard by the aggregate. So a single decision, where you draw the boundary, simultaneously fixes your consistency model and your sharding strategy. Draw it well and both work; draw it badly and both break together. How that boundary becomes a shard key is its own topic, covered in [database sharding](/blog/partitioning-sharding).
+
+Relational databases are aggregate-ignorant. They shred your data into normalized rows with no notion of which rows belong together as a unit, and that is not a flaw, it is the feature that lets you slice the data along arbitrary new dimensions later. You can ask "total sales across all orders this quarter" precisely because the database never committed to the order as an indivisible aggregate. Aggregate-oriented stores win when your access aligns with the aggregate; relational wins when you must analyze across aggregates. This is the honest argument for polyglot persistence, using more than one storage technology because different shapes genuinely fit different stores, and also the reason it is a real cost rather than a free win. Two stores means two consistency models, two failure modes, and a fragile sync seam between them. Reach for it only when one engine truly cannot serve both shapes.
+
+## The fan-out fork: the canonical denormalization decision
+
+Abstractions are cheap, so make it physical with the decision every social product eventually faces. You want a home timeline. The normalized way is to join posts against follows at read time: find everyone a user follows, gather their recent posts, merge, sort. At any real scale this is catastrophic on read, so you denormalize into a per-user materialized timeline. The interesting question is where you choose to pay.
+
+Fan-out on write, the push model: when a user posts, you copy the post ID into every follower's precomputed timeline. The read is then a single sequential fetch, blazing fast. The cost is write amplification of O(followers): one celebrity with a million followers produces a million writes per post, and that storm hits hardest exactly when the system is busiest.
+
+Fan-out on read, the pull model: you store one copy of each post and gather from everyone the user follows at read time. The write is O(1), trivially cheap. The cost moves to the read, which now merges from hundreds of sources on every timeline load.
+
+```text
+fan-out on write (push)   write = O(followers)   read = O(1)        fast read, write storm
+fan-out on read  (pull)   write = O(1)           read = O(following) cheap write, slow read
+
+celebrity with 1,000,000 followers -> 1 post = 1,000,000 timeline writes
+```
+
+The staff-level instinct is that neither pure mode is the answer. The real-world resolution is a hybrid split on a follower threshold around ten thousand. For normal users, fan out on write, because their follower counts are small and the read speed is worth the cheap write. For celebrities, do not fan out at all; store their posts once and merge them in at read time, because fanning out to millions is the expensive case and there are few enough celebrities that the read-time merge stays bounded. This is the tell of a senior engineer: the right answer is rarely one mode, it is a threshold between two. [Design Twitter](/blog/design-twitter-feed) walks this exact tradeoff in depth.
+
+There is a second lesson buried here. Every one of those denormalized timeline entries is a copy, and copies drift. The moment a post is deleted or edited, every materialized timeline holding it is stale. That is the standing liability denormalization always creates, and it is why the duplicate has to come with a sync mechanism: a fan-out worker, a change-data-capture stream, or a transactional outbox that guarantees the copies converge. Denormalization is read speed financed by a write-time consistency obligation, and the financing is not optional.
+
+The same pre-compute-on-write instinct shows up far outside feeds. In [NomadCrew](/case-study/nomadcrew), a trip's live presence and location ride a WebSocket hub, where each client's view is a denormalized projection of who is online and where, kept converged by the hub rather than rejoined on every read.
+
+## Single-table design, and what it actually buys
+
+DynamoDB pushes the access-pattern-first philosophy to its limit, and single-table design is where it gets concrete. Alex DeBrie states the core reason plainly: the main reason for using a single table is to retrieve multiple, heterogeneous item types using a single request. DynamoDB has no joins, on purpose, because joins are unbounded: their cost grows with the data and their tail latency cannot be predicted, which is disqualifying for a database that promises single-digit-millisecond reads at any scale. So instead of joining at read time, single-table design pre-joins at write time. You put related entities into one item collection, everything sharing a partition key, so a single Query returns the org metadata, its users, and its teams together in one round trip. The join is not computed; it is materialized into the physical layout.
+
+The discipline that makes this work is enumerating every access pattern before the schema exists. Houlihan's demonstration is the proof: he routinely models around twenty-three access patterns on a single table with only three global secondary indexes. That is possible only because every pattern was known up front, and the trick that stretches three indexes across so many patterns is index overloading, where generic attributes like `GSI1PK` and `GSI1SK` carry different meanings for different item types. It is the pressure-release valve on the rigidity, the way you buy back some flexibility after committing to a fixed layout.
+
+But single-table design is not a free win, and pretending otherwise is junior-tier advice. DeBrie names three real downsides a senior engineer knows cold: a steep learning curve, because the schema looks alien next to a normalized model; inflexibility for new access patterns, because the design is tailored to the patterns you knew and a genuinely new one can force an ETL; and painful analytics, because a denormalized layout looks more like machine code than a spreadsheet, so OLAP work needs re-normalization first. AWS itself names where multi-table wins: when you need multiple DynamoDB Streams consumers (Streams caps at roughly two per table), when you need clean analytics exports, and, most honestly, when simplicity wins and multi-table is just easier for your team to reason about.
+
+There is a nuance here worth flagging because it is widely misunderstood. People treat MongoDB documents and DynamoDB single-table design as the same thing, and they are not. A document database embeds a tree inside one record; DynamoDB single-table puts multiple distinct entity types in separate items sharing a partition key to form a collection. The first is intra-aggregate locality. The second is a materialized join. Knowing the difference is the difference between using these tools and cargo-culting them.
+
+## How a senior actually decides
+
+The shallow framing is "normalize for OLTP, denormalize for OLAP." It points at the wrong axis. The real axes are two: known versus unknown access patterns, and which resource you optimize, storage or compute. Plot them and the whole topic collapses into a map. Unknown patterns plus optimize-for-storage lands you on relational and third normal form, because a normalized schema answers queries you have not thought of yet. Known patterns plus optimize-for-compute lands you on single-table or document, because you can name every read and want each one to be a single cheap fetch.
+
+```text
+                 optimize for STORAGE          optimize for COMPUTE
+              +-----------------------------+----------------------------+
+  patterns    |  relational / 3NF           |  (rare: heavy joins on     |
+  UNKNOWN     |  flexible, query-friendly   |   data you cannot predict) |
+              +-----------------------------+----------------------------+
+  patterns    |  (rare: normalized but      |  single-table / document   |
+  KNOWN       |   read-pattern-stable)      |  pre-joined, fast, rigid   |
+              +-----------------------------+----------------------------+
+```
+
+The tell of a senior is that they do not open with "SQL or NoSQL?" They open with three questions: what are all the access patterns, what is the read-to-write ratio on each, and which ones sit on the hot path. That ratio is the deciding number more often than anything else, because denormalization only pays when reads dominate writes. Feeds, catalogs, and profiles are read-heavy, so pre-computing the read is worth the sync tax. On a write-heavy, low-read path the sync tax can exceed the read savings, so you normalize and join the rare read.
+
+The decision that separates staff from senior is weighting the cost of being wrong, not just the happy-path performance. Schema-on-write is forgiving: guess the schema wrong and you `ALTER TABLE`, add an index, write a new query, and move on, all reversible and cheap. A NoSQL access-pattern miss is not, because in a denormalized store the physical layout is the query plan, so a pattern you did not anticipate can mean a full migration. This irreversibility asymmetry is why the reflexive default for an early product with fuzzy requirements is still a normalized relational database: you keep the option to be wrong cheaply until the access patterns stop moving.
+
+Two more things a staff engineer keeps in view. First, the binary is softening: Postgres has JSONB with GIN indexes and MongoDB has lookups and multi-document transactions, so the pragmatic 2020s answer is often one relational engine with normalized columns where you need integrity and a JSONB column where you need a flexible aggregate, instead of paying the two-datastore polyglot tax. Second, normalization and denormalization are not a global choice you make once. Normalization is a property of writes and denormalization a property of reads, and CQRS lets them coexist: a normalized write model as the source of truth, denormalized read models projected off a change-data-capture stream and kept converged. You stop choosing globally and start choosing per read path, the most senior move of all because it treats the decision as engineering rather than religion.
+
+The deeper invariant under everything above is one line: items accessed together should be stored together. Relational clustering, document locality, a DynamoDB item collection, the fan-out timeline are all instances of it. When the decision feels muddy, drop back to that principle, look at what your hottest path reads together, and let the physical layout follow the access. The model debate carries a great deal of noise, but that one sentence is the signal.
+
+How you store data is only one corner of a larger system; it interacts with how you index, replicate, and keep copies consistent under concurrency. The [system design interview framework](/blog/system-design-interview-framework), [secondary indexes](/blog/secondary-indexes), [MVCC and isolation levels](/blog/mvcc-isolation-levels), and the [LSM-tree vs B-tree](/blog/lsm-tree-vs-btree) tradeoff are the adjacent corners worth reading next.
+
+## FAQ
+
+<FAQ />

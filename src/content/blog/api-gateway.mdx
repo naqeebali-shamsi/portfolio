@@ -1,0 +1,170 @@
+export const meta = {
+  slug: 'api-gateway',
+  title: 'How an API Gateway Works: The Front Door to Your System',
+  description:
+    'An API gateway puts auth, rate limiting, TLS, routing, and composition at the edge so your services do not each rebuild them. How it works, and where it bites.',
+  headline: 'How an API Gateway Works: The Front Door to Your System',
+  deck: 'One thin entry point implements auth, throttling, TLS, and routing once at the edge so a fleet of services can stay focused on business logic.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '13 min',
+  tags: ['api-gateway', 'microservices', 'system-design', 'envoy', 'kong', 'aws', 'bff'],
+  faq: [
+    {
+      q: 'What is the difference between an API gateway and a reverse proxy?',
+      a: 'A reverse proxy forwards a request to a backend and returns the response. An API gateway does that and adds the cross-cutting policy on top: it validates the caller identity, enforces a per-client rate limit, terminates TLS, transforms protocols, emits telemetry, and can compose several backend calls into one response. The composition capability is the cleanest disqualifier for "it is just nginx", because a plain proxy cannot fan out to five services and merge the results. Every gateway is a reverse proxy; not every reverse proxy is a gateway.',
+    },
+    {
+      q: 'Does an API gateway slow down my system?',
+      a: 'It adds one network hop, which for a thin proxy on the hot path is single-digit milliseconds. That cost is real but small, and it is often outweighed by composition: collapsing seven client round-trips into one gateway call is usually a net latency reduction on high-RTT mobile networks. The danger is not the hop, it is letting business logic creep into the gateway until the hop stops being thin. Keep it thin and the latency stays a rounding error.',
+    },
+    {
+      q: 'Is an API gateway a single point of failure?',
+      a: 'By construction, yes, because all north-south traffic crosses it. That is acceptable only because you defang it: run it stateless so any instance serves any request, scale it horizontally behind an L4 load balancer or anycast, keep it thin so the blast radius is small and restarts are fast, and isolate it from upstream failure with tight timeouts, circuit breaking, and outlier detection. SPOF is a deployment property you control, not a destiny you accept.',
+    },
+    {
+      q: 'When should I use a Backend for Frontend instead of a shared gateway?',
+      a: 'Reach for a BFF when one user experience needs its own response shape and its own failure policy, and the frontend team wants to ship that without coordinating on a shared artifact. A BFF is owned by the frontend team, scoped to a single experience, and deliberately smaller than a general gateway. Sam Newman frames the rule as "one experience, one BFF". The driver is organizational autonomy and deployment velocity, not routing. Heavy composition tends to migrate out of the shared gateway into per-client BFFs for exactly this reason.',
+    },
+  ],
+}
+
+Every system that grows past one service eventually faces the same question: where do clients connect? The honest first answer is "directly to whichever service they need", and it works right up until you count the things that have to happen on every single request before any business logic runs. The caller has to be authenticated, the connection decrypted, the request rate limited so one noisy client cannot starve the rest, then routed, logged, traced, and shaped into whatever the backend expects. Do that across ten services and you get ten implementations of each, and ten chances to get each one subtly wrong.
+
+An API gateway is the decision to implement those cross-cutting concerns once, at a single entry point, and let the services behind it think about nothing but their actual job. It is the obvious idea, which is why three independent sources reached for the same metaphor. AWS describes its API Gateway as "a 'front door' for applications to access data, business logic, or functionality from your backend services". Netflix called Zuul, the gateway that fronted its entire streaming platform, "the front door for all requests". Wikipedia, with no product to sell, defines the pattern as "a server that acts as an API front-end [that] receives API requests, enforces throttling and security policies, passes requests to the back-end service and then passes the response back to the requester".
+
+A front door is the one place everyone enters, and you check credentials there, not in every room. The cost is one latency hop and one place that can take everything down. Both are manageable, neither is free, and the rest of this piece earns that tradeoff honestly.
+
+## What it actually does, in the order it does it
+
+A request enters the gateway and passes through a pipeline of stages, each a checkpoint that can pass, transform, or reject. Vendors name them differently and the list stays consistent. Zuul's filter categories are Authentication and Security, Insights and Monitoring, Dynamic Routing, Load Shedding, and Static Response. Envoy structures the same work as a chain of L3/L4 and L7 filters; Kong calls them plugins.
+
+```
+   client request
+     |
+  [ TLS terminate ]    decrypt inbound; trust boundary starts here
+  [ authN ]            validate the JWT signature and expiry, once
+  [ rate limit ]       spend a token; 429 if the bucket is empty
+  [ route match ]      path/host/header -> which upstream service
+  [ compose? ]         optionally fan out to several services, merge
+  [ transform ]        protocol/shape translation (HTTP/1.1 <-> HTTP/2, REST <-> gRPC)
+  [ forward ]          proxy upstream, with timeout + circuit breaker
+  [ log / trace ]      emit metrics, structured access log, inject traceparent
+     |
+   response back to client
+```
+
+Five of those stages are why a gateway exists, each a concern you do not want duplicated across services.
+
+**Routing** is the irreducible core. Kong models it as a Route that matches a request by rules and forwards to a Gateway Service, the upstream; Envoy routes "based on path, authority, content type, runtime values". Strip everything else away and routing is the one thing a gateway cannot not do.
+
+**Composition** separates a gateway from a dumb proxy. Chris Richardson, who wrote the canonical pattern definition, describes "fan out" to multiple services and aggregation "enabling clients to retrieve data from multiple services with a single round-trip". A mobile screen needing the user, their cart, and three recommendations makes one call instead of five across a cellular network, which is what makes "it is just a load balancer" wrong.
+
+**Authentication** happens once, at the door. AWS gives you IAM, Cognito, Lambda authorizers, and native JWT authorizers; Zuul's first filter category rejects unauthenticated requests before they reach a service. Validating a token signature and expiry is identical work for every endpoint, so it belongs in one place, the same identity machinery covered in [the auth deep dive](/blog/auth-deep-dive), pushed to the edge so downstream services inherit it for free.
+
+**Rate limiting** protects the fleet from any single caller, and earns its own section below as the most misunderstood part of the gateway. **TLS termination** decrypts inbound traffic so backends speak plaintext or get re-encrypted for internal hops; terminating once keeps certificate rotation and cipher policy in one config instead of scattered across every service.
+
+The payoff is structural. Envoy puts it directly: the same software at the edge gives you "identical service discovery and load balancing algorithms" across every route. You get the same behavior everywhere, not just less code. Ten services hand-rolling auth produce ten subtly different auth bugs; one gateway produces one you can reason about.
+
+## Rate limiting is a distributed-systems problem wearing a config toggle
+
+The shallow version is "count the requests, reject past the limit". That intuition survives until you scale the gateway past one instance, which you always do, because it is your SPOF and statelessness is how you defang it.
+
+Start with the algorithm. AWS throttles via a token bucket where "a token counts for a request", with two knobs: **rate** is how fast tokens refill (the requests per second you hold forever), and **burst** is the bucket's capacity (the one-shot spike absorbed before the gateway returns `429 Too Many Requests`). Configure rate 1,000 RPS and burst 5,000, and you sustain 1,000 RPS while absorbing a momentary spike of up to 5,000 before the 5,001st request gets a 429.
+
+```
+   refill: 1,000 tokens/sec
+        |
+        v
+   [ ||||||||||  ]   bucket capacity = 5,000 (burst)
+        |
+   each request spends 1 token
+        |
+   bucket empty -> 429 Too Many Requests + Retry-After
+```
+
+AWS layers these limits most-specific-first (per-client, then per-stage, then per-account, then a hard Regional ceiling) and is honest about the guarantee: throttles are "applied on a best-effort basis" and are "targets rather than guaranteed request ceilings", protective targets rather than exact gates.
+
+Now the part that separates senior from shallow. You run N gateway instances behind a load balancer, and a token bucket lives in memory on one process. So a "1,000 RPS limit" with a local bucket on each of 10 instances is actually a 10,000 RPS limit, because each instance sees only its own slice. Kong lays out the tradeoff triangle in three policies:
+
+| Policy | Where counters live | Accuracy | Cost |
+| --- | --- | --- | --- |
+| `local` | in-memory per node | inaccurate across a fleet | "minimal performance impact" |
+| `cluster` | shared in Kong's datastore | accurate | "each request forces a read and a write on the data store" |
+| `redis` | shared in external Redis | accurate | "less performance impact than a cluster policy", plus you run Redis |
+
+Accuracy, latency, and operational simplicity form a pick-two: local is fast and wrong at scale, cluster is right and slow, redis splits the difference at the cost of a system to run. Envoy's two-stage model is the production compromise: "the initial coarse grained limiting is performed by the token bucket limit before a fine grained global limit finishes the job". A local bucket sheds obvious bursts cheaply; a shared global service does the precise accounting for what survives. When someone says the gateway enforces "1,000 RPS", the senior question is which of these it means. It is the same tension worked end to end in [the rate limiter deep dive](/blog/rate-limiter), now at the edge where it belongs.
+
+## Authenticate at the door, authorize in depth
+
+The most expensive mistake people make with a gateway is conflating two words that sound like synonyms. Authentication asks who are you. Authorization asks what are you allowed to do. The gateway is excellent at the first and a trap for the second.
+
+Validating identity is perfect edge work. A JWT's signature and expiry can be checked without knowing anything about your domain, the check is identical for every request, and centralizing it means one place to rotate keys and reject forged tokens. AWS HTTP APIs offer a native JWT authorizer for exactly this. Do it once, at the door.
+
+Authorization is where the temptation gets dangerous. "Can this user edit this specific record" depends on your data, your ownership model, your business rules. Pushing that into the gateway forces the SPOF to understand every service's domain model and centralizes a fast-changing concern in the one component you most want thin and stable. Validate identity at the edge; keep resource-level policy near the data, where the service that owns the record can answer the question. The consistency tradeoffs of distributing those permission and flag changes are their own topic, worked through in [event-driven RBAC](/blog/event-driven-rbac), which makes the case for why authorization state resists being pushed to the edge cleanly.
+
+A related trap is to then trust the gateway's forwarded headers blindly. A service that acts on an `X-User-Id` header without question is one misrouted internal request away from impersonation. The gateway reduces how often each service re-validates; it does not abolish the principle that a service should not act on identity it cannot itself verify.
+
+## TLS termination quietly moves your trust boundary
+
+Terminating TLS at the gateway is convenient and it has a consequence people miss. The moment you decrypt at the edge, traffic behind the gateway is plaintext unless you re-encrypt it. Your trust boundary just moved from "the client" to "everything inside the perimeter", and you are now trusting your own network.
+
+For many systems that is a fine bet. For a zero-trust posture it is not, and the gap is exactly the one a service mesh fills with mutual TLS between services. The canonical layered answer is "terminate TLS at the gateway, mTLS inside the mesh", which AWS supports via backend re-encryption. The staff-level move is to draw the boundary deliberately rather than by accident.
+
+## Why the gateway must stay thin
+
+Everything above points at one rule juniors get backwards. The gateway is the single point of failure and the shared hot path that every request crosses, which makes it the worst possible place to put business logic. Fattening it couples unrelated teams to one deploy and recreates the monolith you broke apart, now sitting in front of everything. Richardson, the pattern's own author, names the drawback plainly: the gateway is "yet another moving part that must be developed, deployed and managed". He tempers the latency worry, "for most applications the cost of an extra roundtrip is insignificant", and a senior quantifies the hop and then guards the thing that actually goes wrong: logic creep.
+
+AWS even ships the thin-versus-full tradeoff as a product choice. Its REST APIs carry the full set (API keys, per-client throttling, request validation, response caching, WAF), while its HTTP APIs deliberately drop most of that for lower latency and cost, keeping only native JWT and Lambda authorizers. Choosing between them is the principle "keep the gateway only as fat as it must be" made concrete, the same shape of decision as [REST vs gRPC vs GraphQL](/blog/api-design-styles) for what the edge speaks.
+
+Thinness is also what lets one box keep up. Envoy runs "single process, multiple threads", binding each connection to one worker and using thread-local storage to keep the hot path "lock-free on the data path". That share-nothing design scales almost linearly with cores, which is precisely why blocking logic or shared state on that path is so expensive: it taxes the property that makes the gateway fast.
+
+## The single point of failure is a choice, not a fate
+
+"The gateway is a SPOF" is true and incomplete. Everything north-south crosses it, so if it goes down, the system goes down. The senior response is to make failure rare and recovery fast. Make it **stateless**, so any instance serves any request. Scale it **horizontally** behind an L4 load balancer or anycast, so one instance failing just sheds its share. Keep it **thin**, so the blast radius is small and a crashed instance restarts fast. And **isolate it from upstream failure** with tight timeouts, circuit breaking, and outlier detection (all first-class in Envoy), so a slow backend cannot back up connections until the gateway falls over with it.
+
+```
+        L4 LB / anycast
+        /     |     \
+   [gw-1]  [gw-2]  [gw-3]      stateless, thin replicas
+      \       |       /
+   timeouts + circuit breakers on every upstream edge
+        \     |     /
+       service fleet
+            ^
+   control plane (xDS / CP) pushes config to all replicas
+```
+
+The real subtlety is the line at the bottom. Kong and Envoy both separate a **control plane** that distributes config from a **data plane** that handles traffic. Envoy's dynamic config APIs, collectively xDS, push routes and clusters to the fleet at runtime. This is a gift and a loaded gun: the gift is changing a route or a rate limit without redeploying, the loaded gun is shipping a broken config to every instance in seconds. The mechanism that makes the gateway flexible makes it capable of a fleet-wide outage from one bad push, so treat gateway config as production code, with the same discipline as [deployment strategies](/blog/deployment-strategies): stage it, canary it, keep a fast rollback.
+
+## Composition couples you to failure, which is why BFFs exist
+
+The fan-out that makes a gateway more than a proxy comes with a bill. An endpoint that calls five services and merges the results inherits the failure modes of all five, so it must define its partial-failure semantics: if one upstream is slow or down, do you fail the whole response, return partial data with the gap flagged, or serve a cached fallback (Zuul's Static Response filter)? This is the structural reason heavy composition migrates out of the shared gateway, into a Backend for Frontend. A BFF is not a gateway-per-client; the distinction is ownership. Sam Newman, who named the pattern, frames it as "one experience, one BFF": a BFF is owned by the frontend team, scoped to one user experience, and deliberately smaller than a general gateway.
+
+The driver is Conway's Law. A senior decides between the two by asking who needs to change this and how often: shared, stable, cross-cutting concerns stay in a thin gateway, while experience-specific shaping that one frontend team iterates on fast goes in that team's BFF, where the duplication buys autonomy and an isolated failure policy.
+
+## Gateway versus service mesh, told honestly
+
+The folklore says "gateway is north-south, mesh is east-west", and it is folklore. Both can handle both directions: you can run internal gateways, and meshes have ingress. The traffic-direction line is a memorable oversimplification that breaks the moment you build a real system.
+
+The honest axis is purpose and awareness. A gateway operates at the application **edge**, is **product-aware** (consumers, API keys, lifecycle, monetization), and is **client-facing**. A service mesh provides **internal**, **application-transparent** infrastructure between services, mutual TLS and retries and observability without changing application code, typically via sidecar proxies. Gateways treat services as products; meshes treat connectivity as plumbing every service gets for free. They are not alternatives, they compose: "authenticate and terminate TLS at the gateway, mTLS and retry inside the mesh" beats any north-or-south arrow.
+
+## Observability is a primary function, not a bonus
+
+Because all north-south traffic crosses the gateway, it is the one place that sees every external request. That makes it your golden-signals chokepoint: the home for accurate edge metrics, structured access logs, and trace-context injection (the W3C `traceparent` header) that stitches a request across the whole system. Envoy emits "statistics support for all subsystems"; Zuul's second filter category is Insights and Monitoring for "an accurate view of production". You get this because everything funnels through one door, and it is one of the strongest arguments for having a gateway at all. The deeper treatment of how to read those signals lives in [latency and the tail](/blog/latency-throughput-tail) and [SLOs and error budgets](/blog/slos-error-budgets); the gateway collects the raw signal for both.
+
+One sharp edge lives here: a gateway that retries failed upstream calls can amplify load into a retry storm, or duplicate a non-idempotent write, exactly when the system is already struggling. Easy retries are a reason to be deliberate about which operations are safe to retry, not a license to retry everything.
+
+## Where this lands in practice
+
+I lean on this pattern in real systems. [NomadCrew](/case-study/nomadcrew), a group-travel platform with a WebSocket hub for chat, presence, and live location, terminates and authenticates at the edge so the realtime services behind it never re-implement identity, and so location privacy is enforced at a boundary they can trust. The same edge thinking runs through [Aladeen](/case-study/aladeen) and [IntelliFill](/case-study/intellifill): authenticate once, route cleanly, keep the services focused on their work.
+
+It shapes the interview prompts too. In [Design WhatsApp](/blog/design-whatsapp) and [Design Twitter](/blog/design-twitter-feed), the gateway is where fan-out, rate limiting, and auth sit before a request touches the message hub or the timeline, and naming that layer early is part of [the system design interview framework](/blog/system-design-interview-framework). Sizing the fleet behind it is [capacity estimation](/blog/capacity-estimation).
+
+## The honest landing
+
+A gateway centralizes the boring, identical work that every request needs, so the interesting work in your services can stay simple. You pay one network hop and accept one component that, handled carelessly, can take everything down, and you earn it back by keeping that component thin, stateless, horizontally scaled, and isolated from the failures behind it. So the rule is the opposite of "put it all in the gateway because it is convenient". Put exactly the cross-cutting concerns at the edge, authentication of identity, rate limiting, TLS, routing, telemetry, and ruthlessly keep everything else out. Authenticate at the door, authorize near the data. Limit globally but shed bursts locally. Terminate TLS, then decide honestly whether the inside needs re-encrypting. Compose where it saves a round-trip, and move heavy composition into a BFF before it fattens the SPOF. Do that, and the front door stays a front door: the one place everyone enters, checked once, consistently, while the rooms behind it stay simple. Skip it, and you have built ten front doors, each with its own lock, each with its own way of being picked.
+
+## FAQ
+
+<FAQ />

@@ -1,0 +1,120 @@
+export const meta = {
+  slug: 'design-youtube',
+  title: 'Design YouTube: Upload, Transcode, and Serve at Planet Scale',
+  description:
+    'YouTube is two systems in a trenchcoat: a throughput-bound pipeline that transcodes uploads, and a latency-bound cache hierarchy that serves them. Design both.',
+  headline: 'Design YouTube: Upload, Transcode, and Serve at Planet Scale',
+  deck: 'The write path is an embarrassingly parallel job queue and the read path is a CDN, and the candidates who keep those two halves separate are the ones who pass.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['system-design', 'video', 'transcoding', 'cdn', 'streaming', 'distributed-systems'],
+  faq: [
+    {
+      q: 'Why is transcoding split into chunks instead of encoding the whole video at once?',
+      a: 'Three reasons, and they compound. Latency: a one-hour video splits into hundreds of independently decodable segments that encode in parallel, so wall-clock time drops from hours to minutes. Resiliency: encoders run on preemptible spare capacity, so if a worker is reclaimed mid-job you re-encode one four-second segment instead of the whole title. Cost: small re-runnable units fit into spot or trough capacity that would otherwise sit idle. You can only cut on keyframe boundaries, because inter-frames reference frames that would not be present mid-segment.',
+    },
+    {
+      q: 'Does the server pick the video quality, or the client?',
+      a: 'The client. Adaptive bitrate is player-driven. The player fetches a manifest listing every rendition, measures its own buffer health and throughput, and requests the next few seconds of video at the highest quality it can sustain. The server is a passive byte-range store. This is the single most common thing candidates get backwards, and getting it right signals you understand where the intelligence actually lives.',
+    },
+    {
+      q: 'How do you count views on a video without melting a single database row?',
+      a: 'A viral video makes one counter row a write hotspot, so you do not increment one row. You run a hot path that shows an approximate, sharded, or streamed count immediately and a cold batch path that recomputes the accurate number asynchronously, then reconciles. For unique viewers at billions of events you use HyperLogLog, which estimates cardinality to within a couple of percent in about sixteen kilobytes, because storing a per-user set for a viral video is impossible.',
+    },
+    {
+      q: 'HLS or DASH?',
+      a: 'Neither, as a final answer. They are near-equivalent HTTP adaptive-bitrate protocols: HLS uses .m3u8 playlists (plain text), DASH uses .mpd manifests (XML). The modern move is CMAF, which packages the fragmented-MP4 segments once and generates both an .m3u8 and an .mpd over the same underlying bytes. You stop paying to store two copies of every segment and let each device pick the manifest it understands.',
+    },
+    {
+      q: 'Why does YouTube pull content to the edge while Netflix pushes it?',
+      a: 'Catalog cardinality decides the fill strategy. Netflix has a finite, slowly changing catalog, so it can pre-position titles onto edge appliances during off-peak fill windows. YouTube has an unbounded catalog with hours uploaded every second, so it cannot pre-position everything and must demand-fill the edge on the first request. Same caching concept, opposite direction, driven by the shape of the content rather than a technology preference.',
+    },
+  ],
+}
+
+The fastest way to fail a YouTube design interview is to draw one box labelled "video service" and start hanging features off it. The fastest way to pass is to draw two boxes that barely talk to each other, and to know exactly why they barely talk to each other.
+
+Because YouTube is not one system. It is two systems wearing a trenchcoat.
+
+The first is the write path: a creator uploads a multi-gigabyte file, and you turn that single file into a matrix of renditions and store it. This is a batch-compute problem. A job queue feeds a farm of workers, and a single source video fans out into dozens of outputs that can each be computed in complete isolation from the others. It is, in the precise technical sense, embarrassingly parallel. You optimize it for throughput, elasticity, and cost-per-encode.
+
+The second is the read path: a hundred million people press play, and you stream bytes to their eyeballs faster than they can drain their buffers. This is a caching problem. It is overwhelmingly read-heavy and latency-bound, and you solve it by pushing immutable chunks of video as physically close to the viewer as you can get them. You optimize it for tail latency, cache-hit ratio, and bytes-served-per-dollar.
+
+These two halves share almost nothing operationally. They have opposite bottlenecks, opposite consistency needs, opposite scaling triggers. The only thing they share is a bucket of object storage that sits between them like a loading dock. A candidate who keeps the two mental models separate, and reasons about each with the right vocabulary, reads as staff-level. A candidate who blends them into one undifferentiated blob reads as junior. So before any of the rest, hold that line: write path is throughput, read path is latency, and the bucket in the middle is the only handoff.
+
+If you want the scaffolding this hangs on, it is the same shape as [the system design interview framework](/blog/system-design-interview-framework): pin the requirements, do the math, then let the numbers force the architecture.
+
+## The numbers that force the architecture
+
+Run [capacity estimation](/blog/capacity-estimation) first, because here the math is not decoration. It is the thing that tells you which half of the system you are even talking about.
+
+Roughly a million videos go up per day and a hundred million get watched per day, with source files reaching tens of gigabytes. That gives a read-to-write ratio of about 100:1 at the video level. But that ratio is a lie that undersells the read side, because every watch is not one request. A single playback session pulls hundreds of small segments, each its own HTTP request, so in bytes and in requests the read path outweighs the write path by orders of magnitude more than 100:1.
+
+That asymmetry is the whole justification for a CDN-centric read path and a queue-centric write path. You are going to spend serious engineering on serving because that is where the volume is, and you are going to spend serious engineering on transcoding because that is where the per-item cost is. The ingest tier that accepts uploads, by contrast, sees a comparatively trivial request rate. It does not need to be clever. It needs to get out of the way of the bytes, which is the next problem.
+
+## The write path, part one: never let a video byte touch your app server
+
+The instinct everyone has first is: the client POSTs the file to a server, the server saves it. At tens of gigabytes per file and a million files a day, that instinct melts your application tier on bandwidth alone. Your app servers would spend their entire existence as a very expensive copy command.
+
+So the bytes do not go through your servers. They go around them.
+
+The client asks your API for an upload session. Your API mints a presigned URL, a time-limited credential that lets the client write directly into object storage, and hands it back. The client then uploads the file straight to the bucket. Your application servers never touch a single frame of video. They mint URLs and they track state. That is the entire job of the ingest tier.
+
+Now make it survive a flaky connection, because a creator on hotel wifi uploading eight gigabytes will drop the connection, and restarting from byte zero is a non-starter. The answer is resumable, chunked upload, and it is a real, boring, well-specified HTTP protocol. The client splits the file into chunks (the tus protocol and Cloudflare Stream both floor this at five mebibytes; Google Cloud Storage requires multiples of 256 kibibytes) and uploads them in sequence. When the connection dies and the client reconnects, it asks the server where it left off by sending `Content-Range: bytes */TOTAL`. The server replies `308 Resume Incomplete` along with the range of bytes it already has, and the client resumes from the next byte. When the last chunk lands, the upload completes with a `201 Created`.
+
+Here is the consistency split that separates a careful answer from a hand-wave. The video bytes are immutable once written, so they need no coordination. But the chunk-tracking state, which bytes have we durably received, must be strongly consistent, because losing track of a chunk corrupts the upload. So the bytes go to object storage and the state goes to a database, and only the state needs the strong guarantee. You are putting CP where the small, critical state-machine lives and leaving the large, immutable payload alone. This is the same instinct behind [idempotency and the exactly-once lie](/blog/idempotency-exactly-once): make the operation safe to retry, key it so a duplicate chunk upload is a no-op, and stop pretending the network will deliver each chunk exactly once.
+
+## The write path, part two: transcoding is a fan-out DAG, not a function call
+
+The upload lands a single high-quality master in object storage. The studio term for that master is the mezzanine, and using it is worth a small amount of credibility: "the mezzanine" reads senior, "the original file" reads junior. Now you turn that one mezzanine into the bitrate ladder, the set of renditions a player can choose between, spanning resolutions from 144p to 4K and multiple codecs.
+
+The naive version is "convert the video to other resolutions." The senior version recognizes the shape of the problem. You split the mezzanine on keyframe boundaries into independently decodable segments, you enqueue each (segment, resolution, codec) combination as a discrete job, you run those jobs across a worker farm in any order, and you stitch the results back together per rendition. It is a diamond: one input fans out into a grid of independent jobs, then fans back in. The only ordering constraint in the entire pipeline is the coarse one of split, then encode, then assemble, then package, then publish.
+
+Why cut on keyframe boundaries specifically and not just every N seconds? Because video compression makes most frames depend on their neighbors. A keyframe (an I-frame) stands alone; the predicted frames after it (P- and B-frames) only make sense relative to frames around them. A group of pictures, from one keyframe to the next, is the smallest independently decodable unit. Slice mid-group and your segment references frames that are not there, and it decodes to garbage. The legal cut points are the keyframes, and that constraint is doing real work: it is what makes the fan-out possible at all.
+
+Why bother chunking at all instead of feeding the whole file to one big encoder? Three payoffs, and Netflix, who rebuilt exactly this pipeline, names all three. Latency: a one-hour video that would encode in hours encodes in wall-clock minutes when its segments run in parallel. Resiliency: the encoders run on borrowed, preemptible capacity (Netflix pulls workers from spare capacity freed by autoscaling other services, not from a dedicated encode cluster), so a worker can vanish mid-job at any moment. When it does, you re-encode one four-second segment, not the whole title. Netflix calls these checkpoints: persist each encoded segment immediately so a reclaimed worker costs you seconds of redone work, not hours. Cost: small, re-runnable units fit into spot and spare capacity that would otherwise sit idle.
+
+That last point quietly dictates the whole design. Because the compute is preemptible, the unit of work has to be small and idempotent. So you name each output segment by a hash of its input segment plus the encode recipe, which makes re-running a job a harmless no-op write and gives you free deduplication. This is why an at-least-once job queue is safe here: a duplicate encode produces byte-identical output to the same address. The cost model picked the architecture, and the queue discipline is the same family of ideas as [Kafka vs queues](/blog/kafka-vs-queues), where the durable log lets workers fail and retry without losing work. The trade you are explicitly making: at-least-once plus idempotent outputs, never exactly-once, because exactly-once across a preemptible farm is the same myth it always is.
+
+There is a tier worth raising before the interviewer does. Netflix encodes a finite catalog of premium content, so it can afford content-adaptive encoding: analyze each title's complexity, build the convex hull of bitrate against perceptual quality (measured with VMAF, a perceptual metric, rather than raw PSNR), and even optimize per shot. A one-hour Stranger Things episode becomes roughly 900 shots, two orders of magnitude more encode units than a coarse chunking, which buys real bitrate savings at equal quality. But that is enormously more compute per title. YouTube ingests hours of footage every second of unknown future popularity, so running full per-shot optimization on every upload is uneconomical. The senior move is to tier it: cheap fixed or per-title encoding for the cold tail that nobody will watch, expensive content-adaptive encoding reserved for content that earns the views. Recognizing that asymmetry between a finite premium catalog and an infinite user-generated one is the distinction that lands.
+
+Finally, packaging. Do not pick HLS or DASH and store two copies of every segment. Package once with CMAF (fragmented MP4) and generate both an `.m3u8` playlist for HLS and an `.mpd` manifest for DASH over the same bytes. One small correction to keep in your pocket, because a lot of secondary sources get it backwards: HLS playlists are plain-text `.m3u8`, and DASH manifests are XML `.mpd`. Do not say HLS uses XML.
+
+## The read path: a CDN, an origin shield, and the long tail nobody budgets for
+
+Now the other system entirely. A hundred million watches a day, hundreds of segment requests each, served with low enough latency that nobody sees a spinner. This is [the distributed cache](/blog/distributed-cache) problem at planetary scale, and the geometry of the content makes it tractable.
+
+The segments are immutable and content-addressed, which means they are the most cacheable objects imaginable: cache them effectively forever, at every edge location, with no invalidation logic. The manifests are tiny but mutable (a new rendition can appear, a live edge can advance), so they get a short TTL. Conflating those two TTLs is a classic mistake: cache the manifest forever and you serve stale ladders; cache the segments for sixty seconds and you destroy your hit ratio. Different objects, different rules.
+
+Push the popular segments to edge points of presence near the viewer and you serve the overwhelming majority of bytes without ever touching origin. The target hit ratio for video is above 95%, and static-heavy traffic can reach 99%. But a flat CDN where every edge node independently pulls a cold segment from origin creates a fan-out problem: N edge POPs each miss on the same newly-popular segment and all N hammer origin at once. The fix is tiered caching with an origin shield, a regional mid-tier cache that aggregates edge misses so origin sees one request per segment regardless of how many edges wanted it. N misses collapse to 1. That is the same thundering-herd defense you would reach for anywhere a cache stampede can crush a backend.
+
+Here is the part most candidates skip, and raising it unprompted is the tell. The CDN solves the popular head of the distribution beautifully. The long tail of rarely-watched videos is mostly cache misses, by definition, and that tail is where your origin egress cost and your worst tail latency actually live. Netflix's edge boxes split into two hardware tiers precisely for this: high-throughput flash appliances for the popular head, bulk-storage disk appliances for the cold catalog. A serious answer treats head and tail as two different cost centers with two different strategies, and does not pretend "add a CDN" is a finished sentence. If you want the vocabulary for why the slow requests cluster the way they do, that is [latency and the tail](/blog/latency-throughput-tail): your p99 is dominated by the misses, not the hits.
+
+One more architectural fact worth stating, because it inverts where the intelligence lives. The server in the read path is dumb. It is a byte-range store that hands over whatever segment it is asked for. The intelligence is in the client. Adaptive bitrate is player-driven: the player reads the manifest, watches its own buffer health and measured throughput, and requests the next two-to-six-second segment at the highest rendition it can currently sustain. When the network degrades mid-stream, the player drops to a lower rendition on the next segment, and the viewer sees a quality dip instead of a stall. The server never decides quality. Say "the server picks the resolution" in an interview and you have just told the interviewer where your understanding stops.
+
+## The state nobody thinks about: metadata, view counts, and what to recommend
+
+Three smaller systems hang off the two big ones, and each has a sharp edge.
+
+Metadata, the titles, descriptions, owners, and rendition pointers, is a sharded relational store. This is literally the problem that birthed Vitess inside YouTube: a single MySQL instance hit walls on connection overhead, data volume, and read load, so they built a sharding layer with a proxy (VTGate) that gives applications one logical database, connection pooling, and live resharding that splits one shard into many with minimal downtime. Partition by video ID or channel ID. Cassandra partitioned the same way is an equally defensible answer; the point the interviewer is checking is that you partition by a key that spreads load, the same principle behind [consistent hashing](/blog/consistent-hashing) wherever you need to place data across nodes without a stampede when the topology changes.
+
+View counts are a trap. The naive answer, "increment a counter," makes a single database row the write-hotspot for a viral video, with thousands of concurrent writers fighting over one lock. So you do not increment one row. You run a Lambda architecture: a hot path shows an approximate or sharded or streamed count immediately (fake it convincingly, reconcile later) and a cold batch path recomputes the accurate number asynchronously. For unique viewers, you cannot store a per-user set for a video with a billion views, so you use HyperLogLog, which estimates cardinality to within a couple of percent in roughly sixteen kilobytes of memory. You are trading exactness for constant memory, on purpose, because exactness is unaffordable and nobody needs the view count accurate to the single view.
+
+Recommendations is its own discipline, but the architecture compresses to one reusable idea: retrieve, then rank. Google's published two-stage design uses a candidate-generation network to narrow millions of videos down to hundreds, then a richer ranking network to score those hundreds against an objective (watch-time, not just clicks). You do not score the whole corpus, because it is too big and it changes every second. You cheaply retrieve a small candidate set and then spend your expensive model only on those. That two-stage retrieve-then-rank shape shows up far beyond video, anywhere the candidate space is too large to score exhaustively.
+
+## Where the model bends, and what to defend
+
+A couple of honest edges, because volunteering them is what staff-level sounds like.
+
+Everything above is video-on-demand. Live streaming bends the whole model: you encode on the fly with no per-shot luxury, your latency budget is seconds instead of minutes, and you reach for low-latency HLS or DASH with partial segments. The two-path split still holds, but the write path loses its leisure, and that is worth one honest sentence rather than a pretense that VOD and live are the same system.
+
+And the new-viral-video event is two of your hardest problems firing at once: a read-side cache-fill storm hitting your origin shield, and a write-side counter hotspot hitting your view-count path. Two faces of the same moment, two separate mitigations. Naming that they are the same event with two different defenses is the kind of connection that makes an interviewer lean in.
+
+This is the same muscle as [Design Instagram](/blog/design-instagram), where the real work is fanning one upload into many derived assets and serving them from a cache, and the cousin of every other read-heavy media system in this series, from [Design Twitter](/blog/design-twitter-feed) to [the URL shortener](/blog/url-shortener), where one canonical object is read far more than it is written. If you want to see the upload-and-serve pattern in something I actually shipped, [Audex](/case-study/audex) and [IntelliFill](/case-study/intellifill) both turn a user-supplied file into processed, served output, and [NomadCrew](/case-study/nomadcrew) leans on the same caching and tail-latency instincts for real-time location sharing.
+
+The interview is not testing whether you know what a CDN is. It is testing whether you can hold two opposite systems in your head at once, keep their consistency models and bottlenecks separate, and explain why the bucket in the middle is the only thing they share. Draw the two boxes. Keep them apart. That is the whole game.
+
+## FAQ
+
+<FAQ />

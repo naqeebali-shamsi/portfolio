@@ -1,0 +1,185 @@
+export const meta = {
+  slug: 'backpressure',
+  title: 'Backpressure: How Systems Say "Slow Down" Before They Fall Over',
+  description:
+    "Under overload a system has three moves and no fourth: slow the producer, buffer, or drop. Backpressure is choosing the blend on purpose, with the right signal, before the queue eats your memory.",
+  headline: 'Backpressure: How Systems Say "Slow Down" Before They Fall Over',
+  deck: 'When work arrives faster than you can finish it, you get exactly three choices, and picking none of them is how the queue eats your memory.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '13 min',
+  tags: ['backpressure', 'distributed-systems', 'load-shedding', 'reliability', 'kafka', 'system-design'],
+  faq: [
+    {
+      q: 'What is backpressure in simple terms?',
+      a: "Backpressure is a downstream component forcing or signaling an upstream one to slow to a sustainable rate. When work arrives faster than you can finish it, you have three responses and no fourth: slow the producer (block), buffer the excess (queue), or discard work (drop). Backpressure is the family of mechanisms that pick that blend on purpose. The failure mode is picking by accident, which usually means an unbounded queue that grows until the process runs out of memory.",
+    },
+    {
+      q: 'What is the difference between flow control and congestion control?',
+      a: "They protect different things. Flow control protects the receiver: TCP's receive window (rwnd) advertises how much spare buffer the receiving application has, and the sender may not exceed it. Congestion control protects the network between the two endpoints: the congestion window (cwnd) shrinks when the path shows signs of loss. A TCP sender is limited by min(rwnd, cwnd), so it respects whichever is tighter. Confusing the two leads to tuning the wrong knob when a system stalls.",
+    },
+    {
+      q: 'Does Kafka give you backpressure automatically?',
+      a: "No. Kafka deliberately decouples the producer from the consumer with a durable log, which means there is no live channel for the consumer to tell the producer to slow down. Backpressure instead shows up as an observable metric: consumer lag, the gap between the log-end offset and the consumer's committed offset. Rising lag means the consumer is falling behind. If lag grows faster than your retention window clears, unconsumed records age out and are lost, so lag is a signal you have to monitor and alert on yourself.",
+    },
+    {
+      q: 'Is dropping requests ever the right answer?',
+      a: "Yes, and mature systems do it on purpose. Load shedding is deliberately discarding the lowest-value work to protect the system from collapsing under everything. The sins are dropping silently (so nobody sees the damage) and dropping high-value work alongside the cheap stuff. Done well, shedding is priority-aware and progressive: it drops bulk and prefetch traffic before anything user-facing, it rejects fast instead of queuing, and it emits a counter so the loss is visible.",
+    },
+    {
+      q: 'Why are retries dangerous during an overload?',
+      a: "Because retries multiply the load at the exact moment the system can least afford it. A backend that is briefly overloaded starts returning errors, every client retries, and naive retries can push offered load toward three times normal, turning a brief spike into a self-sustaining collapse. The guards are a per-request cap (around three attempts), a per-client retry budget (roughly 10 percent of request volume, which knocks that 3x down to about 1.1x), and retrying at only one layer of the stack so the amplification does not compound.",
+    },
+  ],
+}
+
+Every system has a speed it can sustain and a speed at which work arrives. When the second number is smaller, you are fine. When it is larger for more than a moment, you have an overload, and an overload is not a performance problem you can tune your way out of. It is a structural one, and it gives you exactly three things you can do about it.
+
+You can slow the producer down. You can buffer the excess and hope the spike passes. You can throw work away. That is the entire menu. There is no clever fourth option, and no vendor sells one. Every system that survives load is running a deliberate blend of those three. Every system that falls over chose the blend by accident.
+
+This is what backpressure actually is. People reach for it as a feature or a library, and it is neither. It is the family of mechanisms by which a downstream component tells an upstream one to slow to a rate it can keep up with. The interesting engineering is never whether you have backpressure. It is which of the three responses you picked, for which coupling, driven by which signal, and what you gave up. Get that wrong, usually by picking nothing and letting a queue grow without bound, and a traffic spike becomes an outage with your name on the page.
+
+## The trilemma, and why there is no fourth option
+
+Hold the three responses in your head as a triangle, because each corner has a failure mode and you are always somewhere inside it.
+
+Slow the producer (block). The cleanest response when you can actually reach back and throttle the source. The producer stalls until the consumer is ready. Its failure mode is that the stall propagates: if the thing you blocked has its own upstream, the slowdown travels backward through the whole chain, and if that chain loops, you can deadlock.
+
+Buffer (queue). Absorb the excess and drain it when the spike passes. This feels free and it is the most overused answer in the industry. Its failure mode is two-headed. A bounded queue eventually fills and forces you back to block-or-drop anyway, so it only defers the decision. An unbounded queue trades a rate problem for a memory problem and a latency problem at once, and the memory problem ends in an out-of-memory kill.
+
+Drop (shed). Discard work you cannot handle. The fastest way to protect the system, and the only honest answer for real-time fan-out where you genuinely cannot slow the source. Its failure mode is data loss, and the question that decides whether it is sound engineering or a silent bug is whether anyone downstream knows the drop happened.
+
+The reason this matters is that the default, the thing you get when no one makes a decision, is the worst corner. An unbounded queue is what an in-memory channel does when you forget to bound it. A silent drop is what a fixed buffer does when you never wrote the metric. Picking by accident lands you on OOM or invisible loss every single time. Everything below is a way of picking on purpose.
+
+```text
+                 SLOW DOWN (block)
+                 fail: stalls propagate,
+                 cyclic waits deadlock
+                       /\
+                      /  \
+   BUFFER (queue)    /    \    DROP (shed)
+   fail: latency +  /______\   fail: data loss
+   unbounded -> OOM            (silent = a bug)
+```
+
+If you want the habit that decides which corner to favor before you have a mechanism in hand, the same decision-first discipline runs through [the system design interview framework](/blog/system-design-interview-framework): name the constraint, then pick the mechanism, never the reverse.
+
+## Credit: the oldest backpressure trick we have
+
+The most elegant version of "slow the producer" is not blocking at all. It is credit. The consumer hands the producer a budget, the producer spends it sending data, and when the budget hits zero the producer stops on its own. No polling, no blocking call, no shared lock. The producer simply has nothing left to spend.
+
+TCP has done this since long before anyone said "backpressure" out loud. Every TCP receiver advertises a receive window, `rwnd`, on every acknowledgment it sends back. The window is the spare room left in its receive buffer, and it is a hard ceiling: the sender may have at most `rwnd` bytes of unacknowledged data in flight. Now watch what happens when the receiving application stops calling `read()`. The buffer fills because the kernel keeps accepting bytes the app is not consuming. The advertised `rwnd` shrinks toward zero. The sender, seeing a window of zero, stalls. Backpressure has propagated across a network, end to end, with zero lines of application code on either side. The app got slow and TCP translated that into "send less."
+
+There is a deadlock-avoidance detail here that catches people. When `rwnd` reaches zero the sender does not sit silent forever, because the ACK that would reopen the window could itself be lost, which would deadlock the connection indefinitely. Instead the sender periodically pokes the receiver with a one-byte zero-window probe until the app drains the buffer and flow resumes. The protocol assumes its own control messages can be lost and engineers around it.
+
+One distinction worth nailing down before it bites you, because it is the most common confusion in this area. Flow control is not congestion control. `rwnd` protects the receiver from being overrun. The congestion window, `cwnd`, protects the network in between, and it shrinks when the path shows loss. A TCP sender obeys both at once by sending no more than `min(rwnd, cwnd)`. When a transfer stalls, knowing which window closed tells you whether the bottleneck is the far end or the path, which is the difference between fixing the right thing and tuning a knob that does nothing. Why a single slow hop wrecks the tail is the subject of [latency and the tail](/blog/latency-throughput-tail).
+
+HTTP/2 took the same idea and made it explicit and two-level. The `WINDOW_UPDATE` frame is literally a credit grant. Both the whole connection and each individual stream start with a window of 65,535 octets, tracked independently, and a sender must not exceed the receiver's limit on either. When an HTTP/2 receiver's own downstream backs up, it stops emitting `WINDOW_UPDATE` frames, the sender's credit drains to zero, and the sender halts. This per-stream flow control is one of the concrete things you buy by moving down a layer, which is part of the calculus in [REST vs gRPC vs GraphQL](/blog/api-design-styles): gRPC inherits it from HTTP/2, while a plain REST call leaves you back at TCP windows and nothing finer.
+
+Inside a single process, in async stream pipelines, the same credit idea has a name: demand. The Reactive Streams contract is blunt about it. A subscriber calls `request(n)` to grant demand, and the publisher must never deliver more items than have been requested in total, so `request(8)` permits at most eight before the publisher must wait for the next grant. The stated purpose of the whole specification is to bound queues while guaranteeing the receiving side is never forced to buffer an arbitrary amount of data. The unification worth carrying away: TCP's window, HTTP/2's `WINDOW_UPDATE`, and `request(n)` are the same idea at three altitudes. The consumer grants credit, the producer spends it, the producer refills only on the next grant. Once you see credit as the shape, "where is the backpressure here" becomes "where does credit flow, and what happens when it runs out." If the answer is "credit flows nowhere," you have found your next outage.
+
+## When you cannot signal back: lag as backpressure
+
+Credit works when there is a live channel between producer and consumer. Sometimes there deliberately is not, and that is the whole point of the design.
+
+Kafka and durable logs decouple the producer from the consumer on purpose. The producer writes to a log and moves on. The consumer reads whenever it can. There is no path for the consumer to tell the producer to slow down, and removing that path is a feature, because a slow or crashed consumer never blocks a healthy producer. The deeper tradeoffs of a log against a traditional broker are the subject of [Kafka vs queues](/blog/kafka-vs-queues), and building consumers that keep up is the substance of [stream processing](/blog/stream-processing).
+
+But the overload did not vanish. It changed form. With no live signal, backpressure stops being a channel and becomes a number you watch: consumer lag, the log-end offset minus the consumer's last committed offset, measured per partition and summed across the group. Lag is the single most useful signal for whether a consumer is keeping up, and the first thing any serious team alerts on.
+
+Here is a concrete picture. A partition's log-end offset is 1,000,000 and the group has committed up to 940,000, so lag is 60,000 records. If the producer writes 50,000 records per second and the consumer drains 30,000, lag grows by 20,000 every second. Now the failure mode of decoupling shows its face. The "buffer" here is the retained log, and the log has a retention window, say seven days. The real question is whether the consumer catches up before the oldest unconsumed offset ages past retention, because if lag outruns retention, unconsumed records are deleted before anyone reads them. The failure is not OOM. It is silent data expiry.
+
+```text
+log:  [...already consumed...|####### lag #######|--- retention cliff ---]
+                             ^                    ^                        ^
+                      committed (940k)     log-end (1,000k)      oldest, expires next
+
+lag = 60,000 ; producer 50k/s, consumer 30k/s -> lag grows 20k/s
+does the consumer catch up before the cliff eats unread records?
+```
+
+That is the rule the trilemma forces on you, stated generally: decoupling moves the failure, it never removes it. A log converts blocking-backpressure into lag and retention risk. A buffer converts it into latency and OOM risk. You always pay somewhere. The senior move is to say out loud where you decided to pay.
+
+## Buffers are not free, and bigger is usually worse
+
+The reflex when something overflows is to make the buffer bigger. It is almost always wrong, and there is a piece of internet history that proves it at planetary scale.
+
+For years home internet was miserably laggy under load: start an upload and your video call would fall apart, latency spiking into seconds. The cause, diagnosed and named bufferbloat, was oversized buffers in routers and modems. Someone reasoned exactly the way the reflex reasons: memory is cheap, big buffers mean fewer drops, fewer drops mean better throughput. They were catastrophically wrong, for a reason that generalizes far past networking.
+
+TCP's congestion control depends on timely packet drops as its feedback signal. A dropped packet is how the network says "slow down." An enormous buffer that absorbs everything and drops nothing does not prevent congestion. It hides the signal that would have controlled it, so the sender keeps accelerating while packets pile up in a buffer that adds seconds of delay before anything is ever dropped. The buffer did not solve the throughput problem. It converted it into an unbounded-latency problem and blinded the one mechanism that could have fixed it. The fix was the opposite of "bigger": active queue management like CoDel and fq_codel, which keep buffers deliberately short and drop early so the control signal stays sharp.
+
+The lesson is not about routers. It is that a buffer converts a rate mismatch into a latency-and-memory cost, and past a certain size it stops being a cushion and becomes the failure itself. So a real buffer needs two things the naive version lacks. A hard size bound, because unbounded is just OOM deferred. And, the part almost everyone misses, a time bound, because the most dangerous thing in a queue is not the hundredth item. It is the first one, the one that has sat there so long that whoever was waiting for it already gave up. When you build [a distributed cache](/blog/distributed-cache) or any component whose whole job is to hold things, the eviction policy is this decision wearing a different hat.
+
+## Dropping is a skill, not a failure
+
+If buffers defer the decision and you cannot always slow the source, then for a large class of systems dropping is the answer, and the gap between senior and shallow is entirely in how you drop. "Drop when full" is the shallow version. Here is the discipline.
+
+Drop the lowest-value work first. Indiscriminate shedding throws away a user's checkout alongside a background telemetry ping. Google standardizes four criticality tiers (CRITICAL_PLUS, CRITICAL, SHEDDABLE_PLUS, SHEDDABLE) that ride along through the whole RPC chain, so a deep backend sheds its cheapest traffic first and leaves user-facing work untouched. Netflix walked the same road, evolving from equal-opportunity shedding that dropped everything alike to prioritized progressive shedding driven by each service's own CPU utilization, so user-facing playback reclaims capacity from prefetch and bulk jobs before anything a viewer notices degrades. The sharp architectural detail: Netflix pushed the shed decision down from the central gateway into each service, because a hot service knows its own load and can reclaim non-critical capacity locally in a way an edge-only decision is too coarse to manage. That is the same boundary question [the API gateway](/blog/api-gateway) wrestles with from the other side, deciding what belongs at the edge versus what each service has to own. This sits one layer up from [the rate limiter](/blog/rate-limiter): a rate limiter caps a client at a fixed quota, while shedding makes a dynamic, value-ranked decision about what to sacrifice when the whole system is hot.
+
+Drop fast, and never let a request rot in a queue. The distinction that matters is goodput versus throughput, where throughput is everything you accept and goodput is the subset of responses that are useful, on time, and not errors. Amazon's older load balancer used a surge queue that held excess requests; the newer one replaced it with outright rejection, for a precise reason: once a request has been sitting in a queue, the server has no idea how long it waited, and it may already be past the client's deadline. Doing that work is pure waste the moment it is dequeued, a zombie request consuming capacity to produce a result no one is still waiting for. So bound queue time, not just queue depth, and discard stale entries on the way out.
+
+Drop the freshest under deadline pressure, which sounds backward until you see it. Facebook runs queues FIFO under normal load and flips them to LIFO under duress. The logic is brutal and correct: when the system is overloaded, the requests at the back of the queue are the oldest, and the oldest are the most likely to have already blown their deadline, so serving them is wasted work. The newest request has the best shot at finishing in time. Layered on top is a CoDel controller that watches queue sojourn time, the actual wait each request experiences, and drops at an increasing rate once that delay stays above a small target like five milliseconds. The deep point: queue length is a misleading health signal because it depends on load, while sojourn time is the honest one, because it measures the thing the user actually feels.
+
+## Stop overload at the source, and stop feeding the fire
+
+Two more moves separate systems that ride out a spike from systems that amplify it into a collapse.
+
+The first is client-side adaptive throttling, which is backpressure that never reaches the network. When a client notices a backend rejecting a rising fraction of its requests, the client starts rejecting its own requests locally before sending them:
+
+```text
+rejection_probability = max(0, (requests - K * accepts) / (requests + 1))
+
+with K = 2 over a 2-minute window:
+  requests = 1000, accepts = 200
+  -> max(0, (1000 - 400) / 1001) ~= 0.60
+  -> the client drops ~60% of its own requests before they touch the network
+```
+
+When the backend is healthy, `accepts` tracks `requests`, the numerator goes negative, and the probability clamps to zero, so the throttle is invisible. As rejections climb, the client throttles harder, collapsing the feedback loop before it can form. The backpressure happened at the source, which is the cheapest place it can possibly happen.
+
+The second is the move that turns a manageable overload into an outage if you ignore it: retries. Retries feel like resilience and they are the single most reliable accelerant in any overload fire. A backend briefly over capacity returns errors. Every client retries. Those retries are extra load on a backend already over the line, and naive retries can drive offered load toward three times the natural rate, which guarantees more errors, which guarantees more retries. That is the death spiral, and naming its full shape is half of recognizing it under pressure: overload makes things slow, slow triggers timeouts, timeouts trigger retries, retries add load, added load deepens the overload. The loop sustains itself with no external help.
+
+The guards are specific and they compound. Cap retries per request at around three attempts. Give each client a retry budget of roughly 10 percent of its request volume, which mathematically knocks that 3x amplification down to about 1.1x, a margin a healthy system absorbs. And retry at exactly one layer of the stack, because if three layers each retry three times, you have not added retries, you have multiplied them into a combinatorial flood. Every one of those retries re-delivers work the system may have already done, which is why bounded retries only stay safe when the receiving operation is idempotent, the discipline behind [idempotency and the exactly-once lie](/blog/idempotency-exactly-once).
+
+## Your dashboard is lying to you
+
+Two measurement traps will fool you into thinking a system is healthy while it burns.
+
+The first is measuring capacity in requests per second. QPS is a trap because per-request cost varies wildly: one request hits a cache, the next scans a million rows, and treating them as equal units makes your capacity number fiction. Model capacity in the resource that is actually scarce, which is almost always CPU-seconds or concurrency. Google's shedding begins rejecting as the number of active threads grows past the number of available processors, because that ratio, not a request count, is what is actually saturating.
+
+The second trap is more insidious because it worsens exactly as the system does. If you are shedding 60 percent of traffic and your fast rejections take a millisecond while your real work takes 200, your p50 latency looks fantastic, because half your sampled responses are instant failures. The metric improves as the pain deepens. The fix is to split success-latency from rejection-latency and report them separately, and to emit an explicit drop counter so shedding is visible as shedding. A system that looks healthier the worse it gets is a system flying blind, and the cost is realizing during the postmortem that the dashboard was green the entire time the users were furious.
+
+## The slow consumer: dropping on purpose, in six lines
+
+Everything above converges on one common situation worth walking concretely. You have a hub fanning one stream of events out to many consumers, and one consumer is slow. A WebSocket server pushing live updates to thousands of clients is the canonical case, and one client on bad wifi is the canonical villain.
+
+The naive design is a single shared queue the broadcast loop blocks on. The instant one client cannot keep up, that queue backs up, the broadcast loop stalls waiting for the slow client, and now every healthy client is starved by the one struggling one. This is the noisy-neighbor problem, and a single blocking queue guarantees it: one slow consumer takes down the experience for everyone, the worst outcome from the most innocent-looking code.
+
+The fix is the trilemma applied per consumer. Give each client its own bounded buffer, and when that buffer is full, drop the event for that one client rather than blocking the shared broadcast path. This is exactly the architecture [NomadCrew](/case-study/nomadcrew) uses: its WebSocket hub drops events from a full 256-deep buffer rather than block. The idiomatic shape is a non-blocking send with a default branch that fires when the buffer is full.
+
+```text
+for each client:
+    try send(event -> client.buffer)   // bounded channel, capacity 256
+    on full:                           // do NOT block the hub
+        drop event for this client
+        increment dropped_events_counter
+```
+
+Read that against the three corners. It is a deliberate choice of drop over block, scoped to the one coupling that is failing, protecting both the hub's memory and the other clients' liveness. The slow client misses some events. Every other client stays real-time. The same instinct shows up wherever one slow consumer can stall a shared path: the messaging fan-out behind [Aladeen](/case-study/aladeen) and the document-ingestion pipeline in [IntelliFill](/case-study/intellifill) both give the slow path its own bounded lane and let it fall behind alone, rather than letting it set the pace for everyone.
+
+And here is the caveat the trilemma demands you say out loud, because it is the whole reason this framing matters. A dropped WebSocket event is silent data loss for that client unless you pair the drop with a resync path: a way for a client that fell behind to re-fetch current state and recover. Without that, you have chosen the "drop" corner and quietly accepted its failure mode. With it, you have chosen drop for live delivery and reconciliation for correctness, which is exactly the kind of explicit, named tradeoff the discipline is about. The drop is fine. The drop with no recovery path and no metric is the bug.
+
+## How a senior actually decides
+
+Step back and the procedure is small, which is the point. It is one question asked at every coupling in the system.
+
+Can I slow the source? If yes, prefer credit-based flow control, because it is the gentlest response and propagates correctly: TCP windows, HTTP/2 `WINDOW_UPDATE`, Reactive Streams demand. This is the default whenever the producer is something you can actually reach back and throttle.
+
+If I cannot slow the source, must I buffer or drop? Buffer when the spike is genuinely transient and bounded, and only with both a size limit and a time limit, discarding stale entries, treating any unbounded queue as the bug it is. Drop when delivery is real-time and the source cannot be slowed: a hub fanning out to many clients, anything where blocking would starve the many to serve the one. Drop the lowest-value work first, drop fast, and emit a counter.
+
+Then, whichever corner you picked, instrument the signal that matches the mechanism (credit for transport, demand for streams, lag for decoupled logs, CPU and queue sojourn time for services), bound your retries so you do not re-feed what you just shed, and split your success and rejection latencies so the dashboard cannot lie. The honest version of every one of these decisions names the failure it accepts. Block accepts stalls. Buffer accepts latency and memory. Drop accepts loss. There is no choice that accepts nothing, and the engineer who pretends otherwise is the one who finds out which corner the system picked by accident, at 2 a.m., from a pager.
+
+Backpressure, in the end, is not a mechanism you add. It is the admission that your system has a finite speed, followed by the decision about what happens to the work that arrives faster than that. Make the decision on purpose. The alternative is not avoiding the decision. It is having it made for you, badly, by a queue that grows until something dies. It is the same posture [API versioning](/blog/api-versioning) takes toward change instead of load: decide deliberately what happens at the boundary, or have the worst default chosen for you.
+
+## FAQ
+
+<FAQ />

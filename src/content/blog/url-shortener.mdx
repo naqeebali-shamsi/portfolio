@@ -1,0 +1,157 @@
+export const meta = {
+  slug: 'url-shortener',
+  title: 'Design a URL Shortener (TinyURL / bit.ly): The Read Path Is the Whole Design',
+  description:
+    'A URL shortener reads thousands of times for every write. That skew decides everything: ID generation, datastore, caching, and why bit.ly chose 302 over 301.',
+  headline: 'Design a URL Shortener (TinyURL / bit.ly): The Read Path Is the Whole Design',
+  deck: 'The write path can be almost anything; every hard decision in this system lives on the read path, and the candidate who optimizes writes has misread the problem.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '15 min',
+  tags: ['system-design', 'url-shortener', 'caching', 'distributed-systems', 'interviews', 'scalability'],
+  faq: [
+    {
+      q: 'How long should the short code be?',
+      a: 'Count the keyspace before you count characters. Base62 (a-z, A-Z, 0-9) gives 62 symbols per position, so 6 characters is about 56.8 billion codes and 7 characters is about 3.5 trillion. Seven characters comfortably covers a decade of growth even at 100 million new links a day, which is roughly 365 billion links over ten years. Six is fine until you approach a billion-plus total links, then you are forced to widen the alphabet or the length. The decision rule: pick the smallest length whose keyspace clears your ten-year projection with headroom, and 7 is the standard answer.',
+    },
+    {
+      q: 'Should a URL shortener use 301 or 302 redirects?',
+      a: 'It depends on whether the product sells analytics. A 301 (Moved Permanently) is cached by the browser and edge, so repeat visits never reach your server: faster and cheaper, but you lose per-click counts and you can never change or expire the destination for clients that already cached it. A 302 (Found) is not cached by default, so every click flows through you: accurate analytics and editable, expirable links, at the cost of carrying every redirect. bit.ly sells insight, so 302 is forced. A pure vanity shortener with no analytics can prefer 301. Saying the choice is conditional on the product is the senior move.',
+    },
+    {
+      q: 'How do you generate unique short codes without collisions?',
+      a: 'Three families, each with a named failure mode. Hash-of-URL then truncate is stateless and deduplicates identical URLs for free, but truncating a 128-bit hash to seven characters guarantees collisions, so every write needs an existence check and retry. A counter encoded in base62 is collision-free by construction with zero existence checks, but needs a globally unique counter and produces enumerable sequential IDs. Snowflake-style IDs (timestamp plus node plus sequence) need no coordination at all but produce longer codes. A senior answer lays out all three and picks per constraint rather than defaulting to one.',
+    },
+    {
+      q: 'Why does a URL shortener need caching instead of just read replicas?',
+      a: 'The read volume is fundamentally a cache problem, and replicas are the backstop, not the front line. Around 20 percent of links serve roughly 80 percent of redirects, and the hottest codes spike when a link goes viral. Memory reads land near 100 nanoseconds and a cache tier serves millions of reads per second; an SSD-backed replica tops out near 100,000 IOPS and adds replication lag. Cache-aside with LRU and TTL absorbs the hot working set at the edge and in Redis, and read replicas only catch the misses. Sizing the system around replicas alone melts the database the first time a link goes viral.',
+    },
+    {
+      q: 'Where should the ID counter live so it is not a single point of failure?',
+      a: 'A single Redis INCR is atomic but a SPOF and a write hotspot, so do not stop there. Lease ranges: each write node claims a block of, say, 1,000 IDs and serves them locally, touching the central counter once per block. Give each region disjoint ranges so there is no cross-region coordination on the hot path. The key invariant is that you need uniqueness, not contiguity: if a node dies mid-block, the leftover IDs are wasted and nothing breaks. Or skip the counter entirely with Snowflake IDs, which are coordination-free by design. The fix for a hot counter is ranges or Snowflake, never a bigger Redis.',
+    },
+  ],
+}
+
+A URL shortener looks like the easiest system you will ever be asked to design. Take a long URL, hand back a short one, send anyone who visits the short one to the long one. You could sketch the whole thing on a napkin: a function that makes a code, a table that maps the code to the URL, a redirect. Most people do exactly that, and most people get the problem wrong in the first sixty seconds.
+
+The trap is that the napkin sketch is symmetric, and the real system is not.
+
+Here is the asymmetry. People create a link once and then it gets clicked thousands of times. [Alex Xu's worked numbers](/blog/capacity-estimation) put it at 100 million new URLs a day, which is about 1,160 writes per second, and at a 10:1 read-to-write ratio that is 11,600 reads per second. Hello Interview frames the same workload as roughly 1,000 reads per write, deriving hundreds of thousands of reads per second at peak against about one write per second, which it calls "negligible for any database." bit.ly's real traffic is the punchline: 6 billion clicks a month against 600 million shortens, and on a typical recent day around 360 million clicks against 6 to 7 million new links, which is closer to 50:1.
+
+So before you draw a single box, you state the thesis: **this is a read-heavy system, the read path is where every hard decision lives, and the write path can be almost anything.** A candidate who spends the interview optimizing writes has misread the problem. This is exactly the move [the system design interview framework](/blog/system-design-interview-framework) trains: drive from the access pattern and the numbers, not from the diagram.
+
+## What you are actually building
+
+Strip it to the functional core and there are two operations.
+
+Write: given a long URL, return a short code, and optionally accept a custom alias and an expiry.
+
+Read: given a short code, redirect to the long URL, and count the click.
+
+The non-functional requirements are where the interesting constraints sit. The redirect has to be fast, because it is in the critical path of someone clicking a link and waiting for a page; this is a [latency and tail-latency](/blog/latency-throughput-tail) problem, and the number that matters is p99, not the average. The system has to be highly available, because a shortener that is down breaks every link anyone ever made. And it has to scale reads far harder than writes.
+
+That last point forces a [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) stance, and you should say it out loud: favor availability over strong consistency. A redirect that is stale by a few seconds, because a brand-new link has not yet replicated to the region you are reading from, is completely fine. A redirect that returns an error because the system insisted on a quorum is not. You are building an AP system with eventual consistency on writes, and the rare reader who created a link milliseconds ago in another region can tolerate the wait.
+
+## The intellectual core: where short codes come from
+
+This is the part of the interview that actually separates people, and there are three honest families of answer. Each works. Each has a failure mode with a name. The senior move is to lay out all three and pick per constraint instead of defaulting to whichever one you memorized.
+
+**Family one: hash the URL and truncate.** Take `md5(longUrl)`, encode it base62, keep the first seven characters. The System Design Primer's canonical walkthrough does exactly this. It is stateless, it needs no coordination, and it deduplicates identical URLs for free, because the same input hashes to the same code. The failure mode is collisions. A 128-bit hash truncated to seven base62 characters is about 42 bits, and at billions of rows you will get distinct URLs that map to the same code. So every write now needs an existence check: hash, look up, and if the code is taken, perturb the input and retry. You can soften the read cost with a bloom filter, but writes still pay the check. You traded coordination for a read-before-write on the write path.
+
+**Family two: a counter, encoded base62.** Keep a monotonic integer, hand out the next one on each write, and render it in base62. Counter 125 becomes `21`; counter 1,000,000,000 becomes `15FTGg`, six characters. This is collision-free by construction, which means zero existence checks, which is genuinely beautiful. It has two costs. First, you need a globally unique counter, and that is a coordination problem I will come back to, because it is the real staff-level pivot. Second, the codes are sequential, so they are enumerable: a competitor can walk `...001`, `...002`, `...003` to scrape your links or simply count how many you have created this month. That is a real intelligence leak even though short links are usually public anyway.
+
+**Family three: a pre-generated Key Generation Service.** Stand up a separate service that generates random base62 keys offline, stores them in a table marked used or unused, and hands batches to app servers. Uniqueness work moves entirely off the request path: at write time an app server just pops a pre-made key from its local batch. The cost is an extra stateful service plus the concurrency control to guarantee two servers never lease the same key, which means the act of moving a key from unused to used has to be atomic. And you have to size the key database: 62 to the sixth is about 56.8 billion six-character keys, which is your runway.
+
+Note the alphabet detail, because it catches people. Base62 is `a-z`, `A-Z`, `0-9` and deliberately excludes `+` and `/`. Those two show up in base64 and both carry meaning inside a URL or query string, so a base64 code would corrupt the moment someone pasted it into the wrong place. Knowing why the alphabet stops at 62 is a small tell that you have thought about this below the surface.
+
+## The counter coordination problem is the staff-level pivot
+
+Say you pick the counter. The junior answer stops at "use a counter." The staff answer asks the only question that matters: where does the counter live?
+
+The naive home is a single Redis `INCR`. It is atomic, because Redis is single-threaded, so it will never hand the same number to two callers. But it is a single point of failure and a write hotspot: every write in the entire system serializes through one key on one box. A bigger Redis does not fix this; it just raises the ceiling on a design that is structurally wrong.
+
+The real answers reduce coordination instead of scaling the bottleneck.
+
+**Lease ranges.** Each write node asks the central counter for a block, say 1,000 IDs, in one operation, then serves all 1,000 from local memory. Now the central counter is touched once per thousand writes instead of once per write. The objection people raise is "but if a node crashes mid-block, you lose 700 IDs." Correct, and it does not matter, and saying so is the line that separates senior from junior: **you need uniqueness, not contiguity.** Gaps are free. The moment you internalize that an ID allocator's only job is to never repeat, range leasing and everything below it becomes obviously cheap.
+
+**Multi-region disjoint ranges.** Give region A one band of the number space and region B another, with no overlap. Now neither region coordinates with the other on the hot path; each leases from its own band. This is what makes the system genuinely multi-region, and it rides on the same uniqueness-not-contiguity invariant.
+
+**Snowflake: remove the round trip entirely.** Twitter's [archived Snowflake design](/blog/system-design-interview-framework) lays out a 64-bit ID as 1 sign bit, 41 bits of millisecond timestamp, 10 bits of node ID, and 12 bits of per-millisecond sequence. That gives 4,096 IDs per millisecond per node across up to 1,024 nodes, roughly 4.2 billion IDs per second, with zero network round trips because each node mints its own IDs locally. The trade is that Snowflake IDs are long, so your "short" code is now 11-plus characters instead of 6 or 7. You spent code prettiness to buy total coordination-freedom. Whether that is a good trade depends on whether short matters more than simple, and a senior candidate names the trade rather than pretending it does not exist.
+
+There is a footgun worth raising unprompted: Snowflake leans on a 41-bit timestamp from a custom epoch, which means it depends on monotonic clocks. If a node's clock jumps backward, it can mint a duplicate or has to stall until time catches up. Naming clock skew as the operational cost of Snowflake is the kind of detail that signals you have run something like this, not just read about it.
+
+## The datastore: the textbook says key-value, and the real world proves it
+
+What does the read actually do? It takes a short code and returns one long URL. No joins. No range scans. No relational semantics. It is a pure point lookup on a single key, which is the textbook shape for a key-value store.
+
+The Primer uses MySQL with `PRIMARY KEY(shortlink)`, and at modest scale that is completely fine. The instructive story is bit.ly's, because they lived the other end of it. Their [first-party migration writeup](/blog/idempotent-webhooks) describes running manually sharded MySQL holding 80 billion rows, and it was, in their words, high-maintenance and error-prone. Daily backups took almost an entire day. A restore needed two people working for several days. And the sharding scheme blocked them from going multi-region. They migrated to Bigtable, landing around 40 billion records in 26 terabytes, explicitly because the data was "indexed on a single primary key." That is the whole lesson: the access pattern was key-value the entire time, and the relational database was the wrong tool that had been quietly taxing them for years.
+
+One sharding subtlety closes this out. Do not range-partition on a monotonic key. If your IDs come from a counter and you shard by ID range, every brand-new write lands on the newest shard, so the shard holding the highest range becomes a permanent write hotspot while the rest sit cold. Partition by [consistent hashing](/blog/consistent-hashing) instead, which spreads writes across all shards and remaps minimal data when you add or remove a node, or use Snowflake's high-entropy layout so the keys scatter on their own. Range-partitioning a monotonic key is one of those decisions that looks fine on a whiteboard and pages you in production.
+
+## Caching is not an add-on; it is the architecture
+
+Given the read skew, caching is not a box you bolt on at the end. It is the load-bearing wall.
+
+The working-set assumption is the 80/20 rule: about 20 percent of links serve roughly 80 percent of redirects. That distribution is what makes caching devastatingly effective here, because a small amount of memory absorbs most of the traffic. The numbers justify it: a memory read is around 100 nanoseconds and a cache tier serves millions of reads per second, while an SSD-backed replica tops out near 100,000 IOPS and carries replication lag. You cannot serve hundreds of thousands of redirects per second off disk. You serve them out of memory.
+
+The pattern is cache-aside with LRU eviction and a TTL on hot keys. The redirect service checks Redis first; on a hit it returns immediately; on a miss it reads the datastore, populates the cache, and returns. LRU keeps the hot 20 percent resident and evicts the cold tail. For the very hottest codes, push the cache out to a CDN or edge PoP so the redirect resolves at the edge without ever touching origin. This is the same caching discipline a [rate limiter](/blog/rate-limiter) leans on, and the [distributed cache](/blog/distributed-cache) post goes deeper on how a tier like this is built, including the consistent hashing that distributes keys across cache nodes.
+
+Two failure modes on the read path deserve airtime, because they are where viral links go to kill databases.
+
+**Cache stampede.** A link goes viral and gets evicted, or its TTL expires, at the exact moment a thousand concurrent requests want it. All thousand miss, all thousand stampede the datastore for the same key, and the database falls over. The fix is request collapsing, also called single-flight: the first miss fetches from origin while the other 999 wait on that one in-flight fetch and share its result. Without it, popularity itself becomes the outage trigger.
+
+**The 404 path.** Plenty of requests hit codes that never existed: typos, scanners, dead links. You do not want each of those to query the datastore. A bloom filter on the read path answers "this code was definitely never issued" without a database hit, returning 404 cheaply. And you should distinguish the cases for both UX and abuse forensics: never existed is a 404, expired is a 410, disabled-for-abuse is a 410 or 451. Collapsing all three into one error throws away signal you will want later.
+
+## 301 versus 302 is a product decision, not trivia
+
+Everyone "knows" 301 is the SEO-friendly, faster redirect. For this system, defaulting to 301 can be actively wrong, and explaining why both directions of the tradeoff exist is the senior move.
+
+A **301 Moved Permanently** is cacheable. The browser and any edge in front of it remember it, so the second time someone clicks that short link, the request goes straight to the destination and never touches your server. Faster for the user, cheaper for you, strong canonical signal for search. The cost is brutal for a shortener: you stop seeing repeat clicks, so your analytics undercount badly, and you can never change or expire the destination for any client that already cached the 301. The redirect is, for those clients, genuinely permanent.
+
+A **302 Found** is not cached by default, so every single click flows through your server. That is more load, and it is also the entire point if your product is analytics: you see every click, and you can edit or expire any link at any time because nothing downstream has cached the mapping. (307 is the same non-cached behavior but additionally preserves the HTTP method, which matters if anyone ever POSTs through a short link.)
+
+So which is right? It depends on the product, and bit.ly's own framing answers it for them: their business is insight. That single fact forces 302, because 301 would blind the product to the data it sells. A pure vanity shortener with no analytics could reasonably prefer 301 for the speed and cost. The point is not to memorize "302." The point is to derive the answer from what the product does, and to know that 301 quietly costs you analytics and editability forever.
+
+## The parts juniors skip
+
+A shallow answer stops at hash-store-redirect. The surfaces below are where real systems live, and raising them unprompted is the tell that you have operated something like this.
+
+**Custom aliases are a write-write race.** Two users both request `tiny.url/sale` at the same moment. Both check, both see it free, both claim it. Resolve it with a [distributed lock](/blog/event-driven-rbac) on the alias (Chubby, or Redis Redlock), or lean on a unique-constraint insert where exactly one writer wins and the loser retries, the same atomic-claim pattern that makes [idempotent webhooks](/blog/idempotent-webhooks) safe. The shape recurs across systems: when two writers contend for one identity, the database constraint is the only honest referee.
+
+**Expiry is lazy, never eager.** You are not running a cron job that deletes 365 billion rows. You store a TTL and reap on read: when a request hits an expired link, return 410, enqueue an async delete, and move on, with a background sweep for cold partitions. And decide the reuse-after-expiry policy explicitly, because it has teeth: if you recycle an expired code, an old QR sticker or a printed flyer pointing at that code now resolves to someone else's link. Usually you do not reuse codes for exactly this reason, and stating that policy is the senior instinct.
+
+**Abuse is a create-time and a serve-time problem.** At create time, scan the destination against Google Safe Browsing or a blocklist, with the honest caveat that Safe Browsing can lag on brand-new malicious URLs, so a fresh bad link can slip through. Rate-limit link creation by API key, IP, and cookie to blunt bulk abuse. And re-check at click time, because a destination that was benign when shortened can turn malicious afterward; the academic study of gaps in bit.ly's spam detection is a reminder that this is a real and studied attack surface, not a hypothetical.
+
+**Enumeration.** If you went with sequential counter IDs, accept that they are walkable and decide whether you care. The mitigation is to run the counter through a reversible transform before encoding, XOR with a secret, a small Feistel network, or a library like Hashids, so the emitted codes look random while staying collision-free and decodable. Sometimes you genuinely do not care, because the links are public. Naming the leak and the fix, then deciding it is acceptable, beats not noticing.
+
+## Push analytics off the hot path
+
+The last architectural move is the one bit.ly made explicit: the redirect must be synchronous and fast, and the analytics must not be.
+
+When a redirect happens, you do the cheap thing inline (resolve the code, return the 302) and emit an event saying "a click happened" onto a durable queue. bit.ly open-sourced the actual queue they use for this, NSQ, and the consumers, realtime analytics, archival, long-term history, annotation, all read from it asynchronously. The redirect returns long before any of them finish. Their stated lesson is that event-style messages ("a click happened") beat command-style messages ("go increment this counter"), because events let you add new consumers without touching the producer and survive a consumer being down.
+
+This is the same decoupling principle as [acknowledging a webhook fast and processing it later](/blog/idempotent-webhooks): the thing the caller is impatient about (the redirect) becomes cheap, and the thing that is genuinely heavy (counting, aggregating, fanning out) moves somewhere the caller cannot see and cannot time out. If you fan out analytics inline, a slow consumer makes the redirect slow, and a viral link takes the redirect path down with it.
+
+## How a senior decides
+
+The whole design collapses into a short sequence of decisions, each with a default and a named alternative.
+
+| Decision | Default move | Why, and the alternative |
+| --- | --- | --- |
+| What drives the design | The read path | Reads outnumber writes 10:1 to 1000:1; optimizing writes is misreading the problem |
+| Short code generation | Counter + base62, or Snowflake | Collision-free without existence checks; hash-truncate if you want free dedup and accept retries |
+| Where the counter lives | Lease ranges per node | Single Redis is a SPOF and hotspot; Snowflake if you want zero coordination and accept longer codes |
+| ID invariant | Uniqueness, not contiguity | Makes range leasing and multi-region allocation cheap; gaps from crashes are free |
+| Datastore | Key-value (single-key point lookup) | bit.ly proved relational is the wrong tool here; never range-partition a monotonic key |
+| Read scaling | Cache-aside + LRU + TTL + CDN | 80/20 hit rate; replicas are the cache-miss backstop, with single-flight against stampede |
+| Redirect code | 302 for an analytics product | 301 caches away your repeat-click data and freezes the destination; choose per product |
+| Analytics | Async event fan-out off the hot path | Keeps the redirect fast; inline counting lets a slow consumer slow every click |
+
+None of these is exotic. What separates the answer that survives a staff-level bar from the one that stalls is whether you treated each default, 301, MySQL, a single counter, as a decision with a tradeoff and an alternative, and whether you drove the whole thing from the read/write skew and the numbers instead of the napkin sketch. The shortener that handles 6 billion clicks a month is not built on a clever code generator. It is built on knowing which path is hot, and putting everything you have in front of it.
+
+The same instincts show up across the systems I have built and written up: choosing availability and eventual consistency under load in [NomadCrew](/case-study/nomadcrew), pushing heavy work off the request path in [Aladeen](/case-study/aladeen) and [Audex](/case-study/audex), and partitioning a hot keyspace cleanly in [Mecanum](/case-study/mecanum) and [IntelliFill](/case-study/intellifill). The shortener is small enough to fit on a napkin and deep enough to separate the people who have only drawn the napkin from the people who have run what it becomes.
+
+## FAQ
+
+<FAQ />

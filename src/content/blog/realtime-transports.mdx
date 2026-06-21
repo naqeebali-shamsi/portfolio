@@ -1,0 +1,175 @@
+export const meta = {
+  slug: 'realtime-transports',
+  title: 'WebSockets vs SSE vs Long Polling: Choosing a Real-Time Transport',
+  description:
+    'HTTP assumes the client asks first, so pushing data to a browser is a workaround. How to pick between long polling, SSE, and WebSockets by direction and volume, and pay the connection bill.',
+  headline: 'WebSockets vs SSE vs Long Polling: Choosing a Real-Time Transport',
+  deck: 'A shallow answer reaches for WebSockets. A senior answer makes you justify why Server-Sent Events were not enough.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '16 min',
+  tags: ['websockets', 'sse', 'real-time', 'system-design', 'http', 'scalability'],
+  faq: [
+    {
+      q: 'When should I pick SSE over WebSockets?',
+      a: "Pick SSE when data flows one way, server to client, and the client rarely needs to push back through the same channel. Notification feeds, live scores, dashboards, progress bars, and LLM token streaming all fit. SSE is ordinary HTTP, so it passes through proxies and firewalls, reconnects on its own, and replays what was missed through the Last-Event-ID header, all without code you write. Reach for WebSockets only when the client-to-server direction is also hot, like chat, collaborative editing, multiplayer games, or live cursors.",
+    },
+    {
+      q: 'What actually limits a real-time server at scale?',
+      a: 'Concurrent connections, not messages per second. Every long-lived connection is a held socket that costs a file descriptor and memory whether or not it is sending anything, so the first capacity question is how many idle connections one box can hold. This is the C10K problem, now stretched to C10M. WhatsApp reported more than two million TCP connections on a single FreeBSD server in 2011, then ran production boxes at roughly one million each to keep headroom for spikes.',
+    },
+    {
+      q: 'Why does a WebSocket client mask its frames?',
+      a: 'Masking defends intermediaries against cache poisoning, and it is not encryption. RFC 6455 requires the client to XOR every frame it sends with a random 32-bit key so a hostile page cannot shape bytes that a confused proxy mistakes for a cacheable HTTP response. Server-to-client frames carry no mask. For confidentiality you use TLS through wss on port 443, the same way HTTPS wraps a normal request.',
+    },
+    {
+      q: 'Does HTTP/2 make WebSockets unnecessary?',
+      a: 'No. HTTP/2 helps SSE by lifting the old six-connections-per-domain cap, because every event stream now rides one shared connection instead of burning a socket. It gives you no bidirectional channel on its own. Running WebSockets over HTTP/2 is a separate mechanism, the Extended CONNECT method from RFC 8441, with RFC 9220 carrying it to HTTP/3. They answer different questions and run side by side.',
+    },
+    {
+      q: 'Is long polling obsolete?',
+      a: 'It is a fallback, not a foundation. Long polling holds one HTTP request open per waiting client and answers the moment news arrives, which is close to real time and works everywhere, including places that block streaming. Its costs are a held connection per client and a race window where an event can fire while the client is mid-reconnect. Use it where SSE and WebSockets are blocked, or as the degradation tier beneath them.',
+    },
+  ],
+}
+
+HTTP carries an assumption so old that most of us stopped seeing it: the client speaks first. You ask, the server answers, the exchange closes. That shape built the web, and it has no built-in way to say the one sentence every real-time feature depends on, "something just happened, here it is," with nobody having asked.
+
+So every live feature you have used is a way around that gap. The chat that updates while your friend types, the dashboard that ticks with no refresh, the model response that streams in word by word, all of them answer one question. How does a server send data to a client when the protocol was designed for the client to ask first?
+
+The answers are few, and they stack into a ladder. Each rung removes one inefficiency of the rung below it, and the skill is not climbing to the top. It is knowing which rung your workload needs, because the top rung costs the most to run and tempts you the hardest. This piece walks the ladder, hands you a rule for picking a rung, and faces the one bill every rung quietly sends once you have real traffic. It sits beside the rest of the [system design interview framework](/blog/system-design-interview-framework), and if you have read [REST vs gRPC vs GraphQL](/blog/api-design-styles), you already know choosing a protocol is mostly about being honest about the traffic shape. Same move here, one layer down.
+
+## The ladder begins where HTTP runs out of grace
+
+Start at the bottom, with the trick everyone rebuilds before they learn its name.
+
+Short polling. The client asks "anything new?" on a timer, every few seconds, forever. It is trivial to build, runs against any HTTP server alive, and wastes effort in a way that turns ugly fast. The waste deserves a number, because the number earns everything above it.
+
+Take a notification feed polled every five seconds with a hundred thousand users online. That is twenty thousand requests per second of pure "anything new?", each one dragging a full set of HTTP headers that can run from a few hundred bytes to over a kilobyte. On a slow afternoon nearly every response comes back empty. You pay in full, constantly, mostly to hear no. Latency is capped by the interval too: an event that lands one second after a poll waits four more before anyone learns of it. Shrink the interval to cut the delay and you multiply the waste. No setting is both cheap and quick.
+
+Long polling is the first honest fix. The client makes a request, and rather than reply at once with "nothing," the server holds it open. When an event happens, it replies, and the client opens a fresh request to wait again. On a quiet feed you fall from one round trip every five seconds to roughly one per real event. The empty replies disappear. This is the exact waste RFC 6455 describes when it calls the old approach high overhead, with every client-to-server message carrying an HTTP header, made concrete.
+
+```
+SHORT POLLING                          LONG POLLING
+  client: anything new?                  client: anything new?
+  server: no            (wasted)         server: ...holds...
+  client: anything new?                  server: ...holds...
+  server: no            (wasted)              [event happens]
+  client: anything new?                  server: here it is!   <- 1 trip per event
+  server: HERE          (finally)        client: anything new? (reopens, waits)
+```
+
+Long polling is genuinely useful and travels through firewalls and proxies that mangle anything fancier, which is why it stays the fallback tier under most real-time libraries. But look at what it still is: one full HTTP request and response per message, a connection held open per waiting client, and a race window where an event can fire in the gap between the client getting its answer and reopening the next request. The verdict everyone lands on is the same. It is close to real time, and anything built on it as a base will feel the seams. A fallback, not a footing.
+
+The next two rungs split on the question long polling never makes you ask, the one that ends up deciding the design: which way does your data actually move?
+
+## SSE: when the traffic runs one way
+
+A lot of "real-time" features move in one direction only. The server has news, and the client only has to hear it. Stock tickers, the notification bell, live scores, build logs draining into a CI view, a progress bar on a long job, and the now-everywhere case of a model streaming tokens into a chat window. In each one the client's whole job is to listen.
+
+For that shape there is a transport most engineers rate too low: Server-Sent Events. SSE is one long HTTP response that never ends. The server sets the content type to `text/event-stream` and writes events into the open connection whenever it wants, for as long as it wants. The browser hands it to you through the `EventSource` API, and the wire format is close to trivial.
+
+```
+event: price
+data: {"symbol":"ACME","bid":41.12}
+id: 8814
+
+: this colon-prefixed line is a comment, used as a keep-alive ping
+
+data: a bare data line defaults to the "message" event
+id: 8815
+
+retry: 5000
+```
+
+That is the entire protocol. The fields are `data:`, `event:` which defaults to `message`, `id:`, and `retry:` for the reconnection delay in milliseconds. A line that opens with a colon is a comment, which doubles as the standard heartbeat that keeps idle connections from being reaped by middleboxes.
+
+The reason to care about SSE is what the browser does when the connection drops, which it will, because mobile networks and laptop lids exist. On a drop, `EventSource` reconnects on its own and sends the last event's id back in a `Last-Event-ID` header, so a server that tracks ids picks up exactly where the client fell off and fills the gap. A few lines to honor that header buy you reconnection, resume, and gap-filling for close to nothing. Hold that thought, because the contrast with the rung above is the whole argument.
+
+One SSE trap is sharp enough to lose an afternoon to. MDN states it without hedging: over HTTP/1.1 the browser caps open connections per domain at six, the limit is per browser and set to a very low number, and the matching bug is marked Won't fix in Chrome and Firefox. Open your app in six tabs and the seventh tab's stream just hangs, because all six sockets are spent. HTTP/2 dissolves this by multiplexing every stream over one connection, though even then a default ceiling waits in `SETTINGS_MAX_CONCURRENT_STREAMS`, which many servers set to 100. So SSE over HTTP/2 is the setup you want, and knowing why separates reading about HTTP/2 from having been burned by it.
+
+## WebSockets: when both sides talk at once
+
+Now the case SSE cannot cover. Sometimes the client is no passive listener. In chat, both people send. In collaborative editing, every keystroke flows up while everyone else's flows down. In a multiplayer game the client streams input and the server streams world state dozens of times a second. When the client-to-server direction runs hot and frequent, you want a real two-way channel, and that is what WebSockets give you: one TCP connection, upgraded once, over which both sides send on their own whenever they like, full-duplex, for the life of the connection.
+
+The opening repays a careful read, because it explains why WebSockets get through corporate proxies that block everything else. A WebSocket starts as a plain HTTP request, then stops being HTTP. The client sends a `GET` carrying `Upgrade: websocket`, `Connection: Upgrade`, `Sec-WebSocket-Version: 13`, and a `Sec-WebSocket-Key` of sixteen random bytes, base64-encoded. The server replies `101 Switching Protocols` with a `Sec-WebSocket-Accept` it computes by joining that key to a fixed magic GUID, `258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, taking the SHA-1, and base64-encoding the digest. That GUID is a literal constant in RFC 6455. After the `101`, the bytes become WebSocket frames moving both ways.
+
+```
+  client                                      server
+    |  GET /chat  Upgrade: websocket            |
+    |  Sec-WebSocket-Key: dGhlIHNhbXBsZQ==  --> |
+    |                                           |
+    |  <-- 101 Switching Protocols              |
+    |      Sec-WebSocket-Accept: s3pPLMBi...    |
+    | ----------- now it is no longer HTTP ---- |
+    |  <----------- frames both ways ---------> |
+```
+
+Two details of the frame protocol are the ones a senior engineer names without looking, and naming them shows you read the source instead of a summary. First, opcodes: `0x1` text, `0x2` binary, `0x8` close, `0x9` ping, `0xA` pong. Ping and pong are protocol-level heartbeats, the answer to "how do you tell a dead WebSocket from a quiet one," because a TCP connection can be silently dead for minutes before anyone notices. Second, masking. RFC 6455 requires that the client mask all frames it sends to the server, XOR-ing each one with a random 32-bit key. People mistake this for security, and it is not. Masking stops a hostile page from shaping bytes that a confused intermediary proxy reads as a cacheable HTTP response and then poisons its cache with. Server-to-client frames carry no mask. For real confidentiality you use `wss` on port 443, WebSocket over TLS, the same way HTTPS is HTTP over TLS.
+
+Here is the opinion the rest of this piece has been walking toward. The connection is the easy twenty percent. The expensive eighty percent is everything you now build around it, every bit of which SSE handed you for free. WebSockets give you no automatic reconnection, no resume, no gap-filling. You write the reconnect-with-backoff loop. You build the ping and pong heartbeat and decide what a missed pong means. You handle message dedup and ordering across reconnects. And you handle backpressure, the case people forget completely: when the server produces faster than a slow client drains, something has to buffer, drop, or slow down, and if you never chose which, your memory chooses for you. A WebSocket hands you a pipe, and a messaging system is the work you do on top of it. Treating the pipe as the system is the most common way these projects slide off the rails.
+
+## The choice is two axes, not a flowchart
+
+People want a flowchart here. The honest version is a two-by-two, because two independent questions settle the answer, and "is it real-time?" is neither of them.
+
+The first axis is direction. Does data move one way, server to client, or both ways? The second is volume, really frequency. Is the client-to-server direction a rare event or a steady stream? Drop the transports into those quadrants and the choice falls out.
+
+| | Low volume / infrequent | High volume / frequent |
+| --- | --- | --- |
+| **Server to client only** | Long polling is fine | **SSE** |
+| **Both directions** | Long polling, or SSE plus `fetch` POST | **WebSockets** |
+
+The two corners people skip are the interesting ones. A live notification feed is server-to-client and high-volume, so it lands flat on SSE, and reaching for WebSockets there buys operational weight you will never spend. A chat app where you mostly read and now and then send does not automatically need WebSockets either: SSE for the down-channel plus an ordinary `fetch` POST for the rare message up-channel is a clean design and often the better one, because the down-channel keeps SSE's free reconnection and the up-channel is just a normal request.
+
+So the rule, said as a default and not a menu: start at SSE for anything server-driven, and make the jump to WebSockets earn its place by proving the client-to-server direction is genuinely hot. "Real-time" does not buy a WebSocket. Frequent two-way traffic does. The tell that separates shallow from senior is which way the design has to argue: a shallow one defends choosing WebSockets, a senior one defends declining SSE. That is the same instinct behind [REST vs gRPC vs GraphQL](/blog/api-design-styles), and the same honesty [latency and the tail](/blog/latency-throughput-tail) asks for when you decide which percentile actually has to be fast.
+
+## The bill every rung sends: holding the connections
+
+Now the part that never shows up in the feature table and quietly decides whether the design survives, because it is the cost all three transports share the moment you have more than a handful of users. Every one of them, long polling included, holds a connection open per client. That reads as harmless until you do the arithmetic, which reframes the whole scaling problem.
+
+The limit is connections, not throughput. Ably puts it plainly: persistent connections require servers to keep connection state and tie up system resources over long periods. Each open connection costs a file descriptor and memory, on the order of two to ten kilobytes for an idle one before any application state or send and receive buffers. At five kilobytes each, a million connections is five gigabytes of RAM spent only on holding them, before one byte of your logic runs. File descriptors are the other wall, one per connection, which is why high-scale servers tune kernel limits before anything else. So the first scaling question is not "can this box process the messages?" It is "can this box hold the connections?" This is the lineage the [C10K problem](https://en.wikipedia.org/wiki/C10k_problem) named decades ago, now stretched to C10M, a connection-count problem dressed as a throughput one.
+
+The numbers that make this concrete are WhatsApp's, reported first-hand rather than passed around. In 2011 their own engineering post announced more than two million TCP connections on a single FreeBSD box running Erlang, with one lightweight process per connection. Then the detail that teaches the most: in production they ran boxes at roughly one million each, well under the two million they had proven, to keep headroom for spikes. Peak density is a tradeoff you choose, not a record you chase. A single well-tuned event-driven node on a modern stack, Node or Go or Elixir, holding a couple hundred thousand connections at low-tens-of-milliseconds latency is the anchor for what one box does today.
+
+```
+VERTICAL WALL                    HORIZONTAL WALL
+ one box                          conn split across N boxes
+  +--------------------+           [box A]   [box B]   [box C]
+  | conn 1 -> fd + mem |              \         |        /
+  | conn 2 -> fd + mem |               \        |       /
+  |   ...              |             [ pub/sub backplane ]
+  | conn N -> fd + mem |          user X on A messages user Y on C:
+  +--------------------+          the backplane fans it out
+   ~2M/box proven, ran ~1M        Redis / Kafka / NATS
+```
+
+Holding the connections is only the vertical wall. The horizontal one, harder of the two, shows up the instant your connections span more than one server. If user X is on box A and needs to message user Y on box C, box A has no idea where Y even lives. You need a pub/sub backplane, Redis or Kafka or NATS, that any node can publish to and read from, so a message fans out to the right connections wherever they sit. The connection count is the vertical wall, the cross-node fan-out is the horizontal one, and you hit both. This is the architecture at the center of [Design WhatsApp](/blog/design-whatsapp), the same shape as scaling the timeline in [Design Twitter](/blog/design-twitter-feed) where one write has to reach many readers. I have built it for real in [NomadCrew](/case-study/nomadcrew), a WebSocket hub carrying group chat, presence, and live location for travelers, where the backplane is what lets a location ping from one phone reach everyone in the trip no matter which node holds their socket.
+
+A tempting shortcut is sticky sessions: pin each client to the server that holds its connection. Ably's warning here runs against instinct and is worth heeding. Sticky sessions make failover and load-shedding harder, because a client glued to a dying node keeps retrying that exact node instead of rerouting to a healthy one. The sturdier pattern is to push session and message state outside the node so any node can serve any client, which costs more up front and pays you back during the incident. That trade between affinity and recovery is the same one [deployment strategies](/blog/deployment-strategies) wrestle with when a deploy has to drain a node without dropping the live connections riding it.
+
+## Three places this gets you, and one horizon
+
+A few hard-won details that only surface in production, each of which has paged someone.
+
+Mobile breaks the persistent-socket assumption. Phone operating systems aggressively kill long-lived connections when an app backgrounds, so a "live" socket is simply gone the moment the user switches apps. This is the real reason WhatsApp-class apps lean on platform push, APNs and FCM, to reach a sleeping app, instead of pretending the socket survives. The live transport and the push channel are two designs you build together, and one is no substitute for the other. That shaped the NomadCrew mobile hub directly.
+
+Proxies and load balancers can quietly strangle a stream. A reverse proxy that buffers responses, which several nginx configs do by default, will batch or stall an SSE or long-poll stream while it waits for a response body that, by design, never ends. It works on your laptop and dies behind the load balancer, which is a miserable thing to debug under pressure. Real deployments have to turn off response buffering, allow chunked transfer, and raise idle timeouts well past the heartbeat interval.
+
+Delivery guarantees stay your job. The WebSocket transport is ordered because TCP is ordered, and that guarantee evaporates across reconnects, server restarts, and fan-out. If a message must not be lost when a client's connection blips during a deploy, that reliability is your application's work, the same at-least-once and idempotency discipline [event-driven RBAC](/blog/event-driven-rbac) needs when it pushes a permission or flag change and has to survive the window before every node agrees. The transport moves bytes. It does not remember them for you.
+
+And the horizon, a frontier and not a recommendation. RFC 8441 lets a WebSocket ride one HTTP/2 connection through the Extended CONNECT method, and RFC 9220 carries that to HTTP/3 over QUIC. Past them, WebTransport over QUIC adds unreliable datagrams alongside multiplexed streams, a real gain for games and live media where a dropped frame should be skipped instead of resent. As of 2026 it has no Safari support, limited Node support, and experimental server support, so it is a thing to track, and not a thing to ship a product on. One line closes the taxonomy: for server-to-server push, machine to machine rather than to a browser, the usual answer is a webhook, a different tool for a different audience.
+
+## How a senior engineer actually decides
+
+Walk the ladder, and walk down from the constraints rather than up from the features.
+
+Name the direction first. If data only moves server to client, SSE is your default and the burden of proof falls on anything heavier, because SSE already gives you reconnection, resume through `Last-Event-ID`, and clean passage through proxies. Name the volume second. If the client-to-server direction is rare, a plain `fetch` POST handles it and you keep SSE underneath. Only when that up-channel runs genuinely hot do you reach for WebSockets, and when you do, budget for the eighty percent that is not the connection: heartbeats, reconnect, resume, ordering, backpressure.
+
+Then, before any of it, ask the scaling question that really governs the design, the one [capacity estimation](/blog/capacity-estimation) trains you to run on a napkin: how many concurrent connections, times the memory and file descriptors each one costs, against one box's ceiling, and where is the pub/sub backplane that fans messages across nodes? Set a per-node connection target with headroom the way WhatsApp ran a million instead of two, push state outside the node instead of pinning clients, and define what happens to in-flight messages when a node drains, which is where your [SLOs and error budgets](/blog/slos-error-budgets) tell you how much real-time delivery you are allowed to lose. Carry the same instincts you would bring to [the rate limiter](/blog/rate-limiter), [the auth deep dive](/blog/auth-deep-dive), or the batch siblings like [feature flags](/blog/feature-flags), [the API gateway](/blog/api-gateway), and [autoscaling](/blog/autoscaling): the protocol is the small decision, and the operational shape around it is the real one.
+
+The honest landing is the one the feature tables never print. WebSockets are no prize at the top of the ladder. They are a strong, costly tool for one specific shape, frequent two-way traffic, and most "real-time" features are not that shape. For the rest, SSE over HTTP/2, or even long polling, will serve you better and cost less to run, because the cheapest real-time system is the one that does not make you rebuild reconnection by hand. Reach for the lowest rung that fits the direction and the volume, and make every step up the ladder earn its keep.
+
+## FAQ
+
+<FAQ />

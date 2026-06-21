@@ -1,0 +1,137 @@
+export const meta = {
+  slug: 'lsm-tree-vs-btree',
+  title: 'LSM-Tree vs B-Tree: The Storage Engine Decision That Defines Your Write Path',
+  description:
+    'B-trees and LSM-trees pick opposite sides of the same tradeoff. How each handles writes, reads, and space, and how a senior decides which your workload wants.',
+  headline: 'LSM-Tree vs B-Tree: The Storage Engine Decision That Defines Your Write Path',
+  deck: 'Every storage engine is a bet on two of three things, and the third one degrades whether you planned for it or not.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '16 min',
+  tags: ['databases', 'storage-engines', 'lsm-tree', 'b-tree', 'rocksdb', 'postgresql', 'system-design'],
+  faq: [
+    {
+      q: 'What is the core difference between an LSM-tree and a B-tree?',
+      a: 'A B-tree updates data in place: it finds the page that holds a key and overwrites it, keeping one sorted structure on disk. An LSM-tree never overwrites. It buffers writes in memory, flushes them to immutable sorted files, and merges those files in the background through a process called compaction. The B-tree pays for writes with random in-place page updates plus a write-ahead log. The LSM-tree pays for reads, because a single key can live in several files that all have to be checked. The choice is really about which of those costs your workload can afford.',
+    },
+    {
+      q: 'Is an LSM-tree always faster for writes than a B-tree?',
+      a: 'No, and treating it as a law is a junior mistake. LSM-trees turn random writes into sequential ones and defer most of the work to compaction, which usually wins on write-heavy workloads. But compaction has its own write amplification, often above 10x for leveled compaction, and on modern SSDs the gap between the two engines narrows because the device has its own internal garbage collection. The honest answer is to measure on your device and your workload rather than quoting a rule.',
+    },
+    {
+      q: 'What is write amplification and why does it matter?',
+      a: 'Write amplification is the ratio of physical bytes written to storage versus the logical bytes you asked to write. A B-tree writes every change at least twice, to the log and to the page, and often writes a full 4 to 16 KB page for a one-byte change. An LSM-tree moves that cost into compaction, rewriting each key roughly once per level as it sinks toward the bottom. Write amplification matters because it burns disk bandwidth and, on flash, consumes the limited write endurance of the drive.',
+    },
+    {
+      q: 'When should I choose a B-tree over an LSM-tree?',
+      a: 'Reach for a B-tree when reads dominate, when you need predictable low tail latency without background compaction stealing bandwidth, and when strong transactional semantics matter, because a B-tree holds each key in exactly one place, which makes range locking and isolation cleaner. Reach for an LSM-tree when ingest is heavy and sustained, when you can tolerate read and space amplification, and when you want to tune write-versus-space tradeoffs through the compaction policy. Most relational databases default to B-trees for a reason.',
+    },
+    {
+      q: 'Do Bloom filters speed up range scans in an LSM-tree?',
+      a: 'No. A Bloom filter answers one question only: is this exact key possibly in this file. That helps point lookups skip files that cannot contain the key. A range scan has no single key to test, so it must open and merge every file whose key range overlaps the query. This is why range-heavy workloads expose the LSM read penalty most sharply, and why leveled compaction, which keeps one sorted run per level, reads better than tiered compaction, which keeps many.',
+    },
+  ],
+}
+
+Every database you have ever used made a decision before you wrote a single row, and that decision is sitting underneath your slowest query right now. It chose how to lay bytes on disk. The engine hides it behind SQL, and the choice only surfaces when a workload pushes on the part the engine is bad at.
+
+There are two dominant answers, and they disagree about something basic: what to do when you change a value. A B-tree finds the place that value lives and overwrites it. An LSM-tree refuses to overwrite anything, ever, and writes the new value somewhere else to reconcile later. That one difference, in place versus out of place, ripples all the way up to your write throughput, your read latency, your disk bill, and your 2 a.m. pages.
+
+This is the layer the rest of system design sits on top of. If you have walked through [the system design interview framework](/blog/system-design-interview-framework) or done [capacity estimation](/blog/capacity-estimation) for a write-heavy service, the storage engine is where those numbers either hold or fall apart. Pick wrong and no amount of caching upstream saves you.
+
+## You are always picking two of three
+
+Before either tree, the frame. One result makes the whole comparison stop feeling like a list of pros and cons and start feeling like a single decision, and it comes from a 2016 paper out of Harvard's data systems lab called the RUM Conjecture.
+
+RUM stands for read overhead, update overhead, and memory overhead. The conjecture, almost as the authors wrote it: an access method that sets an upper bound on two of those three overheads gives up a lower bound on the third. You do not get to minimize all three. You pick two to keep tight and accept that the third bloats.
+
+That is not a metaphor. The paper defines each overhead as a ratio: read overhead is data read over data wanted, update overhead is writes performed over writes asked for, memory overhead is bytes stored over live bytes. A dense sorted array drives memory overhead to a perfect 1 and pays with brutal update cost, since inserting in the middle shifts everything. An append-only log drives update overhead to 1 and pays with unbounded read cost, since finding anything means scanning. Push one ratio to its floor and another climbs.
+
+For storage engines, the three overheads have field names you will see in every tuning guide. The amplification triad is the RUM conjecture wearing work clothes.
+
+- **Write amplification (WA):** physical bytes written divided by logical bytes you asked to write. A one-byte change costing an 8 KB page write is 8000x amplification on that operation.
+- **Read amplification (RA):** how many pages or files you touch to answer one logical lookup.
+- **Space amplification (SA):** physical bytes stored divided by live bytes. Dead data, old versions, and not-yet-reclaimed deletes all push it above 1.
+
+Hold this triad in your head for the rest of the piece. Everything a B-tree does keeps read and space low and lets write climb. Everything an LSM-tree does keeps write low and lets read and space climb. The compaction strategies are just different ways of sliding along the same surface.
+
+## How a B-tree actually writes
+
+The B-tree is the older answer and the default in almost every relational database: Postgres, InnoDB, SQLite, SQL Server. It keeps data in fixed-size pages, usually 4 to 16 KB, arranged as a balanced tree. To find a key you walk from the root down a handful of levels to the leaf that holds it, a few page reads even for enormous tables. Reads are the B-tree's home turf.
+
+Writes are where the bill arrives, and it is bigger than it looks. To change a value, the engine locates the leaf page and modifies it in place. A crash mid-write could leave that page half-updated, so the change goes to a write-ahead log first, then to the page. As the canonical database text puts it: a B-tree must write every piece of data at least twice, once to the WAL and once to the page. And the page write is page-sized, not byte-sized. Change one byte and the engine still writes the whole 4 to 16 KB page, because pages are the unit of I/O. So two physical writes for one logical change, before we get to the part the two production engines solve in very different ways: the torn page.
+
+Postgres uses full-page writes. The first time a page is touched after a checkpoint, it logs the entire page into the WAL, not just the change, so a crash cannot leave a torn page it can't reconstruct. The number that should change how you size Postgres write load: insert one roughly 1 KB row into a table with five indexes right after a checkpoint, and you touch the heap page plus five index leaf pages, each logged in full at 8 KB. That is 48 KB of WAL for one kilobyte of data. And here is the lever almost nobody reaches for first: whether that 48 KB recurs depends on your primary key distribution. Sequential keys like `BIGSERIAL` keep hitting the same hot leaf pages, so later inserts skip the full-page write after the first per checkpoint; random keys like UUIDv4 scatter across the index, touching a fresh leaf page nearly every insert, so it fires again and again. In Postgres, key distribution often dominates write amplification more than any engine setting, and moving a high-ingest table from random UUIDs to sequential keys is a one-line schema change that can cut WAL volume by multiples.
+
+InnoDB solves the same risk differently, with a doublewrite buffer that writes every page twice, first to a sequential side area then in place; because the extra write is sequential, overhead is typically only 5 to 10 percent. Two B-trees, two opposite answers to one crash-safety problem. So one logical byte can become tens of kilobytes of physical I/O. The B-tree accepts heavy, somewhat random writes to keep reads cheap and space tight, and Postgres widens that corner further: MVCC writes a new tuple per update and leaves a dead one for VACUUM, a second source of amplification on top of the page mechanics.
+
+## How an LSM-tree actually writes
+
+The LSM-tree, the log-structured merge-tree, comes from a 1996 paper by O'Neil and colleagues, and its entire thesis is one move: stop doing random writes, convert them into sequential ones, and pay the difference back on reads.
+
+The write path is almost suspiciously simple. Every write lands first in an in-memory sorted structure, the memtable (a skiplist or small tree, called C0 in the paper), and is appended to a write-ahead log, a pure sequential append and the cheapest write a disk can do. When the memtable fills, the engine flushes it to disk as an immutable sorted file, an SSTable, a Sorted String Table, in one big sequential write. No seeking, no in-place page churn, no full-page-write tax. The paper's framing holds up decades later: the gain comes from reading and writing in large multi-page blocks, eliminating the seek time that dominates random B-tree inserts.
+
+But you cannot keep flushing immutable files forever. Every flush adds another file that reads must consult, and the same key can now live in many files with the newest version winning. So the LSM-tree runs a background process to merge files, reclaim superseded data, and bound the file count. That process is compaction, and it is the entire personality of an LSM-tree. It is also where the second misconception dies: people say LSM-trees have no write amplification. They do; they moved it. Compaction rewrites data every time it merges, and a key gets rewritten once per level as it sinks from the top toward the bottom. The B-tree's amplification lives in full-page writes at insert time; the LSM-tree's lives in compaction, after the fact, sequentially. It is not gone, it is relocated and made cheaper per byte, and how cheap depends entirely on which compaction strategy you run.
+
+## Compaction is the whole game
+
+There are two base strategies at opposite corners of the write-versus-space tradeoff, and the per-level math is clean enough to memorize.
+
+**Leveled compaction** is the strategy from the original paper, and the one LevelDB and RocksDB are named after. Data is organized into levels, each roughly 10x larger than the one above, and the defining rule is that each level holds exactly one sorted run, so its files have non-overlapping key ranges and read as one ordered sequence. When a level overflows, the engine merges data into the next, rewriting the overlapping portion. The per-level write amplification, worst case, equals the fanout, so with a fanout of 10 and five or six levels, total write amplification commonly lands above 10. In exchange you get the best space amplification of any strategy, a provable worst-case bound of roughly 1 + 1/(fanout - 1), around 1.1x, and reads touch few files. Leveled keeps read and space tight and pays in writes. It is the B-tree's temperament expressed in an LSM-tree.
+
+**Tiered compaction**, also called size-tiered, is what Cassandra defaults to and RocksDB calls universal. Instead of one run per level, each level accumulates several similarly-sized runs, and only when enough pile up does the engine merge them into a single larger run at the next level. Because data is rewritten only when a whole tier merges, the per-level write amplification is just 1, far less than leveled's fanout. That is the appeal: cheap writes. The cost lands in the other two corners. Reads are worse, because a key might live in any of several runs per level. Space is worse with no hard bound, because old versions linger across runs until a merge clears them, and a full compaction of a max-level run can temporarily double disk usage while the merged output coexists with its inputs. RocksDB's docs put a number on the swap: leveled to universal cuts write amplification by roughly 7x, at the cost of read and space and that transient 2x spike.
+
+Here is the detail that catches people in interviews and incident reviews alike. What RocksDB ships as its default "Level" mode is not pure leveled. It is tiered+leveled: the memtable flush level and L0 behave tiered, accepting overlapping files for cheap ingest, while deeper levels behave leveled. The pure "Classic Leveled" of the 1996 paper is the idealization; the implementation blends both to get less write amplification than pure leveled and less space amplification than pure tiered. The 2018 Dostoevsky work formalized exactly this: make the bottom level leveled to bound space, keep shallower levels tiered to keep writes cheap. So when someone says "we use leveled compaction," the senior follow-up is which levels, because the real answer is usually "tiered at the top, leveled below."
+
+## How an LSM-tree reads, and why it can hurt
+
+The LSM read path is where the bill for cheap writes comes due, and it splits hard along one line: point lookups versus range scans. A point lookup must find the newest version of one key, which could sit in the memtable or any SSTable that might contain it, so naively it means checking many files. The escape hatch is the Bloom filter, the single most important reason LSM-trees are usable for point reads at all.
+
+A Bloom filter is a small probabilistic structure that answers one question about a file: is this key possibly inside, or definitely not. It never gives a false negative, so a "definitely not" lets the engine skip a file without touching disk. It gives occasional false positives, a "maybe" where the key is absent, costing a wasted lookup. The math is tidy: at the textbook 10 bits per key, the false-positive rate is roughly 1 percent. So a point lookup probes each level's filter, skips the levels that say no, and reads disk only where one says maybe. Read amplification stops scaling with the number of files and scales instead with levels times false-positive rate, plus one real read.
+
+There is a refinement that marks genuinely deep understanding, from a 2017 paper called Monkey. Standard practice gives every level the same bits-per-key. Monkey proves that is suboptimal: worst-case point-lookup cost is proportional to the sum of false-positive rates across all levels, so you should spend more Bloom bits on the larger deep levels and fewer on the small shallow ones, holding total memory fixed. Same budget, the sum of rates drops, lookup latency falls 50 to 80 percent. The lesson generalizes past Bloom filters: do not allocate a resource uniformly just because it is simple, spend it where the marginal return is highest.
+
+Now the part Bloom filters cannot save: range scans. A query for every key between A and B has no single key to test, so the filter is useless to it. The engine must open every sorted run whose key range overlaps and merge them, because the answer might be spread across all of them. This is exactly why leveled-versus-tiered shows up in read latency: leveled keeps one run per level so a scan merges a handful, tiered keeps many so a scan merges many more. Range-heavy workloads are where the LSM read penalty bites hardest, and where a B-tree's single sorted structure quietly wins.
+
+Deletes sharpen the same edge. An LSM-tree cannot delete in place, so a delete writes a marker called a tombstone, and the space is not reclaimed until that tombstone compacts down past every shadowed copy across every level. Until then a range scan over a tombstone-heavy region has to read and skip all of them, which is why heavy deletes plus scans is a known LSM pathology and why Cassandra ships `gc_grace_seconds` and time-window compaction to manage it.
+
+## The cost nobody benchmarks: tail latency
+
+This is the operational truth average-throughput benchmarks hide, and the real reason LSM-trees demand respect in production. Compaction is not free background work. It competes with your foreground writes for disk bandwidth and pollutes the page cache by churning through files. Under steady moderate load this is invisible. Under sustained heavy ingest, compaction falls behind, and when it cannot keep up the engine has to push back: RocksDB throttles and then stalls incoming writes when L0 files pile up or pending compaction bytes cross a threshold. Your writes do not slow down gently. Most stay fast, then a handful hit a compaction stall and spike.
+
+That is a p99 and p999 problem, not an average problem. Watch only mean write latency and you will declare the LSM-tree healthy right up until a sustained burst drives compaction into the red and the tail falls off a cliff. So the right SLO question is never "what is average throughput," it is what p99 write latency does under sustained peak ingest while compaction fights your writers for the disk. This is the same dynamic covered in [latency and the tail](/blog/latency-throughput-tail): the LSM tail is shaped by a background process that is invisible in steady state and decisive under stress. A B-tree has no equivalent compaction stealing bandwidth, which is much of why it gives more predictable tail latency and why latency-sensitive systems often prefer it even when raw write throughput favors an LSM-tree.
+
+## The dogma that does not survive measurement
+
+The one-liner everyone learns is "LSM wins writes, B-tree wins reads." It is a fine starting intuition and a dangerous stopping point.
+
+A 2022 paper from USENIX FAST, on closing the write-amplification gap between B+-trees and LSM-trees on modern SSDs, makes the uncomfortable point. On flash, the external write amplification you measure at the engine partially overlaps the internal write amplification the SSD already does through its flash translation layer and garbage collection. The device is already doing its own out-of-place writing and compaction underneath you, so the LSM-tree's headline advantage, turning random writes sequential, matters less when the drive was going to relayer your writes anyway. The gap narrows, and workload skew can even flip the result. The senior position is that the answer depends on the device and the workload, and the honest way to know is to measure on yours. Quoting the rule is junior; knowing when it breaks is the job.
+
+## How a staff engineer actually decides
+
+This is where the abstractions cash out into a choice you defend in a design review. The question is never "which engine is better," it is which two corners of the triad your workload needs tight, and whether you can afford the third to bloat.
+
+| Workload signal | Lean | Why |
+| --- | --- | --- |
+| Reads dominate, especially range scans | B-tree | One sorted structure, no multi-run merge, no compaction stealing read bandwidth |
+| Sustained heavy ingest, write-bound | LSM-tree | Sequential writes, compaction amortizes the cost, write amplification stays manageable |
+| Predictable low tail latency required | B-tree | No background compaction to cause p99 write stalls |
+| Strong transactional, serializable semantics | B-tree | Each key lives in exactly one place, so range locking and isolation are clean |
+| Disk is tight or cost-sensitive | LSM-tree with leveled compaction | Provable worst-case space bound around 1.1x; tiered gives none and spikes to 2x |
+| Write cost matters more than space | LSM-tree with tiered compaction | Per-level write amplification of 1, roughly 7x less than leveled, at the cost of space and read |
+| High-ingest table on Postgres | B-tree, sequential keys | Key distribution dominates WAL volume; sequential keys dodge repeated full-page writes |
+| Time-series with TTL expiry | LSM-tree, time-window compaction | Whole old files drop at once; tombstone and reclamation cost stays bounded |
+
+The transactional row deserves emphasis because it is often the deciding factor and easy to miss. A B-tree holds each key in exactly one place, which makes range locking, isolation, and serializable transactions structurally clean, while an LSM-tree scatters versions across runs and levels and needs more machinery for the same guarantees. That is a real reason the databases that care most about ACID defaulted to B-trees, and it threads into the consistency picture in [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum): the engine constrains how cheaply the layers above can offer strong consistency. The other reframing that matters in a design review: the same engine spans the spectrum, so "we picked RocksDB" or "we picked Postgres" is the start of the decision, not the end. RocksDB alone ships leveled, universal, and FIFO compaction, three different points on the triad. The engine name narrows the field; the configuration is where you choose your two corners.
+
+These choices compound on top of the data-plane decisions in [consistent hashing](/blog/consistent-hashing) and [the distributed cache](/blog/distributed-cache). A high-write system like [the URL shortener](/blog/url-shortener) leans toward an LSM-friendly key-value store; a read-and-transaction-heavy core service leans toward a B-tree. The same reasoning shaped real systems I have shipped: the event-ingestion path in [Audex](/case-study/audex) and the write-heavy sync in [NomadCrew](/case-study/nomadcrew) were storage-engine decisions before they were anything else. Even the reliability discipline from [idempotent webhooks](/blog/idempotent-webhooks) sits on top of whichever engine you pick, because exactly-once processing needs somewhere to record that it happened, and that record has its own write path. The [database mindmap](/blog/database-mindmap) maps how these branches fit together; this is one of them, and replication strategies are another, layered on top of whichever engine writes the bytes.
+
+## The honest landing
+
+You do not get a storage engine that is good at everything, and any benchmark suggesting otherwise is hiding the corner it sacrificed. The RUM conjecture is not a guideline you engineer around. It is the shape of the space. Two of read, update, and memory stay tight, and the third gives.
+
+A B-tree keeps reads and space tight and pays in heavy, page-granular writes, with torn-page protection your key distribution can quietly amplify or defuse. An LSM-tree keeps writes cheap and sequential and pays in read and space amplification, with the bill arriving as background compaction you only feel in the tail, under sustained load, exactly when you can least afford it. Neither wins. They are two answers to the same forced choice, and the engineer who understands them does not memorize which is faster. They name the workload, name the two corners it needs, and pick the engine and the compaction policy that keep those two tight, knowing exactly which corner they just agreed to let bloat. Do that, and the storage layer holds under the load you designed for. Skip it, and you learn which corner you sacrificed the night the workload changes shape.
+
+## FAQ
+
+<FAQ />

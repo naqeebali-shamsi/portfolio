@@ -1,0 +1,173 @@
+export const meta = {
+  slug: 'inverted-index-search',
+  title: 'How a Search Engine Works: The Inverted Index (Lucene and Elasticsearch)',
+  description:
+    'Lucene and Elasticsearch build the index at write time so the query stays a sorted-list walk: analysis, immutable segments, skip pointers, BM25, and sharding.',
+  headline: 'How a Search Engine Works: The Inverted Index (Lucene and Elasticsearch)',
+  deck: 'Search looks like a read-time lookup, but every fast query is paid for at write time by an index that did the hard work in advance.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['search', 'inverted-index', 'lucene', 'elasticsearch', 'bm25', 'system-design'],
+  faq: [
+    {
+      q: 'What is an inverted index?',
+      a: 'A map from each term to a postings list of the document IDs that contain it. It is the inverse of a forward index, which maps a document to its terms. The inverted index has two parts: a sorted term dictionary that stores each term and its document frequency, and the postings lists themselves, sorted by document ID so that two lists can be intersected with a linear merge. It is the structure that lets a search engine answer a query by walking a few sorted lists instead of scanning every document.',
+    },
+    {
+      q: 'What is the difference between TF-IDF and BM25?',
+      a: 'Both weight a term by how often it appears in a document (term frequency) and how rare it is across the corpus (inverse document frequency). TF-IDF treats term frequency linearly, so a document that repeats a keyword fifty times scores far higher than one that mentions it twice. BM25 saturates: extra occurrences past the k1 parameter add almost nothing, and it normalizes for document length with the b parameter. Elasticsearch made BM25 its default similarity in version 5.0 because the saturation and principled length normalization rank real documents better than raw TF-IDF.',
+    },
+    {
+      q: 'Why is the number of primary shards in Elasticsearch fixed at index creation?',
+      a: "A document's shard is chosen by hash(routing) modulo the number of primary shards. The routing value, usually the document id, is hashed and reduced modulo the shard count to pick a destination. If you changed the shard count, the modulo would change for nearly every document, so the routing that found a document on write would no longer find it on read. Because the count is baked into where every document lives, you cannot edit it in place. To change it you reindex into a new index, or use the Shrink or Split APIs.",
+    },
+    {
+      q: 'Why do identical documents sometimes get different relevance scores in Elasticsearch?',
+      a: "BM25 needs inverse document frequency, which depends on how many documents in the corpus contain a term. By default each shard computes that statistic from its own local documents, not the whole index. Two identical documents that land on shards with different local term counts therefore get different IDF and different scores. The fix is to run the search with search_type=dfs_query_then_fetch, which gathers global term statistics in a prepass before scoring, at the cost of one extra network round trip.",
+    },
+    {
+      q: 'What is the connection between a search index and an LSM-tree?',
+      a: 'They are the same shape. A Lucene index is a set of immutable segments plus an in-memory buffer and a write-ahead log, and new data is written as new segments that are later merged into larger ones. That is exactly the SSTable, memtable, and WAL triad of a log-structured merge tree, with the postings list playing the role of the value. Martin Kleppmann states the equivalence directly in Designing Data-Intensive Applications: a full-text index keeps its terms and postings lists in SSTable-like sorted files and compacts them the same way.',
+    },
+  ],
+}
+
+Type a query into a search box, hit enter, and a few milliseconds later you have the ten best matches out of a billion documents. It feels like the work happens when you press enter. It does not. By the time your query arrives, almost everything that makes it fast and almost everything that makes it relevant has already been built, sorted, compressed, and laid out on disk. The query is the cheap part.
+
+That is the one idea to carry through this entire piece. A search engine does enormous, deliberate work on the write path so the read path can be a handful of sorted-list walks. Relevance, speed, and freshness are not computed when you search; they are decisions baked into a data structure at index time. Treat search as a read-time lookup and you will misjudge every tradeoff it makes. Treat it as a write-time compaction-and-statistics problem and the whole design snaps into focus.
+
+The data structure underneath is the inverted index, and the two systems most people actually run are [Lucene](https://lucene.apache.org/) and Elasticsearch, which is Lucene wrapped in a distributed system. This is a structural cousin of the storage engines in [the database mindmap](/blog/database-mindmap), and if you have read [LSM-tree vs B-tree](/blog/lsm-tree-vs-btree) you already know more about how Lucene stores data than you might think.
+
+## The index is the thing, and it is inverted
+
+Start with the structure, because everything else is built to serve it. A forward index is the obvious one: a document maps to its list of terms. Doc 1 contains "the quick brown fox." That is how a file sits on disk, and it is useless for search, because to answer "which documents contain fox" you would have to open and scan every document.
+
+So you invert it. Instead of `document → terms`, you build `term → documents`. That single flip is the whole trick, and it is where the name comes from. The inverted index has two substructures. First, a **term dictionary**: a sorted list of every distinct term, and for each term its **document frequency**, the number of documents it appears in, which is exactly the length of its postings list. Second, the **postings lists**: for each term, the list of document IDs that contain it, sorted by document ID, optionally carrying the term frequency and the positions where the term occurred.
+
+Build one by hand from two documents to see how little magic is involved.
+
+```
+Doc 1: "the quick brown fox"
+Doc 2: "the lazy brown dog"
+
+analyze (lowercase, drop "the"):
+  (brown,1) (quick,1) (fox,1) (brown,2) (lazy,2) (dog,2)
+
+sort by term, then by docID, merge duplicates:
+
+  brown → df=2 → [1, 2]
+  dog   → df=1 → [2]
+  fox   → df=1 → [1]
+  lazy  → df=1 → [2]
+  quick → df=1 → [1]
+```
+
+Construction is a sort-merge: stream out `(term, docID)` pairs, sort by term then by document ID, collapse duplicates, and split the result into a dictionary and postings. Now `brown AND fox` is answerable without touching any document. You walk `brown`'s list `[1, 2]` alongside `fox`'s list `[1]` and emit the IDs in both. Document 1. The query did almost no work because the index already did all of it. Note too that the document frequency in the dictionary was computed at build time; the statistics that later drive relevance are a byproduct of construction, not a query-time computation.
+
+## Analysis decides what is searchable, and it is a one-way door
+
+Before a term can enter the index, raw text has to become terms, and the rules for that transformation are the most consequential decisions in the whole system. They are also the easiest to get quietly, irreversibly wrong.
+
+In Lucene the component is an `Analyzer`, and the thing to understand is that an analyzer does not process text. It is a factory that assembles a chain: zero or more `CharFilter`s that clean up raw characters, exactly one `Tokenizer` that splits the stream into tokens, then zero or more `TokenFilter`s that transform the token stream, lowercasing, stemming, removing stop words, expanding synonyms. Text flows through this conveyor belt as a `TokenStream`, and what comes out the end is what gets indexed.
+
+Here is the rule that bites people. What you do not tokenize, you cannot search. A search for `Fox` only works because the query is lowercased the same way the document was. That is the asymmetric contract: the query is analyzed by an analyzer of its own, and **the index-time and query-time analyzers must agree**. Index with one tokenizer and query with another and your matches do not error. They silently fail to appear, which is far worse, because nothing tells you the recall you are missing.
+
+The choices inside the chain are real tradeoffs, not defaults to accept blindly. Stemming reduces "running," "runs," and "ran" to a shared root so they match each other; it raises recall and lowers precision, finding more including some you did not mean. Drop it and the opposite.
+
+Stop words are the instructive case, because the conventional wisdom inverted itself. The historical default stripped high-frequency words like "the," "of," and "to" to save space. The textbook records the reversal plainly: information retrieval went from large stop lists of 200 to 300 terms, to tiny ones of 7 to 12, to no stop list at all, and web search engines generally use none. Dropping stop words destroys phrase queries. Search "President of the United States" or "flights to London" with the connective words gone and you have mangled the meaning. Modern compression and IDF weighting make those frequent terms cheap enough to keep, so you keep them.
+
+The expensive consequence sits underneath all of this: the analyzer is a migration boundary. You cannot retroactively re-analyze documents already in the index. Change your tokenizer, your stemmer, or your synonym set, and the only way to apply it to existing data is a full reindex. Treat an analyzer change like a schema migration, because operationally that is exactly what it is.
+
+## Immutable segments and merging, or why this is an LSM-tree
+
+Now the storage layer, where search stops looking like a special case and reveals itself as a log-structured merge tree. A Lucene index is not one monolithic structure. It is a set of **segments**, each a complete, self-contained mini inverted index over a subset of the documents. And segments are immutable. Once written, a segment is never modified. That single constraint shapes everything about writes, deletes, durability, and freshness.
+
+Watch what happens when you index a document. It lands first in an in-memory buffer. Periodically a **refresh** writes the buffer out as a new segment into the filesystem cache, and at that point the document becomes searchable. Note what refresh does not do: it does not fsync to disk. It makes data visible cheaply by handing it to the OS page cache. Elasticsearch refreshes every second by default, the source of its near-real-time reputation.
+
+Updates and deletes never touch an existing segment, because they cannot. A delete writes a tombstone marking a document ID as gone; the bytes stay in their segment, still taking space, until something reclaims them. An update is a delete plus a fresh insert. So the index only ever grows, accumulating small segments and dead documents, until a background process compacts it.
+
+That process is **merging**, and it is governed, not ad hoc. Lucene's default `TieredMergePolicy` budgets how many segments are allowed, finds the segments over budget, and picks the least-cost merge. Cost is a blend: it favors low **skew** (merging segments of similar size rather than one giant with many tiny), smaller total merge size, and a high fraction of deleted documents reclaimed. A merge reads its inputs, rewrites the live documents into one larger segment while dropping the tombstoned ones, and swaps it in for the old segments.
+
+If you have read [LSM-tree vs B-tree](/blog/lsm-tree-vs-btree), this is familiar to the bone: immutable files, an in-memory buffer, background compaction that merges small sorted files into bigger ones and reclaims dead entries. It is not merely similar to an LSM-tree. Martin Kleppmann names the equivalence directly in Designing Data-Intensive Applications: Lucene uses very nearly the LSM-tree process, where for a full-text index the key is a term and the value is its postings list, kept in SSTable-like sorted files. Same machine, different payload.
+
+Merging is not free, and the cost has a name worth internalizing: **write amplification**. Every byte you index is read and rewritten several times as it climbs through successive merges. Mike McCandless measured this on an English Wikipedia index: the bytes read and written during merging came to roughly 6.19 times the size of the final index. You write the data once; the system writes it six times. And here is the coupling that catches teams off guard, because freshness and write cost are the same dial: the one-second refresh that makes data instantly searchable is exactly what manufactures the flood of tiny segments that must later be merged at 6x. You do not get cheap freshness. You get freshness, paid for in merge load.
+
+## Durability is a separate log: the translog
+
+If a refresh does not fsync, a sharp question follows. A document is searchable the moment it hits the filesystem cache, but the cache is volatile. What happens if the node loses power one millisecond after a refresh and before anything reached disk?
+
+Durability does not come from refresh at all. It comes from a separate write-ahead log called the **translog**. Every operation is appended to it before it is acknowledged. With the default `index.translog.durability: request`, Elasticsearch fsyncs the translog on every write request before returning success, and on a 5-second timer as a backstop. The expensive Lucene operation, a **flush** (a true commit that fsyncs segments and advances the commit point), happens far less often and rolls over to a fresh translog generation. On restart after a crash, the node recovers from its last committed segments and then **replays the translog** to reconstruct everything acknowledged but not yet committed.
+
+Conflating these three is the single most common source of confusion about how this works, so lay them side by side.
+
+| Operation | What it guarantees | Cost | Default cadence |
+| --- | --- | --- | --- |
+| Refresh | Visibility (searchable) | Cheap, no fsync | Every 1s |
+| Translog fsync | Durability (survives crash) | One fsync | Per request + every 5s |
+| Flush / commit | Segments fsynced, commit point advanced | Expensive | Automatic, translog-sized |
+
+This is the same memtable-plus-WAL-plus-SSTable triad any LSM engine runs, which is the whole point: once you see that search storage is an LSM-tree, its crash-recovery story is one you already know from [the database mindmap](/blog/database-mindmap).
+
+## Query execution: walk the lists, then prune hard
+
+Now, finally, the query, the cheap part we built all of this to make cheap. Boolean matching is a merge of sorted lists. `AND` is an **intersection**: hold a cursor on each postings list, repeatedly advance whichever points at the smaller document ID, and emit a hit when they agree. Because both lists are sorted by document ID, this is a single linear pass. `OR` is a **union** of the same lists. There is no per-document scan anywhere; there is only walking.
+
+The first optimization is **skip pointers**, bookmarks embedded in a postings list that let the walk jump over document IDs that cannot match. When one cursor sits at 41 and the other at 16, you must advance the second to at least 41; stepping 16, 19, 23 wastes comparisons, but a skip pointer at 16 pointing ahead to 28 (still no greater than 41) lets you jump there in one move. The textbook heuristic is to place the square root of the list length: for 10,000 documents, about 100 evenly spaced pointers. The tradeoff is the obvious one, more skips mean shorter jumps but more pointers to store and compare. Modern Lucene uses a two-level inlined scheme instead, with skip data every 128-document block and every 32 blocks (4,096 documents), tuned for sequential reads.
+
+But here is the move that separates a tutorial understanding from a staff-level one. For top-k search, the real speedup is not skipping inside one list. It is **not scoring most of the matches at all**. You want the ten best results, so you do not care about a document that provably cannot crack the current top ten. Lucene precomputes, for each term and each block of its postings, the **maximum impact score**, the largest contribution that term could ever add to any document. **Block-Max WAND** uses this. It tracks the current k-th best score, the **minimum competitive score** a candidate must beat to enter the heap. For any block it sums the per-term block-max scores; if that ceiling cannot exceed the minimum competitive score, the whole block is skipped without scoring a single document in it. As better results fill the heap, the threshold rises and more of the index gets pruned away unexamined.
+
+This is why the common assumption that the engine scores every matching document is simply false. Most matches are never scored. Lucene evolved through WAND, then MAXSCORE, then Block-Max WAND, which shipped in Lucene 8.0 in March 2019. Which one wins depends on query shape: WAND evaluates fewer documents but carries higher per-document overhead, so MAXSCORE tends to win for large k or many terms. Dynamic pruning is not one-size-fits-all, and long machine-generated queries are an active reason the choice still gets revisited.
+
+## Scoring: from TF-IDF to BM25, and why the change happened
+
+Matching tells you which documents qualify. Scoring decides their order, and the move from TF-IDF to BM25 is a clean lesson in why a principled model beats a naive one.
+
+Both rest on two intuitions: a term that appears often in a document is more relevant to it (term frequency), and a term that is rare across the corpus is more informative than a common one (inverse document frequency). Raw TF-IDF multiplies these with term frequency entering linearly, and that linearity is its flaw: a document repeating a keyword fifty times scores wildly higher than one mentioning it twice, which rewards keyword stuffing and punishes natural writing.
+
+BM25, Elasticsearch's default similarity since version 5.0, fixes this with two parameters. Here is the formula, as Elastic documents it.
+
+```
+score(D,Q) = Σ_i  IDF(q_i) · ─────────────────────────────────────────────
+                                f(q_i,D) + k1 · (1 − b + b · fieldLen/avgFieldLen)
+
+                              f(q_i,D) · (k1 + 1)
+
+IDF(q_i) = ln( (docCount − n(q_i) + 0.5) / (n(q_i) + 0.5) )
+```
+
+Three pieces do the work, with defaults `k1 = 1.2` and `b = 0.75`.
+
+**IDF** rises as a term gets rarer across the corpus. This is where the document frequency from the term dictionary, computed at index time, finally pays off.
+
+**Saturation**, controlled by `k1`, is the cure for keyword stuffing. Going from one occurrence to two adds a lot; going from twenty to twenty-one adds almost nothing, because the curve flattens once term frequency passes `k1`. A document cannot win simply by repeating a word, the exact abuse linear TF-IDF invites.
+
+**Length normalization**, controlled by `b`, discounts long documents so they do not win on sheer size. At `b=0` length is ignored; at `b=1` it is fully penalized. At the default 0.75, a document twice the average length is discounted unless its extra matches earn the score back.
+
+That is the whole reason BM25 replaced TF-IDF as the default: saturation and a principled length penalty rank real documents the way a human would, where raw term counts do not. But BM25 is lexical scoring; it ranks by term overlap, not meaning. Ranking by semantic similarity is a different machine, the subject of [vector databases](/blog/vector-databases) and a frontier hybrid systems now combine with the BM25 path described here.
+
+## Sharding distributes the index, and quietly distorts the scores
+
+One more layer, because Elasticsearch is Lucene made distributed, and distribution introduces a failure mode that has nothing to do with availability and everything to do with correctness.
+
+An Elasticsearch index is split into **primary shards**, each a complete, standalone Lucene index holding a slice of the documents. A document is routed to its shard by `hash(routing) % number_of_primary_shards`, where the routing value defaults to the document id. That formula explains a constraint that frustrates everyone eventually: the primary shard count is immutable after creation. Change it and the modulo lands nearly every document on a different shard, so the routing that placed a document on write would no longer locate it on read. The count is wired into where every document physically lives. To change it you reindex, or use the Shrink or Split APIs. There is no in-place edit.
+
+Now the subtle trap, the one that genuinely separates senior engineers from the rest. BM25's IDF depends on document frequency, the count of documents containing a term, and by default each shard computes that count from its own local documents, not the global index. So the same document can score differently depending on which shard it landed on. The canonical demonstration: index four near-identical "Shane Connelly" documents into a default five-shard index and search "shane." Two documents are genuinely equivalent, yet one scores lower, because it landed on a shard holding two documents while its twin landed on a shard holding one, and the local IDF differs. The fix is `search_type=dfs_query_then_fetch`, a Distributed Frequency Search prepass that gathers global term statistics across all shards before scoring. After that, the identical documents score identically, matching a single-shard index.
+
+That fix is not free. It costs an extra network round trip on every query, fine for correctness-sensitive search and expensive at high QPS. Plenty of teams accept the score drift instead, or over-shard less so statistics stay more uniform across shards. There is no default that is right for everyone, which is the recurring theme of [the system design interview framework](/blog/system-design-interview-framework): the senior move is to name the tradeoff and decide it against your workload, not memorize an answer.
+
+While here, kill the most common myth about shards: more is not faster. Over-sharding wastes memory and CPU and can destabilize a cluster, because a small number of large shards uses fewer resources than a swarm of tiny ones. Sharding is the scale boundary, and people remember that. It is also the relevance boundary, because it fragments the global term statistics scoring depends on, and people forget that constantly.
+
+## What the engine actually optimizes for
+
+Two compression details close the loop on the write-time thesis, because they are why the read path fits in cache.
+
+The term dictionary is not a hash map. Lucene stores it as a **finite state transducer**, an automaton that shares both prefixes and suffixes among terms and maps each term to the file offset of its postings list; McCandless measured it as roughly 38 to 52 percent smaller in RAM than the alternatives it replaced. The postings themselves are **delta-encoded**: instead of absolute document IDs you store the gaps between consecutive IDs, which are smaller numbers that pack into fewer bits, then block-pack those. Compression here is not an afterthought; it is the reason the hot parts of the index stay resident in memory, and the reason the query is fast.
+
+Every one of those structures is produced on the write path so the read path can stay a pruned walk over sorted lists. That is also why the failures cluster on the write side. Merge storms when refresh pressure spawns too many small segments. Deleted-document bloat when tombstones outrun merging. Hot shards from skewed routing. Scoring drift on small or unevenly-sharded indices. None of these are query bugs. They are consequences of a system that front-loads its work, and reasoning about them means reasoning about the write path, even when the symptom shows up as a slow or wrong search.
+
+The same write-at-index-time bet drives the layer most users touch first, the suggestions that appear as they type, which run on FST-backed structures built for exactly this access pattern in [search autocomplete](/blog/search-autocomplete). It is the same bet you make designing the timeline in [Design Twitter](/blog/design-twitter-feed) or the discovery surface in [Design YouTube](/blog/design-youtube): do the expensive assembly when data is written, so reads are cheap when users are waiting. The inverted index is just the most refined version of a decision good systems make over and over.
+
+## FAQ
+
+<FAQ />

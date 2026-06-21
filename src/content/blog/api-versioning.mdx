@@ -1,0 +1,187 @@
+export const meta = {
+  slug: 'api-versioning',
+  title: 'How to Version and Evolve an API Without Breaking Your Clients',
+  description:
+    "Versioning is the last resort, not the strategy. How to evolve an API additively for years, version only when forced, and retire old behavior without an outage.",
+  headline: 'How to Version and Evolve an API Without Breaking Your Clients',
+  deck: 'The whole problem exists because you cannot redeploy your clients, so every technique here is about making change invisible until they opt in.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['api-design', 'versioning', 'rest', 'backward-compatibility', 'stripe', 'system-design'],
+  faq: [
+    {
+      q: 'What counts as a breaking API change?',
+      a: "A change is breaking if it can make a correct existing client misbehave, not just one that violates a documented field. Hyrum's Law is the sharp version: with enough users, every observable behavior of your system becomes someone's contract, including error message wording, field ordering, default sort order, and undocumented nulls. Concretely, breaking means removing or renaming a field or endpoint, changing a type, tightening validation, making an optional field required, or changing a default. Adding a new optional field or a new endpoint is safe, because a well-built client ignores what it does not recognize.",
+    },
+    {
+      q: 'Should I put v1 in the URL on day one?',
+      a: "Usually no. A version number you ship before you have made a single breaking change is a guess about the future, and Roy Fielding, who defined REST, called a premature version number a middle finger to your API customers. The better default is to design for additive evolution and add a version identifier only when a change genuinely cannot be made backward-compatible. The exception is when you already know v1 will be short-lived, which is rare. Most APIs evolve for years on a single contract.",
+    },
+    {
+      q: 'How do I version an API: URL path, header, or media type?',
+      a: "Each transport moves the same complexity to a different place. A URL path like /v2/orders is the cache key itself, so it is CDN-native and trivial to route, at the cost of leaking the version into every client and putting one resource at multiple URLs. A custom header keeps URLs canonical and allows per-request pinning, but you now own the cache key and proxies must Vary on that header or you risk cache poisoning. A media type in the Accept header is the most RESTful and gets correct Vary semantics, but tooling support is weak. The heuristic: public APIs with unknown clients favor the URL path; internal services where you control the clients favor a header.",
+    },
+    {
+      q: 'How long should a deprecation window be before I remove an old version?',
+      a: "Long enough that the clients you do not control have time to migrate, and the length is proportional to how many of those clients exist. Public APIs run six to twelve months at minimum; GitHub gives twenty-four. Internal APIs where a single team can redeploy the callers can be days to weeks. The window is the entire reason the problem exists, because if you could redeploy the client you would just fix it. Set the removal date from usage telemetry, never from a calendar guess, so you are removing something nobody calls rather than scheduling an outage.",
+    },
+    {
+      q: 'Does GraphQL avoid versioning?',
+      a: "It relocates it rather than escaping it. Versionless GraphQL still has breaking changes, such as removing a field or narrowing a nullable field to non-null, it just handles them per field instead of per endpoint. The mechanism is the deprecated directive plus a rename, deprecate, monitor, remove loop. The additive rule is identical to REST: add new fields freely, never remove or retype an existing one without a deprecation cycle. The granularity is finer, the discipline is the same.",
+    },
+  ],
+}
+
+An API is a promise you make to code you will never meet. Once a public endpoint has clients, you cannot redeploy those clients. You cannot patch the mobile app that shipped eighteen months ago, the cron job some analyst wired up in 2022, or the partner integration whose author left the company. The contract is frozen on their side the instant they build against it, and the only thing that can change is you.
+
+That single fact is the whole subject. Everything below is downstream of one constraint: you control the server and nothing else, so every change has to be safe for clients who will never hear it happened.
+
+The trap people fall into is thinking the answer is versioning. Slap a `/v1` on the URL, and when you need to change something, ship `/v2`. It feels responsible. It is mostly a way to manufacture work, because the strategy is not versioning. The strategy is evolving without versioning for as long as you possibly can, and treating a new version as the escape hatch you reach for only when the alternative is genuinely impossible. Stripe has stayed backward-compatible with integrations written in 2011. They did not do that with fifteen versions. They did it by almost never breaking anything.
+
+## What "breaking" actually means
+
+Start here, because most arguments about versioning are really disagreements about this definition. A change is breaking if it can make a correct existing client misbehave. The client did nothing wrong. It read your docs, built against them faithfully, and is now in production. If your change makes it return wrong data, throw, or silently corrupt state, it is breaking, full stop.
+
+The naive version of this is "I removed a field that was in the docs." The senior version is harsher, and it has a name. Hyrum's Law: with a sufficient number of users of an API, it does not matter what you promise in the contract, all observable behaviors of your system will be depended on by somebody. The contract is not what you wrote down. It is everything a client can observe.
+
+The field ordering in your JSON. The exact wording of an error string that someone is matching with a regex because you never gave them a stable error code. The default page size. The default sort. A field that happens to be null today and that three clients quietly treat as "always present." The latency envelope a downstream timeout was tuned against. None of that is in your OpenAPI spec, and all of it is somebody's contract. "We only documented X" is not a defense against Hyrum's Law. It is the thing it was written to refute.
+
+## The one rule that buys you years
+
+Here is the rule that lets you evolve an API for years without ever cutting a new version: every change must be additive and optional. You may add. You may never remove, rename, retype, or tighten. Concretely:
+
+```text
+SAFE (additive, optional)
+  - add a new endpoint
+  - add a new OPTIONAL request parameter
+  - add a new property to a response
+  - add a new enum value or event type (with a caveat below)
+  - change the order of properties in a response
+  - change the length or format of an OPAQUE string (e.g. an opaque id)
+
+BREAKING (subtractive or tightening)
+  - remove or rename a field or endpoint
+  - change a field's type
+  - make an optional request field required
+  - tighten validation (reject input you used to accept)
+  - change a default value, default sort, or default page size
+```
+
+Stripe, GitHub, Azure, and the GraphQL community all independently arrived at this exact split, a strong signal it is the real boundary and not one vendor's preference. It works because of one client-side behavior: a well-built client ignores fields it does not recognize. Add a property to a response, and a tolerant reader skips over it. Add an optional parameter, and clients that do not send it get the old behavior. The additive change is invisible because the client was built to tolerate the unknown.
+
+A few entries earn a closer look, because they are where "obviously safe" turns out to be conditional.
+
+Adding a response field is the canonical safe change, right up until a client round-trips your object. Picture a client that does a GET, modifies one field, and PUTs the whole thing back. That read-modify-write is everywhere. If your new field rides along on the GET, a client that does not understand it can drop it on the PUT, and now your additive field caused data loss in a flow you never tested. Azure calls this the GET-PUT pipeline problem: a response field is safe only when it is truly optional and the consumer is read-tolerant. The instant a write path round-trips it, "additive" has teeth.
+
+Adding an enum value is the silent breaker. You did not remove anything, but every strictly-typed SDK that deserializes your enum into a closed set of cases will throw the moment it sees a value that did not exist when it was generated, and many do by default. You do not fix this by refusing to add enum values. You fix it by making "handle unknown enum values gracefully" part of the published contract from day one, the way Stripe documents that new webhook event types will appear. Skip that expectation at launch, and widening an enum is closer to breaking than safe.
+
+And tightening validation is always breaking, with no asterisk. If you accepted an input yesterday and reject it today, every client sending that input now gets a 400 it never got before. You can loosen validation freely; you can never tighten it without a new version. The same logic kills "let us just make this optional field required now." Azure's rule is blunt: a required request field may only be introduced in the very first version of an endpoint, because an old client has no way to supply a value it never knew existed.
+
+## When you actually have to break: pick where the version lives
+
+Eventually a change comes along that cannot be made additive. The semantics genuinely changed, a field has to become a different type, or a security flaw forces you to abandon a behavior. This is the moment versioning earns its place, and the first decision is mechanical: where does the version identifier live? There are three transports, and the entire decision is a caching and tooling tradeoff. If you are choosing the API's underlying shape at the same time, that is a separate axis covered in [REST vs gRPC vs GraphQL](/blog/api-design-styles); this section assumes REST.
+
+```text
+URL path        /v2/orders
+  + the path IS the cache key, so it is CDN-native with zero config
+  + dead-simple gateway and load-balancer routing
+  - the same resource now lives at multiple URLs
+  - the version leaks into every client and every link
+
+Custom header   X-API-Version: 2   or   Stripe-Version: 2024-10-01
+  + URLs stay canonical; one resource, one URL
+  + per-request pinning; clients can migrate one endpoint at a time
+  - YOU own the cache key: proxies must Vary on the header or you get
+    cache poisoning and a cratered hit rate
+  - harder to test by hand; the version is invisible in a URL
+
+Media type      Accept: application/vnd.example.v2+json
+  + most RESTful: versions are representations of one resource
+  + correct Vary: Accept semantics fall out for free
+  - weak tooling and client support; steepest learning curve
+```
+
+There is no free option here, only a chosen cost. The URL path is the most honest about its tradeoff: it puts the version where every cache, proxy, browser, and curl command can already see it, which is why a public API with broad, unknown clients should default to it. The visibility you dislike on aesthetic grounds is what makes it cacheable and debuggable.
+
+The header is the right move when you control the clients, which usually means internal services, because then you can fix the `Vary` configuration on your own [API gateway](/blog/api-gateway) and get clean URLs in exchange. Pick a header and forget the `Vary`, and you ship a subtle, miserable bug where one client's versioned response gets served to another from the cache, so it is worth knowing what a [distributed cache](/blog/distributed-cache) is doing for you before you make it version-aware. The media type is the purest REST answer and the one with the worst ergonomics, which is why it stays rare outside hypermedia-heavy APIs. This is exactly the kind of decision the [system design interview framework](/blog/system-design-interview-framework) is built to surface: there is no correct answer in the abstract, only a defensible one once you have named who the clients are and who owns the cache.
+
+## Date-based versions, and the trick that keeps them sane
+
+Once you have decided to version, the next question is what a version is named, and the senior default is a date, not a number. `2024-10-01` reads as "the contract as it stood on this date," a continuum you migrate along rather than a product you fork. Semantic `v2`, `v3` implies discrete products you maintain in parallel forever. A date implies a timeline, which composes naturally with a "supported for N months" sunset policy. Stripe uses `YYYY-MM-DD.release_name` (a recent one is `2026-05-27.dahlia`); GitHub uses `2022-11-28` and supports each version for twenty-four months.
+
+Date-based versioning pairs with a second idea that flips the safety model entirely: account pinning. The first time a new account calls your API, you pin it to the version current right then, and from that moment every call it makes is implicitly that version until it explicitly opts into a newer one. The header is the override, not the requirement.
+
+Sit with what that buys you. A new release physically cannot break an existing integration, because the integration never sees it. New behavior is opt-in by construction. The default is safe for a structural reason, not a disciplinary one: the architecture makes "the latest changes reach an old client" impossible. Contrast the alternative everyone starts with: deploy to everyone at once and email people asking them to upgrade. One of these can page you at 3 a.m. The other cannot.
+
+But pinning creates a problem that looks unsolvable. If clients are pinned to versions going back years, and your core has to serve all of them, do you end up with `if version < "2019-02-19"` smeared through every handler until the business logic is unreadable? That is the combinatorial nightmare, and the thing that makes most teams give up and fork.
+
+Stripe's answer is the quietly brilliant piece of this subject, and it is worth stealing. Their core knows only one schema, the latest, with no version branches anywhere in the business logic. Every backward-incompatible change is a small, self-contained, individually-tested transformation module that converts the latest shape back into one older shape. When a response goes out, the engine reads the caller's pinned version and walks backward through time, applying each transform in reverse, until the response matches what that version expected.
+
+```text
+Latest internal schema (what core code builds):
+  event.request = { id: "req_123", idempotency_key: "idk_456" }
+
+Client pinned to an OLDER version expects:
+  event.request = "req_123"          # back then it was a bare string
+
+Egress pipeline:
+  1. Core builds the response at the LATEST schema. No version logic.
+  2. Engine reads the caller's pinned version from the request header.
+  3. It walks backward, applying each change module in reverse:
+        CollapseEventRequest:  { id, idempotency_key }  ->  id  (string)
+  4. It stops once the shape matches the pinned version, then ships it.
+```
+
+The payoff is structural. Adding a new breaking change means writing one new module, fully isolated, unit-tested on its own, with zero reach into business logic. This is the actual mechanism behind "compatible since 2011," and the difference between a clean codebase that supports a decade of versions and three rotting forks you are scared to touch. The lesson generalizes: when version logic has to exist, push it to a transform layer at the edge.
+
+## Retiring a version without paging anyone
+
+Sometimes you genuinely do have to remove something. The transform stack grows, an old version has a security problem, or a behavior is too costly to keep alive. Removal is legitimate. The mistake is treating it as an event instead of a process.
+
+The lifecycle has three stages: deprecate, then a transition window, then decommission. Deprecation is a signal, not a shutdown. The endpoint still works, fully, the entire time. Decommissioning is the shutdown, and it comes strictly later. Conflating the two is how you turn a routine retirement into an incident.
+
+Two IETF standards make this machine-readable so clients can react in code rather than by reading a changelog nobody reads. The `Deprecation` response header (RFC 9745, Standards Track as of 2025) announces that a resource is deprecated and when that happened. The `Sunset` header (RFC 8594) announces the moment it is expected to stop responding. They pair, and there is one hard rule: `Sunset` must not be earlier than `Deprecation`. You cannot announce a death before you announce the illness. On the wire, every response from the doomed endpoint carries the full picture for the entire window:
+
+```text
+HTTP/1.1 200 OK
+Deprecation: @1735689599
+Sunset: Wed, 31 Dec 2025 23:59:59 GMT
+Link: <https://api.example.com/docs/migrate/v2>; rel="deprecation"; type="text/html",
+      <https://api.example.com/docs/sunset-policy>; rel="sunset"
+Warning: 299 - "GET /v1/cards is deprecated; migrate to GET /v2/payment_methods by 2025-12-31"
+```
+
+The links point a confused integrator straight at the migration guide and the policy. And when the sunset instant passes, respond with `410 Gone`, not `404`. The difference matters more than it looks. A 404 says "this never existed," which sends an integrator hunting for a typo they did not make. A 410 says "this was here and was deliberately removed," which is the truth and points them at the migration path.
+
+None of this is the hard part, though. The hard part is choosing the sunset date, and the only defensible way to choose it is telemetry. You cannot humanely remove anything until you can answer one question: who still calls this? Instrument every deprecated path. Record version, route, and ideally the calling account as span events server-side, the same observability discipline that [stream processing](/blog/stream-processing) pipelines lean on to understand their traffic. Zalando makes monitoring deprecated-API usage an explicit obligation, not a nicety. With usage data the sunset date is evidence: you remove a version when the callers hit zero, or when the stragglers are few enough to contact by name. Without it, the date is a guess, and removing a version on a guessed date is just scheduling an outage.
+
+How long the window runs scales with one thing: how many clients you do not control. A public API with anonymous integrators needs six to twelve months at the floor, and GitHub's twenty-four is not excessive for that reach. An internal API where one team owns every caller can be days. The window exists only because you cannot push the fix yourself, so its length is proportional to the population you cannot reach.
+
+One tempting shortcut: rate-limit the deprecated endpoint to nudge stragglers off it. Sometimes reasonable, but you are degrading a still-supported contract on purpose, and if you have not thought through how [the rate limiter](/blog/rate-limiter) interacts with a client's retry logic, you can manufacture exactly the retry storm you were trying to wind down.
+
+## Catching the break before it ships
+
+Hyrum's Law has a discouraging corollary: if the contract is every observable behavior, how can you know in advance that a change is safe? You cannot reason your way to certainty about behaviors you did not know clients depended on, but you can capture what your real clients actually expect and check against it mechanically. That is consumer-driven contract testing. Each consumer records its expectations as a concrete set of requests and the response shapes it relies on, and your build verifies on every change that you still satisfy every recorded one. Tools like Pact add a "can-i-deploy" gate that blocks a release the moment it would violate a live consumer. This moves "is this breaking?" from a judgment call in a design review to a build failure caught in CI. It does not catch dependencies no consumer recorded, but it closes the gap for every client that participates.
+
+## The asymmetry that makes all of this work
+
+Underneath every technique here sits one old principle, applied carefully. Postel's Law: be conservative in what you send, liberal in what you accept. The "liberal in what you accept" half is the entire reason additive changes are safe, because it describes the tolerant reader, the client that ignores what it does not recognize.
+
+The senior move is to apply that asymmetrically, and the modern critique of Postel's Law (Thomson and Schinazi, 2023) tells you why. Liberality belongs in the client. The server should stay strict and explicit. A tolerant client lets you evolve, but a server too liberal about what it accepts entrenches every malformed client as a de-facto standard you can never remove, because the moment you tighten anything the sloppy clients break and Hyrum's Law makes their sloppiness your problem. So: tolerant readers, strict servers. Add freely on the way out, validate exactly on the way in. That asymmetry is the quiet engine under multi-year backward compatibility.
+
+This is also why backpressure is its sibling problem rather than the same one. Versioning is about evolving the contract's shape over time; [backpressure](/blog/backpressure) is about what the contract does under load. Both are forms of being a good citizen to clients you do not control. NomadCrew's real-time layer illustrates the strict-server half: its [WebSocket hub](/case-study/nomadcrew) drops events from a full 256-deep buffer rather than block the whole system, an explicit behavior under stress instead of an unbounded queue that quietly entrenches a different kind of dependency. The same instinct shows up wherever you absorb a stream you cannot pause, which is the whole reason [Kafka vs queues](/blog/kafka-vs-queues) is a real decision and not a coin flip.
+
+The transform-layer idea generalizes past versioning too. Pushing compatibility logic to the edge so the core stays single-version is the same shape as pushing idempotency to the edge so the core stays simple, which is the thread running through [idempotency and the exactly-once lie](/blog/idempotency-exactly-once): a core that knows one truth, an edge that adapts it. Aladeen and IntelliFill both lean on that pattern, letting a thin boundary reconcile a singular internal model with whatever the caller brings, whether that is an [older API contract](/case-study/aladeen) or a [messy upstream document](/case-study/intellifill).
+
+## The honest landing
+
+Versioning is a failure mode wearing a strategy's clothes. The goal Fielding gave REST was evolvability: change a deployed system gracefully without breaking the components already running against it. A version number is what you reach for when you have failed to do that additively, which is sometimes unavoidable and never the plan.
+
+So the order of operations is the opposite of where most people start. Evolve additively for years, because the additive rule is generous enough that most changes fit inside it. Build tolerant readers and strict servers so additive change stays invisible. Pin clients to the version they were born under, so a release can never reach someone who did not ask for it. Keep version logic in a transform layer at the edge, so supporting a decade of clients costs one module per break instead of a fork. And on the rare day you must remove something, deprecate it, sunset it on a date your telemetry chose, and serve a 410 to anyone who shows up late.
+
+Fielding put the alternative more bluntly than anyone: a version number you ship before you need one is a middle finger to your API customers. And when the semantics have changed so completely that no transform can bridge them, you have not built `v2` of your API. You have built a different product, and the honest thing to do is give it a different name and a different hostname. Versioning a contract that is genuinely no longer the same contract is a category error. Most of the time, the better answer was never to break it at all.
+
+## FAQ
+
+<FAQ />

@@ -1,0 +1,162 @@
+export const meta = {
+  slug: 'agent-memory',
+  title: 'How Memory Works in AI Agents: Working, Episodic, Semantic, and Long-Term',
+  description:
+    'Agent memory is a systems problem. The context window is volatile RAM; durable memory lives outside it. The hard parts are eviction, retrieval, and write-back.',
+  headline: 'How Memory Works in AI Agents: Working, Episodic, Semantic, and Long-Term',
+  deck: 'The model is the CPU. Memory is the hierarchy you build around it, and the hard part was never storage.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['ai-agents', 'memory', 'llm', 'rag', 'vector-databases', 'context-engineering', 'system-design'],
+  faq: [
+    {
+      q: 'Does a large context window make agent memory unnecessary?',
+      a: 'No. Window size is capacity, not retrieval quality. Lost-in-the-Middle showed accuracy follows a U-shaped curve, high when the target sits at the start or end of the context and dropping sharply in the middle, even for long-context models. The Context Rot study replicated degradation across eighteen frontier models as input grows. A million-token window lets you store more, but the model attends to it worse the fuller it gets, so you still need a retrieval system that keeps the working set small and high-signal.',
+    },
+    {
+      q: 'Is agent memory just RAG with a vector database?',
+      a: 'RAG is one tier, the semantic one. It is retrieval over an external store, which maps cleanly onto durable facts the agent looks up on demand. But a full memory system also has to manage the working context (what is live in the window right now), an episodic log (the append-only record of what happened), procedural memory (learned routines), eviction when the window fills, and write-back consistency when new information contradicts old. A vector database answers one of those questions. The other four are still yours to engineer.',
+    },
+    {
+      q: 'What are the four types of agent memory?',
+      a: 'Working memory is the live context window, the agent equivalent of RAM. Episodic memory is the append-only log of events and interactions, like a database write-ahead log. Semantic memory is durable facts retrieved on demand, which is where RAG and vector search live. Procedural memory is learned routines and policies, usually realized as a self-edited system prompt or a reflection buffer rather than any change to the model weights. Each maps onto a different storage tier with a different cost, latency, and consistency profile.',
+    },
+    {
+      q: 'Why is writing memory back the hard part?',
+      a: 'Reads and writes fail in opposite ways. A read fails by surfacing a stale or wrong memory; a write fails by storing two facts that contradict each other. The hard case is the implicit conflict, where a new observation silently invalidates an old one without explicitly negating it ("I am vegetarian" on turn one, "I had a great steak last night" on turn forty). The STALE benchmark showed the best frontier model resolves these correctly only about 55 percent of the time, and the common last-writer-wins policy is both lossy and, in multi-agent setups, unsafe.',
+    },
+    {
+      q: 'Does procedural memory mean the model learned or was fine-tuned?',
+      a: 'Almost never. The model weights are frozen between calls. What looks like a learned skill is usually self-edited text: a rewritten system prompt, or a reflection the agent wrote after a failure and prepends on the next attempt. Reflexion demonstrated this cleanly, lifting pass@1 on a coding benchmark by writing a verbal lesson into an episodic buffer with zero weight updates. The learning lives entirely in tokens, which means it is portable, inspectable, and also forgettable the moment you stop injecting it.',
+    },
+  ],
+}
+
+Ask someone how memory works in an AI agent and you usually get an answer about the model. Bigger context window, better recall. New model, longer memory. The framing treats memory as a capability that ships inside the weights, something you upgrade by swapping the engine. It is wrong in a way that costs you when you build.
+
+Memory in an agent is a systems problem. The model is stateless between calls; it remembers nothing on its own. Everything that feels like memory is engineering you do around the model: what you keep in the prompt, what you store outside it, how you decide which durable thing to pull back in, and how you keep the stored copy consistent when you write to it. These are not new problems. They are the ones operating-system and database engineers have fought for fifty years: what to keep hot, what to evict, how to retrieve the right record cheaply, how to stay consistent under concurrent writes. The model is the CPU. The interesting work is the memory hierarchy you build around it.
+
+This piece walks that hierarchy from the top, through the four memory types and the two parts everyone underestimates: forgetting, and writing back. If you have read [how LLMs work](/blog/how-llms-work), you already know the model has no persistent state. This is the layer that gives it one.
+
+## Working memory is RAM, and it degrades before it fills
+
+The context window is the agent's working memory: the tokens the model attends to during one forward pass. Like RAM it is fast, finite, and volatile, and when the call ends it is gone unless you wrote it somewhere durable.
+
+The 2023 MemGPT paper made this analogy load-bearing rather than cute, naming the prompt the "main context" and modeling the agent as an OS that pages data between a fast tier and a slow tier. That is the spine of serious agent memory today: the window is RAM, the vector store is disk, the agent is the pager.
+
+But the analogy has a twist that makes agent memory harder than OS memory, and missing it is the most expensive mistake in this area. RAM degrades at its boundary; write past the end and you fault, but everything inside stays equally fast. The context window degrades throughout. Anthropic's framing is the right one: the model has a finite "attention budget," because transformer attention is n-squared pairwise relationships that get stretched thin as n grows, and models are trained mostly on shorter sequences. The marginal token you add does not just cost money and latency. It can lower the accuracy of everything already in the window.
+
+The empirical work makes this concrete. Lost in the Middle (Liu et al., 2023) found a U-shaped curve: accuracy is high when the target sits at the start or end of the context and drops sharply in the middle, even for models sold on their context length. The Context Rot study replicated the pattern across eighteen frontier models in 2025, accuracy sliding as input grew, in some cases from around 95 percent to around 60 percent.
+
+So the conclusion that governs everything downstream: window size is capacity, not retrieval quality. A million-token window is not a million tokens of usable memory; it is a million tokens of place to put things the model will increasingly fail to find. This is what resurrects retrieval inside the agent. You keep the working set small and high-signal, budgeting against the effective window rather than the advertised one, with the highest-signal tokens at the head and tail where recall is strong, never the middle.
+
+## Episodic memory is the log of what happened
+
+Episodic memory holds the past, as an append-only record of events: the messages exchanged, the tools called, the observations made, each timestamped.
+
+The cleanest reference design is the "memory stream" from Stanford's Generative Agents (Park et al., 2023), the paper where twenty-five simulated characters remembered their day well enough to throw a Valentine's party. Every observation lands in a flat, time-ordered list, and nothing is overwritten. MemGPT calls its version "recall storage": the searchable history you query when the user asks "what was my ticket number?" three hundred turns later.
+
+If you have a database background, the right analogy is the write-ahead log: you record what happened, in order, durably, before you do anything clever with it. Summaries can be lossy and beliefs can be revised, but the raw event stream is the ground truth you can always replay against.
+
+Two things the storage-is-cheap crowd gets wrong. First, you almost never feed the whole log back into the window; it would blow the attention budget instantly. The log exists to be queried, not recited. Second, it is the substrate everything richer is built from: semantic facts get extracted from it, reflections synthesized over it, procedural lessons distilled from the episodes where the agent failed. Skip it, and you are deriving beliefs from a record you cannot reconstruct.
+
+## Semantic memory is retrieval, and this is where RAG comes back
+
+Semantic memory is durable knowledge the agent looks up on demand. Not the transcript of a conversation, but the distilled facts: this user prefers dark mode, the Enterprise plan includes SSO, the API base URL changed last quarter. Facts decoupled from the episode that produced them.
+
+This is where retrieval re-enters. The original RAG paper (Lewis et al., 2020) split knowledge into parametric memory (in the weights) and non-parametric memory (in an external store you retrieve from). Semantic memory in an agent is the non-parametric half at the agent layer. Letta, the productized descendant of MemGPT, calls it "archival memory" and implements it as a vector-database table the agent queries with a tool call. [RAG systems](/blog/rag-system) and [vector databases](/blog/vector-databases) are the foundation this tier is built on. Semantic memory is RAG wearing a different job title.
+
+But here is where shallow treatments stop and the real engineering begins. Retrieval relevance is not cosine similarity. Treating "nearest vector" as "right memory" is a real bug, not a simplification.
+
+The Generative Agents retrieval score is the canonical worked formula, and every value here is from their implementation:
+
+```
+score = α_recency · recency + α_importance · importance + α_relevance · relevance
+```
+
+All three signals are normalized to a 0-to-1 range, and in their implementation all three weights are 1. Relevance is embedding cosine similarity, the part everyone implements. Recency is exponential decay with a factor of 0.995 per hour since last access. Importance is an LLM-rated "poignancy" score from 1 to 10, where brushing your teeth scores a 1 and a breakup scores a 10.
+
+Why this matters in production: a memory can be highly relevant by vector distance and still be the wrong thing to surface, because it is stale or trivial. And a memory can be load-bearing, the fact that quietly determines the right answer, while scoring only moderate on relevance. A pure-similarity retriever surfaces the first and silently drops the second, a failure invisible to any eval that only checks whether the top result is "related." The fix is to rank on more than one axis: hybrid lexical-plus-vector search, a reranking pass, recency decay, and importance gating what is worth keeping at all.
+
+## Procedural memory is learned routines, and no weights moved
+
+The fourth type is the one most people conflate with "the prompt." Procedural memory is the agent's learned how-to: the routines, policies, and corrections accumulated from doing the work. An agent that has failed the same way three times and stopped has procedural memory, whether or not anyone designed it deliberately.
+
+The detail that trips people up: this is not fine-tuning. The model weights are frozen. Procedural memory is text the agent edits about itself. LangMem models it as the agent rewriting its own system prompt; Reflexion (Shinn et al., 2023) models it as reflective text in an episodic buffer that conditions the next attempt.
+
+Reflexion is the cleanest demonstration that procedural memory is a context-engineering artifact and not a model property. An agent fails a coding task. Instead of retraining, it writes a verbal lesson, something like "I assumed the input was sorted and it was not; next time, validate ordering," into a buffer. On the next trial that text is prepended, and pass@1 on HumanEval rose from 80 to 91 percent. No gradient step. The improvement lived entirely in tokens.
+
+This cuts both ways. Procedural memory is portable, inspectable, and cheap: you can read exactly what your agent "learned," edit it, version it. But it is forgettable the instant you stop injecting it, and a procedural memory that grows without bound is just a slow way to crowd out the task. This is the discipline that makes [agentic workflows](/blog/agentic-workflows) reliable: what the agent learned has to be re-supplied on every step, because the model retains nothing between calls.
+
+## Four types, four tiers
+
+Four memory types, four storage tiers: working memory in RAM (the window), episodic in a write-ahead log, semantic in a vector index, procedural in self-edited text. The vocabulary is borrowed from Tulving's 1972 split between episodic and semantic memory, but do not believe the metaphor too hard. In humans, semantic memory is consolidated from episodic memory over time, partly during sleep; most agent stacks bolt the two on as separate stores with no consolidation pathway unless you build one. An agent's "episodic" memory is a literal append-only log, not the reconstructive, self-revising thing human recollection actually is. Wherever the metaphor implies a capability your system does not have, drop it.
+
+## Surviving a finite window: compaction versus note-taking
+
+Now the part the four-types taxonomy never mentions, and the part that decides whether your agent survives a long task: what happens when the window fills. It will. A coding agent forty tool-calls deep, a support conversation three hundred turns long. Something has to give, and the two strategies are genuinely different.
+
+MemGPT's approach is reactive and built in. A queue manager watches the token count: at a warning threshold around 70 percent it injects a memory-pressure message, the agent's cue to save what matters; at a higher flush threshold it evicts roughly half the message queue into a recursive summary, while the full transcript is preserved in recall storage. This is page-out and page-in with the agent as the pager. Anthropic calls the same idea compaction: summarize a near-full context and reinitiate a fresh window from the summary. The contrasting strategy is structured note-taking: the agent proactively writes notes to durable storage as it goes (a `progress.md`, a scratchpad) and reloads them just in time, keeping the window lightweight throughout rather than rescuing it at the last moment.
+
+The tradeoff. Compaction fires when you are nearly out of room and permanently throws detail away; note-taking is proactive and durable but adds write overhead on every step. The choice is a function of workload: compaction for conversational agents where occasional detail loss is acceptable; note-taking for long autonomous tasks where losing a decision made thirty steps ago is catastrophic. Many systems run both.
+
+The distinction that bites in production is lossy compaction versus eviction-with-retention. A recursive summary that replaces the raw history is irreversible; whatever the summarizer dropped is gone. Eviction-with-retention keeps the summary in the window and the complete record in episodic storage, so nothing is lost, only moved. "Summarize the old messages" sounds harmless and is not, if the summary is the only copy that survives.
+
+## Consolidation: turning episodes into knowledge
+
+Compaction keeps you under budget; consolidation turns raw episodes into reusable semantic memory. Generative Agents does it through reflection: when the summed importance of recent events crosses a threshold (150 in their implementation), the agent asks the model for the three most salient high-level questions about its experience, retrieves the supporting memories, and synthesizes insights that cite their evidence. That citation trail matters: a consolidated belief you cannot trace back to its source episodes is one you cannot audit when it turns out wrong.
+
+Production systems generalize this. Mem0 (2025) runs an extract-consolidate-retrieve pipeline and reports roughly 90 percent fewer tokens and 91 percent lower p95 latency than stuffing the full history into context. That is the real headline: the right metric for a memory system was never accuracy alone, it is accuracy per token and per millisecond, because a system marginally more accurate at ten times the cost loses in production. Consolidation also belongs off the hot path: Letta's "sleep-time" agents move it to idle periods rather than folding memory edits into the response loop, the agent analogue of running VACUUM when no query is waiting.
+
+## Writing back is the hard part, and it is a consistency problem
+
+Everything so far is mostly about reads, but writes are where agent memory actually breaks, and they break in the opposite direction. A read fails by surfacing the wrong memory. A write fails by storing two memories that contradict each other. Most teams pour their effort into retrieval and discover too late that their real bug is on the write path.
+
+The benchmark that isolates this is STALE (2026), and its result should recalibrate anyone who thinks memory is close to solved. It tests whether agents notice when a new observation silently invalidates an old memory, the implicit conflict, where nothing explicitly negates the old fact. The best frontier model handled these correctly only about 55 percent of the time: a coin flip with a slight edge, on the exact operation a memory system exists to perform.
+
+The worked example is mundane and that is the point. Turn 1, "I am vegetarian," stored as a semantic fact. Turn 40, "I had a great steak last night." No negation, no "actually I changed my mind," just a new observation that quietly contradicts the old one. A naive store now holds two opposed facts and will confidently act on the wrong one. STALE showed something worse still: even when retrieval returned the updated evidence, the agent often failed to act on it. Retrieving the right fact and using it are different competencies.
+
+This is the database-consistency problem wearing an LLM costume. The default convention, last-writer-wins, is wrong twice over: it is lossy, because the newer write may be the mistaken one, and in multi-agent settings it is unsafe, because a weaker agent's write can clobber a stronger agent's assessment with no contest. A write path that survives this needs the same primitives a database needs:
+
+- **Conflict detection.** New fact arrives. No conflict, insert. Explicit conflict, replace. Implicit conflict, detect and revise. The implicit branch is the one that fails, so it needs the most scrutiny.
+- **Idempotency and dedup.** Naive write-back re-stores the same fact every turn, ballooning the store and multiplying the surface for contradiction. Upsert, not blind append. This is the same discipline as [idempotency and the exactly-once lie](/blog/idempotency-exactly-once): a write that runs twice should land once.
+- **Confidence- and role-aware arbitration.** When two writers disagree, recency is a poor tiebreaker. Whose assessment is more confident, more authoritative? Naive "newest wins" answers none of that.
+- **Concurrency control.** Multiple agents reading and writing one store need versioning or locking or orchestrator serialization, the same way any shared database does.
+
+There is a security edge here too, because self-writing memory makes it real. A poisoned or adversarially planted memory persists and re-enters the context whenever it is relevant, which is memory poisoning. At scale this argues for provenance and trust scoring on entries: the same way you verify a webhook signature before acting on it, be wary of acting on a memory you cannot trace.
+
+## Forgetting is a feature
+
+The instinct is to keep everything, since storage is cheap. But storage is the wrong cost to optimize. Retrieval precision and consistency are expensive, and both degrade as the store grows. An unbounded memory is a slower and more contradictory one.
+
+So forgetting is a first-class design axis, and the closest prior art is cache-eviction policy: TTL for memories that expire, decay for relevance that fades (the Generative Agents 0.995-per-hour factor is exactly an LRU-with-decay), importance gating so trivial memories never reach durable storage at all. The question to design around is not "where do I store this?" It is "what do I throw away, when, and how do I keep what is left consistent?" A memory system with no eviction policy is a memory leak with good intentions.
+
+## How to choose
+
+The decisions stack, and the order matters.
+
+| Concern | Default move | Why |
+| --- | --- | --- |
+| What is live in the window | Keep the working set small and high-signal | The model reads a small clean context better than a large noisy one |
+| What happened | Append-only episodic log, queried not recited | Ground truth you can replay; everything richer derives from it |
+| Durable facts | Vector store with multi-signal retrieval | Cosine similarity alone is a lossy ranking signal |
+| Learned routines | Self-edited prompt or reflection buffer | No weights move; the learning is text |
+| Window fills up | Compaction (reactive) or note-taking (proactive) | Lossy-and-cheap versus durable-and-disciplined |
+| Episodes into knowledge | Consolidation, ideally async / sleep-time | Optimize accuracy per token, not accuracy alone |
+| New fact contradicts old | Conflict-aware write-back, not last-writer-wins | Writes fail by storing contradictions; this is the unsolved part |
+| Store growth | Eviction policy (TTL, decay, importance gating) | Forgetting is a feature; unbounded append degrades retrieval |
+
+None of this is exotic. It is the OS memory hierarchy and the database write path one layer up, with an LLM where the CPU used to be. What makes it worth the care is that the failure modes are quiet: a stale memory surfaced, a summary that dropped the one detail that mattered, a write path holding two contradictory facts. None throw an error. They just make the agent subtly, expensively wrong in production, where no demo exercised them. You catch them by instrumenting the memory path like any other critical system, the argument in [observability for the three pillars](/blog/observability-three-pillars), with the same instinct behind [the system design interview framework](/blog/system-design-interview-framework): name the tiers, price each one, be honest about what is not solved.
+
+I have built this for real. [IntelliFill](/case-study/intellifill) is a multi-agent LLM extraction pipeline on LangGraph, where the memory boundary, what each agent holds in its window versus what it pages from shared state, is the difference between a pipeline that composes and one that drowns in its own context. [Aladeen](/case-study/aladeen) is observability for agent CLIs and ships its own MCP server, so it watches exactly this kind of context-and-memory traffic. The same constraints shape consumer agents like [NomadCrew](/case-study/nomadcrew), where what the assistant remembers about a trip has to survive across sessions without ballooning.
+
+## The honest landing
+
+Memory is not a model feature you turn on. It is a hierarchy you build, with the same shape as the one underneath every operating system and every database. The genuinely hard part, the part the research community is still bad at, is not storing memory but writing it back without quietly accumulating contradictions.
+
+Build the easy tiers carefully and you get an agent that recalls things. Take the write path and the eviction policy seriously and you get one that stays right over a long conversation, which is the only kind worth shipping. Skip them, and you get the agent that remembers your name on turn two and forgets you are vegetarian by turn forty, confidently, at scale.
+
+## FAQ
+
+<FAQ />

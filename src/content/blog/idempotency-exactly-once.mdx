@@ -1,0 +1,188 @@
+export const meta = {
+  slug: 'idempotency-exactly-once',
+  title: 'Idempotency and the Exactly-Once Lie',
+  description:
+    '"Exactly-once" is two claims in one name. Delivery is provably impossible; processing is not. The bridge is idempotency, applied at every boundary that hurts.',
+  headline: 'Idempotency and the Exactly-Once Lie',
+  deck: 'Every system that sells exactly-once is really at-least-once delivery plus a dedup trick at a boundary someone chose carefully.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '17 min',
+  tags: ['idempotency', 'exactly-once', 'distributed-systems', 'kafka', 'stream-processing', 'system-design'],
+  faq: [
+    {
+      q: 'Is exactly-once delivery actually impossible?',
+      a: 'Yes, at the transport layer. For a sender and receiver to agree a message arrived exactly once, the receiver must acknowledge it, but the acknowledgment can be lost, which needs an ack of the ack, which can also be lost, and so on forever. No finite protocol terminates with both sides certain. This is the Two Generals result. So on every message the sender is forced to either retry on timeout (risking a duplicate, which is at-least-once) or not retry (risking a drop, which is at-most-once). There is no third option where the bytes move.',
+    },
+    {
+      q: 'If delivery is impossible, what does Kafka exactly-once actually do?',
+      a: 'Kafka gives you exactly-once processing within the Kafka boundary, built from three features: an idempotent producer that dedupes its own retries using a producer id plus a per-partition sequence number, a producer epoch that fences a restarted zombie instance, and transactions that commit output writes and consumer offsets atomically. The honest name is effectively-once: at-least-once delivery underneath, with dedup and atomicity layered on top. It covers Kafka-to-Kafka only. A side effect that leaves Kafka, an email or an S3 write, is not covered and needs its own idempotency.',
+    },
+    {
+      q: 'What is the difference between idempotency and exactly-once?',
+      a: 'They are cause and effect, not synonyms. Idempotency is the property that applying an operation N times has the same result as applying it once. Exactly-once processing is the outcome you get when you take an unavoidable at-least-once delivery stream and run each message through an idempotent operation, so N deliveries cause one effect. Idempotency is the mechanism; effectively-once is the result.',
+    },
+    {
+      q: 'Does idempotent mean the response is the same every time?',
+      a: 'No. Idempotency is about server state, not response bytes. DELETE on a resource returns 200 the first time and 404 the second, and it is still idempotent, because the state after one call and after two calls is identical: the resource is gone. PUT is the same idea, it sets a resource to a fixed value, so replaying it lands the same state. POST is the method that is not idempotent and therefore the one that needs an idempotency key.',
+    },
+    {
+      q: 'How long should a dedup store keep keys?',
+      a: 'Long enough to dominate your worst-case retry or redelivery interval. The dedup window is a correctness parameter, not a config knob. If your store expires keys after 24 hours but a client can retry after 48, or a poison message can be redelivered days later, the duplicate sails through as a brand-new request and the effect happens twice. Set the retention above the maximum time a duplicate of the same logical operation could realistically still arrive.',
+    },
+  ],
+}
+
+A payment API receives `POST /charge` for twenty dollars. It charges the card. The response, on its way back, dies somewhere in the network. The client waits, sees nothing, and its timeout fires.
+
+Now the client has to decide, and it cannot. It cannot tell "the charge succeeded and the acknowledgment was lost" apart from "the charge never happened." Both look identical from where it sits. If it retries, it might charge the card twice. If it gives up, it might charge nothing. One lost packet, two bad outcomes, and no information to choose between them.
+
+That single ambiguity is the entire subject of this piece. Everything written about exactly-once, idempotency keys, Kafka transactions, and stream-processing checkpoints exists to answer one question: what do you do when you cannot tell whether the thing already happened?
+
+## "Exactly-once" is two claims wearing one name
+
+The phrase hides a bait-and-switch, and untangling it is the whole game.
+
+Exactly-once *delivery* is a property of the transport. It says a message moves from sender to receiver one time, with no loss and no duplication, at the layer where the bytes travel. This is the thing people mean when they say "I want exactly-once," and it is provably impossible.
+
+Exactly-once *processing* is a property of the application. It says that no matter how many copies of a message arrive, the effect on your system happens once. This is achievable. It is also a completely different claim, and conflating the two is why "exactly-once" causes so much confusion.
+
+Vendors sell the second and let you hear the first. Kafka's exactly-once, Flink's exactly-once, the "exactly-once" on a dozen queue datasheets, are all the achievable processing kind dressed in the language of the impossible delivery kind. The honest name for what they ship is **effectively-once**: at-least-once delivery underneath, with a dedup-or-atomicity mechanism on top so the observable effect lands once. Once you can hold those two claims apart, the rest of the topic stops being mysterious and starts being a series of engineering decisions about *where* you put the dedup.
+
+## Why delivery cannot be fixed
+
+The impossibility is not a hand-wave about hard problems. It is an infinite regress, and it is worth walking because it tells you exactly which corner you are trapped in.
+
+For delivery to be exactly-once, the sender and receiver have to *agree* the message arrived exactly once. Agreement over a channel that can drop messages requires an acknowledgment: the receiver tells the sender "got it." But that ack travels the same lossy channel and can itself be dropped. So the sender needs to know the ack arrived, which needs an ack-of-the-ack, which can also be dropped, which needs an ack-of-the-ack-of-the-ack. No finite exchange ever terminates with both sides certain. This is the Two Generals' Problem, first proven by Akkoyunlu, Ekanadham, and Huber in 1975, and it has no solution because it cannot have one.
+
+```
+   Sender                         Receiver
+     |  --------- msg --------->    |  receives
+     |  <-------- ack ----------    |  (was the msg seen? yes)
+     |  X--- ack-of-ack (lost) -    |  (did sender get my ack? unknown)
+     |  ... needs ack-of-ack-of-ack ...
+     |     no finite protocol terminates with both sides sure
+```
+
+Out of that regress falls a forced choice the sender faces on *every single message*. The response times out. Now:
+
+- **Retry on timeout.** If the original actually landed, you have just created a duplicate. This is **at-least-once**.
+- **Do not retry on timeout.** If the original was lost, you have just dropped it. This is **at-most-once**.
+
+There is no third branch at the transport layer. At-most-once is fast and loses messages, which rules it out for anything that moves money or state. At-least-once survives contact with real networks, which is why Stripe, SQS, SNS, Kafka, and essentially every durable system on earth picks it. So the premise you are handed, whether you like it or not, is: **duplicates are guaranteed, not rare.** The design question is no longer how to stop them. It is how to make them harmless.
+
+## The reframe: stop fixing transport, start fixing effect
+
+Here is the move that turns an impossible problem into a tractable one. You cannot make delivery exactly-once. You *can* make duplicate deliveries do nothing.
+
+So restate the goal. Accept at-least-once delivery as a fact of the universe, and make your processing **idempotent**, so that N deliveries of the same logical operation cause exactly one effect. An operation is idempotent when applying it more than once has the same result as applying it once. `SET balance = 100` is idempotent; run it five times, the balance is 100. `balance += 10` is not; run it five times and you are off by forty dollars. The job of any system that wants exactly-once is to take the messy at-least-once stream the network actually delivers and run each message through an operation shaped like the first one.
+
+There is a sharp boundary on how far this can go, and the people who built the canonical sources are blunt about it. True exactly-once processing requires a **closed system**: one where you can model input, output, and processor state as a *single atomic operation*. The instant a side effect escapes that boundary, a card charge, an email, a write to S3, the atom breaks. You are no longer inside one transaction; you are making a foreign call that can succeed-then-fail, and you need idempotency again at *that* boundary. Hold onto this, because it is the reason there is no single switch labeled exactly-once. The guarantee is only ever local to a boundary you control.
+
+## This is the end-to-end argument, and it is forty years old
+
+The reframe is not new. It is a direct application of one of the foundational papers in systems design: Saltzer, Reed, and Clark's "End-to-End Arguments in System Design," from 1984. If you have read [the system design interview framework](/blog/system-design-interview-framework) here, this is the principle underneath half of it.
+
+Their claim, in their words, is that a function placed at a low level of a system *"may be redundant or of little value when compared with the cost of providing them at that low level."* The example is careful file transfer. To move a file correctly you have to survive disk read errors, memory corruption, processor faults, network corruption, and a crash at either end. You could armor every single hop, and after all that work you still would not have a guarantee, because a fault between two armored hops slips through. Or you could transfer the file naively, then compute a checksum **end to end at the destination** and re-send if it fails. The second approach is simpler, and it is the *only* one that actually guarantees correctness, because only the endpoints can verify the property that matters.
+
+The nuance that makes this profound rather than obvious: the low-level reliability is not useless. TCP checksums, broker acks, link-layer retransmit are all justified, but **only as a performance optimization**, because they reduce how often the expensive end-to-end retry has to fire. They are never *sufficient* for correctness. The end-to-end check still has to happen.
+
+Map that onto our topic and it clicks. "Exactly-once delivery" is the seductive low-level function, the armored hops. The end-to-end argument says: stop building correctness into the transport. The only place an exactly-once *effect* can be guaranteed is at the application endpoint, through an idempotent operation or a dedup check. **Idempotency is the end-to-end argument applied to message processing.** And the corollary cuts the other way: a junior take says "make everything idempotent at the app and you can ignore broker reliability." Backwards. You *want* the broker's at-least-once machinery, as the optimization that keeps your expensive end-to-end dedup from firing constantly. It is just never the thing you trust for correctness.
+
+## The toolkit: four ways to manufacture effectively-once
+
+There is no exactly-once primitive. There are four mechanisms, and real systems compose them. Here they are, roughly strongest to most situational.
+
+**Naturally idempotent operations.** The best dedup is the one you never have to perform, because the operation is idempotent by construction. `PUT /resource/123` sets a resource to a fixed state; replay lands the same state. `DELETE` leaves the resource gone whether you call it once or twice. An upsert on a primary key absorbs duplicates for free. `SET status = 'paid'` survives any number of replays. When you can express a side effect as a state you set rather than a delta you apply, duplicate suppression becomes a safety net instead of the only thing between you and a double charge. Reach for this shape first.
+
+This is also where a subtlety lives that trips people up. Idempotent does **not** mean "returns the same response every time." It means the *server state* is unchanged. RFC 9110 makes this precise:
+
+| Method | Safe? | Idempotent? | Note |
+| --- | --- | --- | --- |
+| GET / HEAD / OPTIONS | yes | yes | read-only, changes nothing |
+| PUT | no | yes | sets resource to a fixed state; replay = same state |
+| DELETE | no | yes | delete-twice = deleted; 200 then 404 is fine, state is unchanged |
+| POST | no | no | the method that *needs* an idempotency key |
+
+A DELETE that returns 200 then 404 is still perfectly idempotent. The bytes differ; the state does not. Get this wrong and you will "fix" a non-bug by making DELETE return 200 forever, which hides real errors.
+
+**Idempotency key plus dedup store.** When the operation cannot be made naturally idempotent, POST being the obvious case, the client mints a unique key for the logical operation and sends it along. The server records "I have seen this key, here is the result I produced," and on a retry it replays the stored result instead of re-executing. This is what Stripe's `Idempotency-Key` header does, and the pattern [idempotent webhooks](/blog/idempotent-webhooks) leans on end to end. The details that separate a real implementation from a toy: the key must be **client-generated for the logical operation and stable across retries** (a fresh UUID per HTTP attempt defeats the purpose, since the key identifies the *intent to charge*, not the *attempt to send*); you store **the full result including errors**, so a first request that returned a 400 replays that 400; you **match request parameters** against the original and reject same-key-different-body as the bug it almost always is; you handle **in-flight concurrency** with a lock so a racing second copy gets a 409 rather than a second execution; and the keys **expire**, which is the correctness decision covered below.
+
+Brandur Leach's Postgres reference implementation is the canonical version: an `idempotency_keys` table with a unique index on `(user_id, idempotency_key)`, a `locked_at` column for the in-flight lock, the cached `response_code` and `response_body`, and a `recovery_point` that acts as a cursor through a forward-only state machine (`started -> charge_created -> finished`). A retry resumes from its last recovery point and skips the phases that already completed.
+
+**Idempotent consumer, the inbox pattern.** On the message-consumer side, you record the IDs of messages you have processed in a table (or fold the dedup into the business entity itself) and skip any ID you have already seen. Chris Richardson named this the Idempotent Consumer pattern. It is the same idea as an idempotency key, applied to a broker's redelivery instead of a client's retry.
+
+**Atomic state plus offset commit.** The deepest mechanism: make "I processed this message" and "I recorded my progress" a *single transaction*, so a crash cannot leave them disagreeing. Two separate steps means a crash in the gap either loses work (recorded progress, never did it) or repeats it (did it, never recorded progress). Binding them atomically is exactly what Kafka's transactions and Flink's two-phase commit mechanize, which is where we go next.
+
+## Kafka "exactly-once" decoded: it is three features, not one
+
+People say "Kafka has exactly-once" as if it flipped a single switch. It is three distinct guarantees layered together, specified in KIP-98, and knowing which is which is the difference between a shallow answer and a staff-grade one. This sits directly on top of the durability and ordering machinery from [Kafka vs message queues](/blog/kafka-vs-queues); if that distinction is fuzzy, read it first.
+
+**The idempotent producer** kills *producer-retry* duplicates within a session. Each producer gets a **producer ID** (PID), and every message it sends carries a **per-partition monotonically increasing sequence number**. The broker accepts a write only if its sequence number is **exactly one greater** than the last one it committed for that (PID, partition). A lower number means a retry of something already written, and the broker drops it as a `DuplicateSequenceNumber`. A higher number means a gap, which is data loss, and the broker raises a fatal `OutOfOrderSequenceException`. The detail that matters: this dedup state lives in the **replicated log**, so it survives a leader failover. Contrast that with TCP sequence numbers, which are per-connection and evaporate the moment the connection resets. Kafka's dedup outlives the broker that was tracking it.
+
+**The producer epoch** handles the nastiest failure in the whole topic: the zombie. A producer gets network-partitioned, the system presumes it dead and starts a replacement, and then the original *wakes up* and tries to write. Both instances now believe they own the same `transactional.id`, and you are one keystroke from a double write. Kafka maps each `transactional.id` to a PID *plus an epoch*, and the epoch bumps every time `initTransactions()` runs. The restarted instance has the current epoch; the zombie has a stale one, and the broker fences it off. Any home-grown exactly-once scheme needs an equivalent fencing token.
+
+**Transactions** make writes across multiple partitions *and the consumer's offset commit* atomic, all-or-nothing. A **Transaction Coordinator**, backed by the internal `__transaction_state` log, drives it. The key construct is the **consume-transform-produce** loop: a stream processor reads from an input topic, processes, produces to output topics, and folds `sendOffsetsToTransaction()` into the *same* transaction as those output writes. So "I consumed this" and "I produced the result" commit together or not at all. Downstream, consumers set `isolation.level=read_committed` and see records only up to the **Last Stable Offset**, with control markers (COMMIT/ABORT) demarcating transaction boundaries and filtered out before your code ever sees them.
+
+That last piece is easy to skip and important: exactly-once *production* is worthless if the consumer reads *dirty*. Without `read_committed`, a downstream reader would see uncommitted and even aborted transactional records. The guarantee is only as strong as the weakest isolation level in the chain, which is the same lesson that runs through [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) and [replication strategies](/blog/replication-strategies): consistency is a property of the whole path, not one hop.
+
+And the caveat the marketing omits, stated plainly by Confluent's own engineering: this is exactly-once **within Kafka's boundary**, Kafka to Kafka. Their blog says Kafka Streams EOS "is guaranteed within the scope of Kafka Streams' internal processing only." A `print()`, an email, a third-party API call, an S3 write inside your processor is *outside* that boundary and is not covered by anything above. The atom broke the moment your effect left the log.
+
+## Flink "exactly-once" decoded: checkpoints plus two-phase commit
+
+Stream processors face the same problem and solve it with a different boundary. Flink's own definition is careful: *"each incoming event affects the final results exactly once... no duplicate data and no data that goes unprocessed."* Read that twice. It is **effects on results**, not literal single execution. The mechanism:
+
+**Checkpoint barriers** flow through the dataflow like a ruler dragged across the stream. When a barrier passes, every operator snapshots its state and its source position to durable storage. On failure, Flink rewinds *all* operators to the last complete checkpoint and replays from there. Internal state is now exactly-once for free.
+
+But internal rewind cannot un-send an email or un-write a file, so external sinks need more. A transactional sink extends **`TwoPhaseCommitSinkFunction`** and implements four methods: `beginTransaction`, `preCommit`, `commit`, `abort`. When a barrier arrives, the sink **pre-commits**, flushing data into an *open, uncommitted* transaction and stashing the transaction ID in checkpoint state. Only when the JobManager confirms the checkpoint is *globally* complete does the sink **commit**. If any pre-commit fails, everything aborts and rolls back to the previous checkpoint. The requirement, identical to Kafka's, is a **replayable source plus a transactional (or idempotent) sink.** Same three ingredients every time: replay the input, commit state atomically, dedup or transact at the output.
+
+## The leak map: where exactly-once stops and you are on your own
+
+Here is the diagram to keep in your head, because it is the one that prevents production incidents.
+
+```
+  [ source ] --> [ stream processing ] --> [ transactional sink ]      [ external API / S3 / email ]
+  |------------- exactly-once covered ------------------------|        |--- you are on your own ---|
+                  replayable + atomic + transactional                    needs its own idempotency
+```
+
+Exactly-once holds *only if every hop participates*: a replayable source, atomic state-and-offset commits in the middle, and a transactional or idempotent sink at the edge. The instant one hop does not participate, the whole guarantee collapses to effectively-once-at-best. And the hop that almost never participates is the external one.
+
+The canonical trap is the non-idempotent sink. Point a Kafka-to-S3 connector at an at-least-once stream and it will faithfully copy to S3 *exactly what is in the topic, duplicates and all*. S3 has no upsert and no transaction to dedup against, so all the exactly-once machinery upstream buys you nothing at that sink. Contrast a JDBC sink doing an **upsert on a primary key**: it is naturally idempotent and absorbs duplicates for free. The sink's shape decides whether your upstream guarantee survives the last hop. This is the same lesson, one layer down, that [idempotent webhooks](/blog/idempotent-webhooks) makes about the foreign API call your handler cannot wrap in a transaction.
+
+When the boundary is a card charge sitting between two database phases, the discipline is fixed: **commit local state plus a recovery point first, then make the external call carrying its own idempotency key, then advance the recovery point.** A crash anywhere in that sequence is safe, because the external system dedups on the key you passed it, and your recovery point tells the retry which phase to resume from. That is the end-to-end argument applied a second time, one hop downstream from where you applied it first.
+
+## The decisions a senior actually makes
+
+The tell of a shallow treatment is that it asks "is this system exactly-once?" as a yes/no property. The senior reframe is that exactly-once-effect is something you *manufacture at a specific boundary*, so the real questions are "which boundary, and what is the dedup window?" Here is how the calls land.
+
+| Decision | The senior move | Why |
+| --- | --- | --- |
+| Do you even need EOS? | Usually no; prefer at-least-once + idempotent sinks | Transactions cost coordination round-trips and latency; most workloads do not need them |
+| Where does the key come from? | Client key for client retries; message-id for broker redelivery; business key for logically-duplicate ops | These are different dedup *scopes*, and you often need more than one |
+| How long do you keep keys? | Longer than the worst-case retry/redelivery interval | The window is a correctness parameter, not a config knob |
+| What is the dedup store's cost? | Budget storage + a read/write per message + contention | Dedup is stateful; it is never free |
+| Side effect leaves the boundary? | Recovery point, then external call with its own key | No transaction spans a DB and a foreign API |
+| Restarted/partitioned writer? | A fencing token (epoch) | A zombie that wakes up will double-write without one |
+
+A few of these deserve a sentence more, because they are where the genuinely hard bugs hide.
+
+**The dedup window has to dominate the retry horizon.** If your store TTL is 24 hours but a client can legitimately retry after 48, or a poison message can be redelivered days later from a dead-letter queue, then the "duplicate" arrives *after* its key was reaped and is processed as brand new. The effect happens twice and nothing flags it. Sizing this window is the single most common place a correct-looking idempotency scheme silently fails, and it is invisible in every test that runs inside the TTL.
+
+**Dedup is not free, and transactions are not free.** A dedup store is a stateful read-plus-write on every message, and a hot idempotency key or lock row becomes a serialization bottleneck under a retry storm, the exact moment you are already overloaded. Sharding the dedup store is a real concern at scale, the same hot-key problem [the distributed cache](/blog/distributed-cache) wrestles with. Transactions and two-phase commit add coordination round-trips and buffering latency that show up directly in [the tail](/blog/latency-throughput-tail). The honest staff take: most systems should *not* reach for full EOS. At-least-once plus idempotent sinks is cheaper, simpler, and correct, and "do you really need exactly-once?" is a legitimate design question, not a cop-out. When you size it, the [capacity estimation](/blog/capacity-estimation) habits apply: the dedup store's storage and the transaction tax are line items, not afterthoughts.
+
+**One impossibility result is not another.** Tyler Treat's writing on this invokes FLP alongside Two Generals, and the two get conflated constantly. They are different. Two Generals is about a *lossy* channel: messages can be dropped, and that is why agreement is impossible. FLP (Fischer, Lynch, Paterson, 1985) assumes a *reliable* channel but *asynchronous timing* and one crash-fault, and proves no *deterministic* protocol can *guarantee* consensus in bounded time. FLP does not say "consensus is impossible, nothing works", real systems use timeouts, randomization, and failure detectors and reach consensus in practice every day. If you cite FLP, do not overstate it, and do not paste it onto the Two Generals argument as though they were the same proof. The distinction matters because someone in the room will know, and getting it right is a credibility signal in exactly the way [the system design interview framework](/blog/system-design-interview-framework) describes.
+
+I have lived the practical end of this. Building [NomadCrew](/case-study/nomadcrew), a real-time WebSocket hub, the reconnection logic let a client replay the same action across a dropped socket, so every state mutation had to be idempotent on a client-supplied operation id, the inbox pattern, not a server-generated one. In [IntelliFill](/case-study/intellifill), a multi-agent LLM pipeline, a retried agent step that had already called an external API would have double-charged the downstream provider, so each step committed a recovery point before the foreign call and passed its own idempotency key. The pattern shows up the moment any system retries, which is to say always.
+
+## The honest landing
+
+There is no exactly-once primitive. There never was. Anyone who tells you their system delivers exactly-once is either confusing delivery with processing, or selling you effectively-once in a nicer font.
+
+What exists is the end-to-end argument, applied over and over, at every boundary where a duplicate could cause harm. Kafka's boundary is the replicated log, deduped by sequence number, fenced by epoch. Flink's is the checkpoint plus the sink transaction. Stripe's is the idempotency key and its 24-hour window. Your microservice's is the inbox table. Each one accepts at-least-once delivery as unalterable and manufactures a single effect at a place it controls, and each one leaks the instant a side effect escapes that place.
+
+So the marketing word is a lie at the transport layer and a correct abstraction at the application layer, when the boundary is closed. The job is not to believe it or to scoff at it. The job is to know exactly where the abstraction holds, exactly where it leaks, and to put an idempotency key on every wire that crosses the line. Do that, and the duplicate that the network guarantees, the one that arrives at 2 a.m. because an ack got lost, costs you nothing. Skip it, and you find out the hard way that "exactly-once" was always something you had to build, not something you were given.
+
+## FAQ
+
+<FAQ />

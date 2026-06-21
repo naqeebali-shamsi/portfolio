@@ -1,0 +1,169 @@
+export const meta = {
+  slug: 'model-routing',
+  title: 'How Model Routing and Cascades Work: The Right Query to the Right Model',
+  description:
+    "How routing and cascades send each query to the cheapest capable model, why the threshold is the whole game, and when going cheap-first actually costs you more.",
+  headline: 'How Model Routing and Cascades Work: The Right Query to the Right Model',
+  deck: 'Paying frontier prices for a FAQ lookup is the default waste, and a good router is the cheapest engineering you will ever ship to fix it.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['llm', 'model-routing', 'cascades', 'cost-optimization', 'inference', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between model routing and a cascade?',
+      a: "Predictive routing makes one upfront decision: a cheap classifier reads the query, predicts difficulty, and dispatches it to either the cheap or the expensive model, so exactly one model runs. A cascade is sequential: it always runs the cheap model first, scores the answer, accepts it if a verifier is confident, and otherwise escalates to a stronger model. The cascade always pays for the cheap stage and pays twice on every escalated query, which is the cost you trade for a quality guarantee.",
+    },
+    {
+      q: 'How do you set the confidence threshold for a cascade?',
+      a: "Not by intuition. A threshold picked because 0.9 feels safe is miscalibrated by default. The correct method is to take a labelled slice of your own traffic, measure the cheap model's accuracy at each confidence bucket, and set the cutoff where that accuracy crosses your acceptable error rate. The research-grade move is to calibrate the confidence score itself with logistic regression and optimize thresholds jointly across stages, because the right cutoff at one stage depends on the next stage's error profile.",
+    },
+    {
+      q: 'Does routing always save around 80 percent on cost?',
+      a: "No. Savings are workload-dependent. RouteLLM reports roughly 3.66x cost reduction on heterogeneous chat traffic at 95 percent of GPT-4 quality, but only about 1.41x on the uniformly hard MMLU benchmark. On traffic where almost every query is hard, routing can be net-negative once you count the classifier call and the engineering. Quote both ends of the range, never just the headline.",
+    },
+    {
+      q: 'Why is misrouting a hard query to the cheap model so costly?',
+      a: "Because the failure is asymmetric. Sending an easy query to the expensive model wastes a few cents but returns a correct answer, which is benign. Sending a hard query to the cheap model returns a confidently wrong answer for a token saving of cents, and the real cost is a user who re-submits, thumbs-downs, or churns silently. The optimizer is therefore minimizing cost subject to a quality floor, not minimizing raw cost.",
+    },
+    {
+      q: 'When is model routing not worth building?',
+      a: "Below roughly ten thousand requests a day the savings rarely clear the engineering and operational overhead. Routing also pays poorly when traffic is uniformly hard, since there is no cheap tier that can safely absorb a meaningful share of it. And a cascade is the wrong choice for latency-critical interactive paths, because escalation adds a second model call and can double the response time even when the cost math works.",
+    },
+  ],
+}
+
+Every query you send to a frontier model is a bet that the query is hard. Most of the time you lose that bet. A user asks for the capital of France, or to reformat a list as JSON, and the request goes to the same model you would reach for to refactor a distributed system or reason through a proof. You pay the proof price for the FAQ. At one query that is rounding error. At a million queries a month it is most of your bill.
+
+Routing is the lever that fixes this, and it exists because the price spread between models is enormous. The original FrugalGPT benchmark spanned a 150x gap across twelve APIs. You do not even need multiple vendors to feel it anymore: inside Anthropic's lineup, Haiku to Opus is 5x on input and output, and inside OpenAI's, GPT-4o-mini to GPT-4o is roughly 33x on input and 25x on output. Sending a JSON reformatting job to the top of either ladder is the default waste, and a router is the cheapest piece of engineering you will ever ship to stop paying for it. The catch is that doing it badly ships wrong answers quietly, until your users leave, so the rest of this is about doing it well: the three strategies and when each fits, the one number that decides whether a cascade saves money, and the threshold discipline that separates the routers that hold up.
+
+## Three strategies that are not the same thing
+
+People say "routing" to mean three different mechanisms with different cost and latency profiles, and conflating them is the first mistake. The right choice depends on what your traffic looks like.
+
+```
+(a) Predictive routing        (b) Cascade                     (c) Semantic routing
+    Query                         Query                            Query
+      |                             |                                |
+   classifier                   cheap model                       embed
+      |                             |                                |
+   easy / hard?               verifier scores it             nearest intent?
+    /     \                       /        \                     /        \
+ cheap   expensive          accept ✓   escalate            match      sim < floor
+ (ONE runs)                  (done)        |                  |            |
+                                       expensive          chosen      fallback
+                                       (paid TWICE)        model       general model
+```
+
+Predictive routing makes a single decision before any answer is generated. A cheap model or a small classifier reads the query, predicts whether it is easy or hard, and dispatches it to exactly one model. This is the design behind RouteLLM, the LMSYS and Berkeley work that is the reference implementation in this space, and it calibrates better when you understand why a small model fails on what it fails on, which is the subject of [how LLMs work](/blog/how-llms-work). Because only one model ever runs, the decision overhead is tiny, ten to thirty milliseconds, and the latency is predictable, which makes it the right tool for interactive paths where you cannot afford a second model call.
+
+A cascade runs the cheap model first, every time, and decides afterward whether to trust the answer. FrugalGPT is the canonical version. The mechanism is: generate with the cheap model, score that generation with a verifier, accept if the verifier is confident, otherwise escalate to a stronger model and possibly a third. The cheap stage always runs and any escalated query pays for both models. What you buy for that cost is a quality guarantee backed by an actual check on the cheap answer rather than a guess about the query, so cascades fit quality-critical work where you can afford a verifier pass, and batch better than interactive, because escalation adds latency.
+
+Semantic routing skips difficulty prediction entirely. It embeds the incoming query, compares that vector against a catalogue of labelled intents or exemplars, and routes by nearest match, with a similarity floor so that a query matching nothing well falls back to a general model. It is the cheapest of the three to run, and it leans on the same machinery as a [vector database](/blog/vector-databases) and the retrieval side of a [RAG system](/blog/rag-system). Its blind spot is difficulty within an intent: it can tell a billing question from a technical one, but not an easy billing question from a hard one. Use it when your intents are genuinely enumerable and the hard part is dispatch, not difficulty.
+
+## The one number that decides whether a cascade pays
+
+The seductive thing about a cascade is the story: try the cheap model first, it is basically free, you only reach for the expensive one when you have to. The story is wrong about "free," because the cheap stage always runs. Write the expected cost of a two-stage cascade and it falls out immediately. With a cheap model of cost `cost_C`, an expensive model of cost `cost_E`, and an escalation probability `p`, the fraction of queries the verifier rejects at stage one,
+
+```
+E[cost] = cost_C + p * cost_E
+```
+
+You always pay `cost_C`. Every escalated query also pays `cost_E`. Now ask the only question that matters: when is this cheaper than just calling the expensive model directly?
+
+```
+cost_C + p * cost_E  <  cost_E      <=>      p  <  1 - cost_C / cost_E
+```
+
+Put Haiku and Opus on the output axis, where the ratio `cost_C / cost_E` is 5 to 25, or 0.2. The cascade wins only when `p < 0.8`. If your verifier escalates more than eighty percent of queries, the cascade is more expensive than skipping the cheap stage and going straight to Opus: you paid for the cheap model a million times to save on the twenty percent that did not escalate, and the eighty percent that did paid for both.
+
+Most teams never compute this; they assume cheap-first is strictly better and never measure their escalation rate. The break-even says something beyond go or no-go: a cascade only makes sense when the cheap model can handle a large share of traffic on its own. If it cannot, you have a model-selection problem, not a cascade problem, and the answer is predictive routing or a better cheap model. The same accounting is why "more tiers means more savings" is false: each tier is always-paid overhead, so a three-tier cascade means a top-tier query has paid for three calls before it gets the answer it needed all along. Deeper only wins when escalation rates stay low at every stage, which is exactly why setting those thresholds well is not a detail.
+
+## The threshold is the whole game
+
+A cascade's behaviour is governed by one knob per stage: the confidence cutoff at which it stops trusting the cheap answer and escalates. Set it too high and almost everything escalates, so you pay twice constantly. Set it too low and the cheap model's shaky answers get shipped, and you are back to confidently wrong outputs. The threshold is not a tuning detail. It is the entire cost-quality tradeoff compressed into a single number, and almost everyone sets it wrong.
+
+The naive move is to pick a number that feels safe. Ninety percent confidence sounds prudent, so you gate on 0.9 and move on. As the production writeups put it bluntly, any threshold set by intuition is miscalibrated by default, because the only correct approach is to measure what fraction of queries the small model gets right at each confidence level on your workload and set the cutoff from your acceptable error rate. A confidence of 0.9 from your verifier does not mean ninety percent correct. It means whatever your data says it means, and until you have looked, you do not know.
+
+```
+small-model
+ accuracy
+  1.0 |                                  . . . .
+      |                          . . . '
+      |                  . . . '
+  0.92|- - - - - - - -  *  <- set threshold here (error budget = 8%)
+      |          . . '  |
+      |    . . '        |
+      +----------------|------------------------ verifier confidence
+     low                tau                     high
+```
+
+The competent method is the one in that diagram. Take a labelled slice of your own traffic, bucket the cheap model's answers by the verifier's confidence, and measure actual accuracy in each bucket. Draw your error budget as a horizontal line, find where the accuracy curve crosses it, and read off the confidence value underneath. That is your threshold, derived from your traffic and your tolerance, not your gut. RouteLLM operationalizes the cost half of this directly: its `calibrate_threshold` workflow takes a target like fifty percent of calls to the strong model and returns the exact cutoff, a number like 0.11593, that produces it on a reference distribution.
+
+The research-grade method goes further and stops picking a scalar by hand at all. Two ideas carry it. First, calibrate the score itself so that a stated 0.8 actually corresponds to roughly eighty percent correct, typically by fitting a logistic regression on held-out data rather than trusting the model's raw self-reported confidence, which is poorly calibrated on its own. Second, optimize the thresholds across stages jointly, because the cutoff at stage one is coupled to stage two's error profile: how aggressively you should escalate depends on how good the thing you escalate to is. The Rational Tuning work from Caltech models this inter-stage dependency and optimizes the thresholds continuously, where grid search would be exponential in cascade depth. The headline is unintuitive: most of the value comes from making the routing score probabilistic, not from hand-tuning the final cutoff.
+
+If any of this feels familiar, it is the same instinct behind tuning a [recommendation system's](/blog/recommendation-systems) ranking threshold or a [distributed cache's](/blog/distributed-cache) admission policy: you do not guess the cutoff, you measure the curve and set it from a stated objective.
+
+## The error you are actually optimizing against
+
+It is tempting to frame routing as cost minimization, because the dollars are what you set out to save. That framing sets thresholds too aggressively, because it ignores that the two ways to misroute are not symmetric.
+
+```
+                 cheap model            expensive model
+              +------------------+   +---------------------+
+ easy query   |  right & cheap   |   |  correct, overpaid  |
+              |   the win  ✓✓     |   |   benign waste      |
+              +------------------+   +---------------------+
+ hard query   |  CHEAP & WRONG   |   |   right, expensive  |
+              |  the costly cell |   |   fine              |
+              +------------------+   +---------------------+
+```
+
+Three of these cells are fine. Overpaying on an easy query wastes a few cents and still returns a correct answer, which annoys your finance team and nobody else. The entire risk lives in one cell: a hard query sent to the cheap model, which returns a confidently wrong answer for a saving of cents, while the real cost is a user who re-submits, thumbs the answer down, or, worst of all, believes it and leaves quietly. These are silent quality regressions you will not detect until users churn, because nothing in your metrics flags a plausible wrong answer the way an error or a timeout would.
+
+That asymmetry is why the objective is cost subject to a quality floor, not raw cost. You set the threshold conservatively on purpose, accepting some benign overpayment, because the downside of the cheap-and-wrong cell dwarfs the savings that producing it bought you. A router that saves eighty percent at seventy percent quality is usually a bad trade, which is why you report the operating point as quality retained at a stated fraction of strong-model cost, never a bare percentage saved.
+
+One advanced move buys both sides at once. A standard cascade only defers upward; the Caltech early-abstention work adds a third action: when the cheap model is so uncertain that the expensive model is also likely to fail, do not escalate, abstain now and say you do not know. Across six benchmarks that delivered roughly thirteen percent lower cost and five percent lower error, paid for in about four more honest abstentions per hundred queries. Cheaper and more accurate at once, exactly the trade you want in finance or medical work where a confident wrong answer is the worst possible output.
+
+## How good a router can be, in real numbers
+
+Quote RouteLLM precisely, because its own results contain the most important lesson about routing and the headline number hides it.
+
+| Workload | Cost reduction vs strong-only | Quality retained | Multiplier |
+| --- | --- | --- | --- |
+| MT-Bench (chat) | over 85% | about 95% of GPT-4 | 3.66x |
+| MMLU (knowledge) | 45% | about 92% | 1.41x |
+| GSM8K (math) | 35% | about 87% | 1.49x |
+
+The same router delivers 3.66x on heterogeneous chat traffic and 1.41x on a uniformly hard knowledge benchmark. That spread is the insight. Routing pays enormously when traffic mixes easy and hard, because a large easy fraction can go to the cheap model, and thinly when almost every query is hard, because there is nothing cheap can safely take. Anyone who quotes the 3.66x without saying what workload produced it is selling the best case as the median. FrugalGPT's famous 98 percent cost reduction is the same trap: real on a favourable binary-classification task, but the top of the envelope, not what you should expect on arbitrary traffic. Treat both as ceilings and measure your own.
+
+One more thing worth knowing: the harder engineering, in a cascade specifically, is the verifier, not the dispatch. A perfect dispatcher with a bad correctness predictor escalates the wrong queries and you get neither the savings nor the quality. FrugalGPT's actual contribution is a cheap learned scorer that predicts correctness from the query and the answer, distinct from the model's own self-reported confidence, which you should not trust. The gate is the hard part, not the routing table. One reassurance: because difficulty is mostly a property of the query, a router tends to hold up when you swap backends, no rebuild needed.
+
+## What breaks in production
+
+The cost math and the threshold curve assume a static world, and production is not. Distribution shift breaks routers silently: a router calibrated on last quarter's traffic starts misrouting the moment a product launch changes what people ask. Worse than average drift is tail miscalibration, where accuracy on typical queries tells you nothing about behaviour on rare, high-stakes ones, exactly where a wrong answer costs the most. The only defence is observability: log every routing decision, its confidence, the tier served, and a downstream quality signal, then watch the escalation rate and per-bucket accuracy as drift alarms. A router that has quietly gone wrong looks identical to a healthy one until you correlate decisions with outcomes.
+
+Latency is a separate budget from cost. Escalation adds a full second model call, which can double the response time on every query that escalates, and on an interactive surface that can be disqualifying even when the cost math is favourable, a real reason to prefer predictive routing with its single call purely on p95 latency. The mechanics of serving these models under a latency target are the subject of [LLM inference serving](/blog/llm-inference-serving), and a router is really just an admission decision in front of that serving stack.
+
+The cost axis itself is not as simple as list price. Cache hits on Anthropic cost a tenth of the input price, batch processing is half price, and a newer tokenizer can emit more tokens for the same text, all of which move the real per-query cost away from the sticker, so a router optimizing on list price can make the wrong call once caching and batching are in play. This is also where [quantization](/blog/llm-quantization) enters: a quantized cheap model shifts both its cost and its quality, moving every break-even and threshold you derived, so changing your cheap tier's precision is a recalibration, never a free swap.
+
+## How a senior decides
+
+Strip it to the decisions that matter and they stack in a sensible order.
+
+| Decision | Default move | Why |
+| --- | --- | --- |
+| Which strategy | Predictive for latency-critical, cascade for quality-critical, semantic when intents enumerate | The three have different cost and latency profiles; match them to the traffic |
+| Whether to cascade at all | Check `p < 1 - cost_C/cost_E` before building | If escalation is too high, cheap-first costs more than direct-to-expensive |
+| The threshold | Calibrate the score, set the cutoff from a per-bucket accuracy curve against a stated error budget | Intuition-set thresholds are miscalibrated by default |
+| What you optimize | Cost subject to a quality floor, reported as quality at a stated fraction of strong-model cost | The cheap-and-wrong cell can cost more than the tokens it saved, and bare "percent saved" hides the operating point |
+| Observability | Log every decision, confidence, tier, and outcome | Miscalibration is undetectable without it |
+| When not to route | Below roughly 10k requests/day, or on uniformly hard traffic | The savings do not clear the engineering and classifier overhead |
+
+None of these is exotic, and that is the point. The reasoning is the same kind you would bring to any capacity-versus-cost tradeoff in a [system design interview](/blog/system-design-interview-framework): name the workload, write the cost equation, find the break-even, decide against a stated objective rather than a vibe. The same instinct runs through the rest of this batch, where [embeddings](/blog/embeddings) are the substrate semantic routing runs on and the [probabilistic structures](/blog/probabilistic-data-structures) that keep a router's bookkeeping cheap are what make a hot path affordable. In production I have watched this discipline turn a model bill people argued about into one nobody noticed, the document pipeline in [IntelliFill](/case-study/intellifill) being the clearest case: most pages were a cheap extraction, a few needed the strong model, and the only hard part was drawing the line between them honestly.
+
+The honest landing is this. You cannot make every query cheap, because some really are hard and deserve the expensive model. What you control is whether the easy ones quietly subsidize a frontier price they never needed, and whether the line between cheap and expensive was measured or guessed. Measure it, and the FAQ lookup stops costing what the proof costs. Guess it, and you will either pay frontier prices for everything or ship confident wrong answers to the users you were trying to keep.
+
+## FAQ
+
+<FAQ />

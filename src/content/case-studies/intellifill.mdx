@@ -1,0 +1,198 @@
+export const meta = {
+  slug: 'intellifill',
+  title: 'IntelliFill: Multi-Agent LLM Pipeline for Document Extraction | Naqeebali Shamsi',
+  description: 'A TypeScript LangGraph multi-agent pipeline that auto-fills government PDFs via a confidence-weighted LLM+regex merge, ICAO-9303 MRZ checksums, and a per-provider LLM circuit breaker.',
+  headline: 'Earning the Right to Write a Passport Number into a Legal Form',
+  deck: 'Five specialized agents on a LangGraph StateGraph, two extractors reconciled per field, and a confidence score honest enough to say "I am not sure", retrofitted behind seven flags onto a live PII pipeline.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  tags: ['TypeScript', 'LangGraph', 'system design', 'LLM', 'OCR', 'Prisma', 'multi-agent', 'distributed systems'],
+  metrics: [
+    { value: '5', label: 'Specialized agents on one StateGraph' },
+    { value: '3', label: 'LLM providers behind a circuit breaker' },
+    { value: '274', label: 'Agent/workflow unit tests (measured, LLM mocked)' },
+    { value: '38', label: 'Prisma models / 13 migrations' },
+    { value: '85', label: 'Vision confidence cap (heuristic, by choice)' },
+  ],
+  links: [
+    { label: 'GitHub', href: 'https://github.com/naqeebali-shamsi/portfolio' },
+  ],
+  faq: [
+    {
+      q: 'Why run both an LLM and a regex extractor on every document instead of trusting the LLM?',
+      a: "Because there is no ground truth at inference time, and agreement between two independent extractors is the cheapest signal for catching a confident-but-wrong value. mergeExtractionResults() reconciles them field by field: a Levenshtein-gated agreement (>0.85 similarity) earns a +10 confidence boost on the LLM field; on a close disagreement (confidences within 10 points) the pattern value is discounted 0.85x so the LLM wins the tie; otherwise the higher confidence wins and a null source defers to the non-null one. Regex contributes precision on structured IDs (the Emirates ID 784-YYYY-XXXXXXX-X shape) that the LLM lacks. The cost is real: two extractors plus up to two self-correction passes multiply latency and spend, and the merge constants are hand-tuned, not learned.",
+    },
+    {
+      q: 'How does it catch a passport number that is plausible but wrong?',
+      a: "The Machine-Readable Zone encodes its own check digits, so a plausible-but-wrong value fails arithmetic even when it looks right. qaAgent.ts implements ICAO-9303 TD3: mrzCheckDigit() applies the repeating 7-3-1 weighting mod 10, and validateMrzLine2() recomputes the passport-number (index 9), date-of-birth (index 19), expiry (index 27), and composite (index 43) check digits at exact offsets on the 44-character line. Then crossValidateMrzFields() compares the MRZ-decoded passport number against the separately extracted field and flags a mismatch for human review. Honest failure mode: the checksum validator fails loudly on a malformed line (a non-44-char MRZ returns valid:false), but the cross-check is the lenient one: crossValidateMrzFields() returns valid:true and skips when the MRZ isn't a clean 44 chars, so the one region it leans on is trusted to have OCR'd correctly.",
+    },
+    {
+      q: 'What happens when the primary LLM provider rate-limits or goes down?',
+      a: "llmClient.ts fails over in priority order Gemini -> Claude -> OpenAI behind a per-provider CircuitBreaker that opens after 3 failures and half-opens after a 60-second reset; generate() throws only when every available provider is exhausted. Concurrency is bounded independently by a hand-rolled Semaphore(5) on Gemini calls, and each SDK is lazy-imported so an unused provider never loads. The breaker is deliberately lenient: half-open admits all requests in the reset window (no single-probe gate) and any one success deletes the failure count. It is also process-local, so global health across multiple workers is not coordinated.",
+    },
+    {
+      q: 'How do you ship a new LLM pipeline onto a live production PII flow without a big-bang cutover?',
+      a: "You feature-flag everything and design for a staged rollout. Seven env-var flags gate every AI capability (instant rollback, no deploy), each job carries isShadowMode and an abTestVariant, and the Prisma schema has a ProcessingComparison table (fieldDiff, matchingFieldsCount, accuracyDelta, winner) plus AgentMetrics and UserFeedback, read by an admin accuracy dashboard. Honest scope: the read/dashboard side is built but the write/measurement path is not. No committed code runs the legacy pipeline in shadow, diffs the fields, or writes a comparison row. So the apparatus to measure non-regression exists as schema and read surface; the loop is not yet closed.",
+    },
+    {
+      q: 'Why a LangGraph StateGraph instead of a plain async function with try/catch and retries?',
+      a: "Because error recovery has to route backward. When QA fails, the pipeline branches to a recovery node that classifies the failure into one of nine categories and routes back to extract or classify, or escalates to a human, capped at 3 retries under a 5-minute Promise.race. Expressing that as conditional graph edges (routeAfterQA, routeAfterErrorRecovery) keeps the control flow legible where nested try/catch with manual counters would tangle. The cost: graph.compile() is currently called with no checkpointer, so the graph is in-memory and not resumable. An interrupted run restarts from scratch on BullMQ retry, and the MultiAgentCheckpoint table is never written. Resilience comes from BullMQ (3 attempts, a 10-minute lock with 5-minute renew) plus the in-graph recovery loop, not from LangGraph state persistence.",
+    },
+  ],
+};
+
+IntelliFill is a TypeScript document-processing pipeline that extracts structured fields from identity and business documents (passports, Emirates IDs, visas, trade licenses, invoices) and auto-fills government PDF forms. The core is a LangGraph `StateGraph` of five specialized agents (classify, extract, map, QA, error-recover) behind a hybrid OCR front-end and drained into a `pdf-lib` AcroForm filler, with Gemini/Claude/OpenAI behind the LLM calls and Postgres (38 Prisma models) holding job state. The motivating stakes are concrete: in UAE back-office work a person retypes the same name and ID number off five documents into a dozen government PDFs, and one transposed digit gets the whole application rejected. The engineering that mattered was never getting an LLM to read the documents. It was building a per-field confidence score honest enough to know when not to trust what the model just read, and shipping it behind flags without breaking a live PII flow.
+
+<KeyTakeaways items={[
+  'The design problem is not extraction. It is calibration: turning two noisy extractors with no ground truth into one trustworthy per-field confidence, and an explicit "this needs a human" path.',
+  'Every document is read twice (LLM + regex) and reconciled in mergeExtractionResults(): agreement earns a +10 boost gated by an 85%-Levenshtein check; a close disagreement discounts the pattern value 0.85x so the LLM wins the tie. The merge constants are hand-tuned, not learned.',
+  'Passports are checksum-validated in code against ICAO-9303: all four TD3 MRZ check digits are recomputed with the 7-3-1 weighting, then cross-checked against the visually-extracted passport number.',
+  'The LLM tier fails over Gemini -> Claude -> OpenAI behind a per-provider circuit breaker (open at 3, half-open at 60s) with a process-local Semaphore(5) for backpressure. Both are deliberately simple and deliberately process-local.',
+  'It is a risk-managed retrofit behind 7 feature flags with a shadow/A-B comparison SCHEMA and admin dashboard built, but the comparison WRITE path is not yet wired, so the accuracy delta is designed-for, not yet measured. The honest, derivable number is 274 passing agent unit tests.',
+]} />
+
+## The problem
+
+The manual reality is a person at a desk with five documents and a dozen forms. They read a name off a passport, an ID number off an Emirates ID, an expiry date off a visa, a license number off a trade license, and retype all of it into government PDFs: text fields, checkboxes, dropdowns, radio groups, flattened non-interactive scans. The source documents are sensitive PII. They arrive scanned, photographed at bad angles, frequently bilingual (English and Arabic). A single wrong digit in an ID number bounces the application.
+
+Off-the-shelf OCR does not solve this. Tesseract alone gets you raw text, not structured, validated, form-ready fields. It does not know that `784-1990-1234567-1` is an Emirates ID with a checksum, that an expiry date must fall after the issue date, or that the MRZ printed on a passport must internally agree with the visually-printed passport number.
+
+"Just call a vision model on the image" does not solve it either. You get fields, but no confidence calibration, no fallback when the provider rate-limits you, no audit trail, no cost control, and no guarantee the JSON even parses. The bet behind IntelliFill is that reliable document automation is not one model call. It is an orchestrated pipeline of specialized agents, each with deterministic rule-based fallbacks, per-field confidence scoring, and an explicit human-escalation path. The hard part is everything around the LLM that makes its output trustworthy enough to write into a legal form.
+
+## Constraints
+
+Four things bounded every decision, and they are the reason the design looks the way it does.
+
+**It was a retrofit onto a live, in-production pipeline on sensitive PII.** This is the dominant constraint. A big-bang cutover was off the table. The new multi-agent system had to ship behind feature flags, prove non-regression against the existing extractor, then graduate through A/B traffic. Every "is this clever" decision also had to answer "is this shippable without breaking a production PII flow."
+
+**Document text is hostile input by default.** The text fed to the LLM comes from untrusted files, so a malicious document is a prompt-injection vector. This is a trust boundary, and I modeled it as one. `sanitizeLLMInput()` strips template syntax (`{{}}`, `${}`, `{%%}`), fake XML role tags (`<system>`, `<user>`, `<assistant>`), and override phrases ("ignore/disregard/forget previous instructions"), and clamps length to a 50k cap before any text reaches a prompt. Because the pipeline logs heavily over passports and bank statements, `piiSafeLogger` wraps Pino so redaction is the default path, not an opt-in: it drops `NEVER_LOG` fields (password/token/ssn), redacts a PII set (`passportNumber`, `emiratesId`, `iban`, `rawText`), and pattern-redacts email/phone/Emirates-ID-shaped strings recursively. Every agent imports it as `logger`; the raw Pino logger is never imported directly. That is defense-in-depth and data minimization, applied where untrusted PII enters and where it would otherwise leak into logs.
+
+**Brownfield version hell.** The multi-agent PoC pulled Express 5 into a 4.x codebase; the integration audit flagged it as a blocking compatibility issue, so it was downgraded to 4.x. BullMQ landed alongside the existing Bull. Tesseract.js was aligned on v7. The resolution was deliberately conservative: accept two coexisting queue systems as temporary carrying cost rather than force-upgrade everything and destabilize the legacy path. A reversible decision over an irreversible one.
+
+**Cost control by instinct, zero budget.** Gemini is primary because it is the cheapest provider with strong vision for scanned docs. Provider SDKs are lazy-imported so an unused one never loads. Every call estimates token cost from a per-1k-token price table, an estimate (`length / 4`), not billed truth, and labeled as such.
+
+## Architecture
+
+The document-processing core is a LangGraph `StateGraph` of six nodes (`classify`, `extract`, `map`, `qa`, `errorRecover`, `finalize`), wired `START -> classify -> extract -> map -> qa`, with conditional edges `qa -> {finalize | errorRecover}` via `routeAfterQA` and `errorRecover -> {extract | classify | finalize}` via `routeAfterErrorRecovery`, capped at `MAX_RETRIES = 3` and wrapped in a 5-minute hard `Promise.race` timeout. The graph defines ~19 state channels, each with a last-write-wins reducer `(x, y) => y ?? x`: a new node's output replaces the prior value unless it is `undefined`. That is the consistency model: explicit, total, and easy to reason about.
+
+I chose a `StateGraph` over a linear promise chain on purpose. Error recovery has to route *backward*: a failed QA pass needs to send the document to a recovery node that classifies the failure and decides re-extract vs re-classify vs escalate. Encoding that as graph edges keeps the control flow explicit. The rejected alternative, a hand-written async function with nested try/catch and manual retry counters, gets unwieldy and non-resumable the moment you need to retry to a prior stage. The cost I paid is named plainly below: the graph is compiled with no checkpointer, so the "resumable" benefit LangGraph advertises is unrealized today.
+
+The seams are deliberate. (1) OCR text production is decoupled from extraction: the graph consumes `state.ocrData.rawText`, so the source of text is swappable. (2) All LLM access funnels through `llmClient`/`LLMClientService`, so provider failover, circuit-breaking, and concurrency are single-sourced. (3) The legacy Bull OCR queue and the new BullMQ multi-agent queue are intentionally isolated during migration. (4) PII handling is bounded at the trust boundary by `sanitizeLLMInput` (prompts) and `piiSafeLogger` (logs). (5) The new pipeline is bounded from production behind seven flags. (6) The per-user cache scope is the cross-tenant data boundary.
+
+The data flow: an upload creates a `Document` row and enqueues on the BullMQ `multiagent-processing` queue with a deterministic job ID `multiagent-<documentId>` for dedup. The worker flips DB status to `PROCESSING`/`CLASSIFYING` and runs the compiled graph via `processDocument()`: classify (Gemini over OCR text -> one of 12 categories) -> extract (Gemini + regex merge + optional self-correction, userId-scoped cache) -> map (tiered alias/semantic canonicalization) -> qa (category rules + MRZ checksum + date cross-checks -> routing decision) -> finalize (success flag, overall + per-field confidence, `needsReview` + reasons). The worker writes `extractedData`/`confidence` back to the row and pushes a `multiagent_completed` event over SSE.
+
+<TechStack rows={[
+  { layer: 'Orchestration', tech: 'LangGraph ^0.2.0', why: 'StateGraph with conditional edges; QA re-routing and error recovery are first-class transitions, not ad-hoc if/else. Last-write-wins channel reducers. Compiled without a checkpointer (resumability not yet wired).' },
+  { layer: 'Runtime', tech: 'Node + TypeScript + Express ^4.18.2', why: 'Express pinned to 4.x after the PoC pulled 5.x; typed agent-state contracts end-to-end.' },
+  { layer: 'LLM tier', tech: 'Gemini + Claude + OpenAI', why: 'Priority-ordered failover behind a per-provider circuit breaker; process-local Semaphore(5) for backpressure; SDKs lazy-imported.' },
+  { layer: 'OCR / Vision', tech: 'Tesseract.js ^7 (eng+ara) + Gemini Vision + GLM-OCR + Sharp', why: 'Hybrid smart-routing by complexity score; two-stage orientation correction; VLM confidence hard-capped at 85.' },
+  { layer: 'Form filling', tech: 'pdf-lib ^1.17.1', why: 'Type-aware AcroForm filling (text/checkbox/dropdown/radio/option-list) with a post-fill verification reload that diffs written bytes against intent.' },
+  { layer: 'Queue / jobs', tech: 'BullMQ ^5 (+ legacy Bull) on Redis', why: 'Dedicated worker (concurrency 2), deterministic jobId dedup, 10-min lock with 5-min renew. Two queue systems coexist during migration.' },
+  { layer: 'Data', tech: 'Prisma ^6 + PostgreSQL (38 models, 13 migrations)', why: 'Job state, an intended shadow/A-B comparison layer, per-agent telemetry, RLS, and an exploratory ML/vector-search track.' },
+  { layer: 'Observability', tech: 'Langfuse + Pino + prom-client', why: 'LLM tracing behind a flag; PII-safe logger as the only logger; SSE realtime with per-user connection caps.' },
+]} />
+
+## The hard problems
+
+### How do you get a trustworthy confidence score out of an LLM extractor?
+
+An LLM will confidently hallucinate a passport number. A regex will confidently match the wrong string. Neither source is reliable alone, and naively "preferring the LLM" throws away the regex's precision on structured IDs. The real problem is calibration under no ground truth: combine two noisy extractors that sometimes agree, sometimes disagree by a typo, and sometimes return null, into one defensible confidence number per field.
+
+The mechanism is cross-validation as a correctness proxy. `extractorAgent.ts` (~1800 lines) runs Gemini *and* regex extraction on every document, then `mergeExtractionResults()` unions the two field sets and resolves each field. Only-LLM or only-pattern passes through. When both are present, `valuesMatch()` gates agreement (exact, or substring containment for strings longer than 5, or a normalized Levenshtein similarity above `0.85` for strings longer than 3), and agreement applies a `+10` `CROSS_VALIDATION_BOOST` to the *LLM* field (clamped to 100). On disagreement, if the confidences sit within `CONFIDENCE_CLOSE_THRESHOLD = 10` points it compares `conf_llm` against `conf_pattern * 0.85` (`LLM_PREFERENCE_MULTIPLIER`), so the LLM wins close ties; otherwise the higher confidence wins, and a remaining null prefers the non-null source. A final pass multiplies *only* pattern-sourced confidences by `ocrConfidence/100`, so the OCR quality discount lands where it belongs. The invariant holds throughout: confidence stays in `[0,100]`.
+
+```ts
+if (valuesAgree && llmValue !== null) {
+  const boosted = Math.min(100, llmField.confidence + CROSS_VALIDATION_BOOST);
+  merged[fieldName] = { ...llmField, confidence: boosted, source: 'llm' };
+  continue;
+}
+```
+
+There is a deliberate, documented bias here: the boost is keyed on the LLM field even when the pattern field's confidence is higher. That is a choice (the LLM is treated as the primary reader, the regex as a corroborating witness), not an accident.
+
+<Callout type="tradeoff">
+Running both extractors plus up to two self-correction passes roughly doubles extraction work per document, multiplying latency and LLM spend. And the merge constants (the 10-point bands, the 0.85 preference multiplier, the 0.85 similarity bar) are hand-tuned heuristics, not learned. They are defensible and visibly the product of iteration, but not provably optimal. The honest framing: this is calibration by engineering judgment, not by a trained calibrator.
+</Callout>
+
+### How do you catch a passport number that is plausible but wrong? ICAO-9303 in code
+
+The hardest extraction failures are the ones that look correct. OCR or an LLM can return a plausible-but-wrong passport number, and nothing about the value itself flags it. But the Machine-Readable Zone is a parity-coded data structure: it carries its own check digits under a non-obvious weighting (7, 3, 1 repeating, letters mapped A=10 through Z=35, `<` as filler and as zero), and the printed fields must agree with it. That is a checksum problem, and checksums are the right tool when the value cannot otherwise be trusted.
+
+`qaAgent.ts` implements the full TD3 algorithm against the exact positional layout. `mrzCharValue()` maps characters per spec. `mrzCheckDigit()` applies the 7-3-1 weighted modulo-10 sum. `validateMrzLine2()` requires a cleaned 44-character line and verifies four digits: the passport-number check at index 9 over `[0,9)`, the date-of-birth check at index 19 over `[13,19)`, the expiry check at index 27 over `[21,27)`, and the composite check at index 43 over the concatenation `[0,10) + [13,20) + [21,43)`. Then `crossValidateMrzFields()` strips trailing `<` filler from the MRZ passport substring, normalizes the separately-extracted `passport_number` (spaces and dashes removed, uppercased), and raises a mismatch issue with a human-review suggestion if they differ. `PASSPORT_RULES` wires both validators onto the passport fields.
+
+This is the spec-grind that catches the failure mode that actually matters: confident, plausible, wrong. It is also where the QA agent earns its keep beyond field presence.
+
+<Callout type="tradeoff">
+The implementation is TD3-specific; TD1/TD2 ID formats are not checksum-validated. And it assumes the MRZ itself OCR'd cleanly: a non-44-character or garbled MRZ returns `valid: true` and *skips* cross-validation rather than failing loudly. So the one region the check leans on is implicitly trusted to have been read correctly. That is a known soft spot, documented rather than papered over.
+</Callout>
+
+### The QA agent is a deterministic scoring state machine, not "validation rules"
+
+It would be easy to describe QA as "checks the fields." It is more than that: a weighted additive rubric that turns a bag of per-field signals into a single 0–100 score and a binary human-review decision, deterministically and auditably.
+
+The score starts at `BASE_SCORE = 45`, then `+20` if all required fields are present, `+15` if there are zero error-fields, `+10` (or `+5` partial) by average-confidence tier (`HIGH >= 90` full, `ACCEPTABLE >= 80` half), and `+10` if there is no cross-field date mismatch. Then it subtracts `-10` per error-field and `-3` per warning-field, clamped to `[0,100]`. The `CONFIDENCE_THRESHOLDS` (`LOW 50` / `WARNING 70` / `ACCEPTABLE 80` / `HIGH 90`) classify each field as error vs warning before scoring. `passed` is true only when there are no error-severity issues *and* the score is at least 60. And the human-review predicate is a multi-signal OR: `requiresHumanReview = hasErrors || avgConfidence < 70 || issues.length >= 3 || missing required`. That predicate is the whole point. It is the explicit gate between "machine writes this into a form" and "a person looks first."
+
+### What happens when the LLM provider rate-limits? Failover with a hand-rolled circuit breaker
+
+A pipeline that depends on one LLM provider inherits that provider's rate limits, quota caps, and outages. Blindly retrying a down provider wastes time and money; hammering an LLM with unbounded concurrency triggers 429s that cascade. You need per-provider health tracking, automatic failover in priority order, and backpressure, without a heavyweight dependency.
+
+`llmClient.ts` defines a per-provider `CircuitBreaker` holding `Map<provider, {failures, lastFailure, isOpen}>`. `recordFailure()` increments and opens at `failureThreshold = 3`; `isOpen()` returns true while open until `resetTimeMs = 60000` elapses, then returns false to admit a probe; `recordSuccess()` deletes the entry entirely (full reset). `getAvailableProviders()` filters by enabled + API-key presence + (`MULTI_PROVIDER` flag OR provider is Gemini) + not-open, sorted by priority 1/2/3. `generate()` iterates the available providers, recording success or failure per attempt and throwing the last error only when all are exhausted. SDKs are lazy-imported, so an unused provider never loads. Separately, `LLMClientService` exposes a hand-rolled `Semaphore(5)` and wraps every extraction and self-correction call in `geminiSemaphore.run()`: a counting semaphore as explicit flow control, so in-flight Gemini calls never exceed five.
+
+I hand-rolled this instead of routing LLM calls through `opossum`, which the codebase *does* keep for DB and infrastructure health (Supabase, Ollama, MCP). The per-provider state and lazy imports were simple enough to own, and keeping the failover logic out of a generic breaker abstraction kept it visible and unit-testable.
+
+<Callout type="tradeoff">
+This breaker is lenient by design, and that is worth stating precisely: half-open admits *all* requests in the 60-second window (there is no single-probe gate), and *any* one success deletes the entire failure count. Both the breaker and the semaphore are *process-local*, so true global concurrency and health across multiple worker instances are not coordinated. N workers can each independently hammer a provider that is globally rate-limited. And now two breaker implementations coexist (hand-rolled for LLM, opossum for infra). The token cost is also an estimate (`length / 4`), not billed truth.
+</Callout>
+
+### Shipping onto a live PII flow: shadow mode, A/B, and the half-built measurement loop
+
+Replacing an in-production extraction pipeline with a multi-agent LLM one is a high-blast-radius change on sensitive PII. A big-bang cutover risks silently degrading accuracy with no way to prove the new system is better. The design answer is to prove non-regression *before* switching users, with instant rollback if anything regresses.
+
+Every AI capability is gated by an env-var `FEATURE_FLAGS` object with seven flags (`GLM_OCR`, `VLM_OCR`, `STRUCTURED_OUTPUTS`, `SELF_CORRECTION`, `MULTI_PROVIDER`, `LANGFUSE`, `EXTRACTION_CACHE`), each killable without a deploy. The queue job carries `isShadowMode` and an `abTestVariant`. The Prisma schema is built for measurement: `ProcessingComparison` (legacy vs multi-agent: `fieldDiff`, `matchingFieldsCount`, `totalFieldsCount`, `accuracyDelta`, `winner`, and `legacyProcessingTimeMs`/`multiAgentProcessingTimeMs` for latency), `AgentMetrics` (per-agent `processingTimeMs`, `success`, `confidenceScore`, `qualityScore`, `errorType`, indexed by agent+time), and `UserFeedback` (`accuracyRating` 1–5, `isCorrect`, per-field feedback). `admin-accuracy.routes.ts` aggregates these into overall accuracy, per-agent success rate, and a 30-day trend, surfaced in an `AdminAccuracyDashboard`. Documented exit criteria: 95% shadow success and 90% accuracy match before A/B.
+
+Here is the part the original write-up got wrong, and the correction matters more than anything else in this study. **The measurement loop is only half-built.** The schema and the read/dashboard side exist. But a repo-wide search for writers, `(processingComparison|agentMetrics|userFeedback).(create|upsert|update)`, finds *none*, and no committed code runs the legacy pipeline in parallel to diff its output. So `isShadowMode`/`abTestVariant` flow through the queue and the dashboard would render, but it would render zeros, because nothing populates the tables. The accuracy delta the architecture is designed to measure cannot actually be measured yet. The instrumentation *design* is real and strong; the instrumentation *data* does not exist in committed code.
+
+<Callout type="insight" title="The most mature line of code in the pipeline is a comment that refuses to lie">
+The OCR layer routes pages between Tesseract, Gemini Vision, and GLM-OCR by complexity score. But a vision model's "confidence" is not a calibrated probability. So `estimateVLMConfidence()` is documented as a heuristic and hard-capped at 85, `Math.max(10, Math.min(confidence, 85))`, explicitly refusing to inject a fake 99% into the merge and QA math that gate human review. That cap is the whole philosophy in one constant: honest about the gap between *plausible* and *verified*. It costs the ceiling on genuinely clean scans (a correct VLM read can never score above 85), and it is a conservative bound by choice, not an accuracy-maximizing one.
+</Callout>
+
+### Two LLD details that carry real weight: idempotent enqueue and a PII-scoped cache
+
+**The BullMQ job contract is an idempotency and authorization boundary.** `enqueueMultiagentProcessing()` rejects a `filePath` containing `..` or a null byte (path-traversal defense) and rejects a missing `documentId`/`userId`. It computes `jobId = 'multiagent-<documentId>'`; if a job with that id already exists in `{waiting, active, delayed}` it returns the existing job rather than enqueuing a duplicate: a deterministic key making enqueue idempotent over pending states. The worker runs concurrency 2, `lockDuration` 600000ms (stall threshold), `lockRenewTime` 300000ms, `stalledInterval` 600000ms; retention is 24h/1000 complete, 7d/500 failed; `attempts` is 3. On the read side, `getMultiagentJobStatus()` returns `null` when the requesting user id does not match `job.data.userId` (IDOR prevention) and strips `filePath`/`userId` from the response (least-data exposure). It even tolerates BullMQ's stringified `returnvalue` (`typeof === 'string' ? JSON.parse : object`). That is the kind of edge that only shows up once you have actually run the thing in anger.
+
+**The extraction cache makes invalidation and multi-tenancy explicit.** `generateCacheKey()` lowercases and whitespace-collapses the text, SHA-256 hashes it, takes the first 16 hex chars, and forms `ext:{category}:{hash}`. `get()` tries Redis (`setex` TTL 86400s), validates the stored `cacheVersion === '1.0.0'` (else deletes and misses: a one-line global invalidation lever), and falls back to an in-memory `Map` with LRU eviction at `MAX_ENTRIES = 10000`. The critical invariant lives at the call site: the extractor scopes the key by user (`` `${userId}:${text}` ``) *before* hashing, so two users with byte-identical document text never share a cache entry. Cache invalidation and cross-tenant isolation are textbook-hard; both are confronted head-on rather than hoped away.
+
+## By the numbers
+
+These are scope, rigor, and design-surface signals pulled from the repo, not accuracy proof. I am keeping the distinction sharp on purpose.
+
+- **5 agents** on the LangGraph pipeline (classifier, extractor, mapper, QA, error-recovery), across **6 graph nodes** with conditional routing and last-write-wins channel reducers.
+- **274 unit tests pass** across 6 suites in ~7–8s with the LLM fully mocked (`jest.mock`, zero external/paid calls): `npx jest src/multiagent/agents/__tests__ src/multiagent/__tests__/workflow.test.ts`. The qaAgent + extractorAgent subset alone is 91 tests, exercising the deterministic ICAO-9303 MRZ checksum and the confidence-weighted merge. This is the one category of real, derivable measurement. It validates *algorithmic correctness*, not real-world extraction accuracy.
+- **3 LLM providers** in the priority failover chain; **~9–10 of 12 declared document categories** are fully supported end-to-end (the enum lists 12 including `UNKNOWN`, but `ESTABLISHMENT_CARD` and `MOA` have no extraction config or QA rules and fall through to generic extraction).
+- **38 Prisma models** across **13 migrations**, including job state, the comparison/telemetry/feedback tables, user- and org-level RLS, an audit-log/CSP-report trail, a `FieldInferenceCache` (learned field->profile by hash with hitCount), and a vector-search track (`DocumentChunk`/`DocumentSource`).
+- **7 feature flags**, worker concurrency **2**, a Gemini `Semaphore(5)`, a **10-minute** job lock with **5-minute** renew, and a **5-minute** hard `Promise.race` per document with `MAX_RETRIES = 3`.
+
+The 274 passing agent tests are the number I trust most here: the confidence and checksum logic is tested, not vibes. Everything labeled "accuracy" is a target, not a result, and I will not pretend otherwise.
+
+{/* TODO(verify): real-world extraction accuracy. Planning docs (.taskmaster/docs/MULTIAGENT-INTEGRATION-SUMMARY.md) target 90% field extraction, P95 < 15s, and a 150+ document ground-truth set, but no achieved numbers, labeled fixtures, or eval result files exist in the repo. The ProcessingComparison/AgentMetrics/UserFeedback write path is unwired, so the dashboard would show zeros. */}
+{/* TODO(verify): documents processed, active users, throughput. Not present in the repo. */}
+
+## What was hard / what I'd change
+
+The least-AI thing in this whole project is the Day-1 reality. The internal integration audit graded the initial PoC **68/100**. It flagged roughly **85 `any` types** and under-20% test coverage at PoC stage, and it found **exposed API keys in `.env`** (Google/Groq/Perplexity) plus an **auth bypass** that had to be fixed and the keys rotated before anything else proceeded. That is what shipping AI on sensitive data actually looks like before it looks like a clean StateGraph diagram.
+
+The subtle technical work was confidence, not extraction. Getting an LLM to spit out fields is easy. Attaching a number to each field that downstream code is allowed to trust is hard. The merge algorithm (its cross-validation boost, its 0.85 pattern discount, its 0.85-Levenshtein agreement check) is the product of iteration, and the cap-at-85 comment is the most honest line in the codebase.
+
+Three things I would change, stated as debt rather than dressed up as features:
+
+- **Close the measurement loop.** The shadow/A-B apparatus is half-built: schema and dashboard exist, the write path and the parallel legacy run do not. Until a comparison row is actually written, "the new pipeline is more accurate" is a hypothesis, not a finding. This is the single most important gap.
+- **Wire the checkpointer.** `graph.compile()` takes no checkpointer and `MultiAgentCheckpoint` (a `Bytes` state blob with a `parentCheckpointId` DAG) is never written. So the resilience story is BullMQ retries plus the in-graph recovery loop: an interrupted graph restarts from scratch, it does not resume mid-pipeline. The table is built for resumability that is not yet turned on.
+- **Reconcile the model names.** Three modules name three different Gemini models: the extractor and `classifyNode` hardcode `gemini-2.5-flash`, `llmClient` defaults to `gemini-3-flash-preview`, and the VLM config defaults to `gemini-1.5-pro`. The live extraction path uses 2.5-flash; the unified client path uses 3-flash-preview. That is drift to reconcile, not a feature.
+
+There is also an exploratory ML track I am scoping honestly because it is real engineering even though it is off the critical path. `FieldMappingModel` is a complete TensorFlow.js MLP: Input(8 features) -> Dense64 relu (L2 1e-3) -> Dropout .2 -> Dense32 relu -> Dropout .2 -> Dense16 relu -> Dense1 sigmoid, compiled with Adam(1e-3) and binary cross-entropy, with an `evaluateModel()` that computes a full TP/FP/TN/FN confusion matrix into accuracy/precision/recall/F1, backed by an `MlModel` registry table (those same columns plus `trainingSamples`). But it is imported only by a memory benchmark (`scripts/test-memory.ts`); the live mapper is deterministic and rule-based (mapNode logs `model: 'rule-based'`), and no trained weights are committed. I chose the rule ladder for production precisely because it is transparent and debuggable: `findAliasMatch` returns exact(100)/alias(90)/pattern(85), then `findSemanticMatch` buckets a normalized-Levenshtein similarity above 0.6 into 80/70/60, and each field carries a `matchType` so any mapping can be audited. The ML model demonstrates the literacy (topology, offline P/R/F1, a model registry); the rule mapper is what actually ships. Keeping that boundary honest matters more than claiming a neural matcher I did not put on the path.
+
+## FAQ
+
+<FAQ />
+
+The clever part was never getting an LLM to read a passport. It was building the machinery that knows when not to believe it, and being honest about which parts of that machinery are wired, and which are still just schema.

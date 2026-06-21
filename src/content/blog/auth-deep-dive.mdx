@@ -1,0 +1,155 @@
+export const meta = {
+  slug: 'auth-deep-dive',
+  title: 'Sessions, Tokens, and OAuth2: How Auth Works and Where It Breaks',
+  description:
+    'Sessions revoke instantly but cost a lookup. JWTs verify with zero I/O yet cannot be revoked. The whole auth debate is one number: your revocation window.',
+  headline: 'Sessions, Tokens, and OAuth2: How Auth Works and Where It Breaks',
+  deck: 'Every auth design is a bet on one number: how long a stolen credential stays valid after you want it dead.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '16 min',
+  tags: ['auth', 'oauth2', 'jwt', 'sessions', 'security', 'system-design'],
+  faq: [
+    {
+      q: 'Are JWTs more secure than server-side sessions?',
+      a: "No. They are stateless to verify, which is a different property from secure. A JWT is checked with a signature and zero I/O, so nothing is consulted at verification time, which means you cannot revoke it before it expires. A server-side session is an opaque random id that points at state you control, so revocation is deleting one row. Statelessness actively costs you revocability. For a normal web app, an opaque session id plus Redis is simpler, smaller on the wire, and instantly revocable.",
+    },
+    {
+      q: 'Why are JWTs hard to revoke?',
+      a: 'Because nothing is checked when one is verified. The whole point of a JWT is that the signature proves validity without a database lookup, so a logout, a password reset, or a firing cannot reach back and invalidate a token that is already out there. It stays valid until its exp claim. Every fix either reintroduces a per-request lookup, which is sessions with extra steps, or shrinks the damage window with short-lived access tokens plus a revocable refresh token.',
+    },
+    {
+      q: 'What is the difference between OAuth2 and OpenID Connect?',
+      a: 'OAuth2 is an authorization framework. It answers what a client is allowed to do, and it hands out an access token scoped to an API. It was never designed to tell you who the user is. OpenID Connect is a thin identity layer on top of OAuth2 that adds an ID token, a signed JWT whose audience is your client, asserting who authenticated. Using a raw OAuth access token as proof of login is a real bug class, because that token is not audience-bound to you.',
+    },
+    {
+      q: 'Should a single-page app store tokens in localStorage?',
+      a: 'No. Anything in localStorage is readable by any injected script, so one XSS hole exfiltrates the token. Cookies dodge that but invite CSRF, since they auto-attach to cross-site requests. The current IETF guidance for browser apps is to not put tokens in the browser at all: a same-site backend holds the tokens as a confidential OAuth client and hands the browser only an HttpOnly cookie session. That is the backend-for-frontend pattern.',
+    },
+    {
+      q: 'What is PKCE and who needs it?',
+      a: 'PKCE is Proof Key for Code Exchange. The client generates a random code_verifier, sends only its SHA-256 hash up front as the code_challenge, and presents the raw verifier when redeeming the authorization code. An attacker who intercepts the code cannot exchange it without the verifier, which never left the client. The modern security baseline (RFC 9700) makes it mandatory for public clients like SPAs and mobile apps, and recommends it even for confidential server clients, because it defends code injection regardless of client type.',
+    },
+  ],
+}
+
+Auth is the one part of your system where the failure mode is not a 500. It is a stranger holding a credential that still works after you wanted it dead. The hard problem in authentication was never letting the right person in. It is getting the wrong person back out, fast, after something leaks.
+
+Most tutorials never frame it that way. They present sessions and JWTs as old versus modern, recommend JWTs by default, and move on. That framing is backwards, and getting it backwards is how teams end up unable to log a compromised user out. The honest version is a single tradeoff that every design in this space is just a different point on: **how long does a stolen credential stay valid after you want it dead.** Call it the revocation window. Hold that number in your head and every design below falls into place.
+
+## Two questions that get blurred into one
+
+One distinction has to be crisp, because the entire topic collapses if you let it blur.
+
+Authentication asks: who are you? It proves identity. Authorization asks: what are you allowed to do? It grants access. A passport check is authentication, the visa stamp that says you may work is authorization. They run back to back so often that people fuse them, and the fusion is where a specific, expensive class of bug lives.
+
+OAuth2 is an authorization framework. Its defining document, RFC 6749, is explicit: it hands a client a scoped access token that says *this bearer may call that API*, and it was never designed to tell the client who the user is. That gap is exactly what OpenID Connect fills. OIDC adds one thing: an ID token, a signed JWT whose audience is your client, asserting who just authenticated.
+
+OAuth2 is a valet key: it grants access to the car without saying who you are. OIDC is the ID badge: it says who you are. Use the valet key as a badge and you have built a confused-deputy bug, because the access token is not bound to your application as its audience. We come back to that substitution. For now, keep the two questions apart.
+
+## Sessions: the simple, revocable baseline
+
+Start where the field started, because it is also where most apps should end.
+
+A server-side session is a coat check. You log in, the server mints a random opaque id, hands you a ticket, the cookie, and keeps everything that ticket means on its own shelf, a store like Redis or Postgres. The ticket carries no information. It is a pointer. Steal it and you hold a claim-check number with nothing on it until the server looks it up.
+
+That is the whole point. Because all the meaning lives server-side, revocation is one operation: delete the row, and the next request carrying that ticket finds an empty shelf and bounces. Logout is instant. Log-out-everywhere is deleting every session row for a user. A firing takes effect on the user's very next request. The revocation window is essentially zero.
+
+OWASP pins the one hard requirement: the session id must carry at least 128 bits of entropy from a cryptographically secure generator. At 128 bits, guessing a live id is computationally hopeless even under heavy traffic, which is precisely *why* the value can be meaningless. You are not hiding secrets in the ticket, you are making it impossible to forge and keeping the secrets on the shelf.
+
+The cost is honest. Every request pays a lookup against the session store, and you own that store as infrastructure, its availability and scaling your problem. In practice that store is usually a fast in-memory tier like [the distributed cache](/blog/distributed-cache), which makes the per-request lookup cheap enough that the cost rarely shows up in a latency budget. That is the bill for instant revocation, and for the overwhelming majority of applications it is worth paying. Google runs browser sessions this way. The opaque-id-plus-store design is not legacy. It is the simplest correct thing, and the burden of proof sits on anything that wants to replace it.
+
+One failure mode is worth naming. Session fixation: an attacker plants a session id on a victim before login, and if you keep that id after authentication, the attacker's pre-set ticket is now an authenticated one. The fix is mechanical, regenerate the session id at every privilege change, so the pre-login id dies the moment the user authenticates. The cookie itself also has to be hardened, which leads straight into the storage problem that haunts the token side of this story.
+
+None of this touches the front door itself. A login endpoint is a credential-guessing oracle the moment you expose it, so it wants [a rate limiter](/blog/rate-limiter) in front, per-account and per-IP, to turn credential stuffing from a feasible attack into an expensive one. Authentication mechanics decide what a valid credential proves. Throttling decides how cheaply an attacker gets to keep guessing one.
+
+## JWTs: trading revocability for zero-I/O verification
+
+The alternative everyone reaches for, and the reason it is so often the wrong default.
+
+A JWT is a signed, self-describing token: three base64url segments, `header.payload.signature`. The payload carries claims, who the subject is, when it expires, what it may do, and the signature lets anyone holding the verification key confirm the token is authentic and untampered. The seductive part is what that buys: verification needs zero I/O. No store, no lookup, no shared infrastructure. The token proves itself.
+
+That is genuinely useful and genuinely a trap, for one reason. If nothing is consulted at verification time, nothing can be consulted to *reject* a token early. A JWT is valid until its `exp` claim, full stop. The user logs out, it still works. Password reset, still works. Fired this morning, still works. Stolen last night, still works, until it expires on its own schedule. **Statelessness is not a free performance win. It is a direct trade: you give up revocability to get zero-I/O verification.** That is the asymmetry the whole debate orbits, and a 24-hour token hands a stolen credential a 24-hour runway with no kill switch.
+
+A pile of myths cluster here, and a senior engineer swats them on sight. JWTs are not more secure than sessions, they are stateless to verify, which is an orthogonal property. A standard JWT is *signed*, not encrypted, so the base64url payload is trivially decoded and anything sensitive in there is world-readable unless you reach for JWE. And a refresh token is not just a longer-lived access token, which is the distinction the next sections turn on.
+
+So the question becomes: if revocation is what you gave up, how do you buy some of it back? Every answer below is a different price for the same thing.
+
+## Buying back revocation, one imperfect fix at a time
+
+**Fix one: a denylist.** Keep a list of revoked tokens and check every incoming token against it. This works, and it quietly hands back the only thing JWTs were for. You have reintroduced a per-request lookup, a session store wearing a disguise, except now your cookie is a kilobyte instead of forty bytes. If you genuinely need instant revocation, a denylist is sessions with extra steps. The one case it earns its keep: pair it with a tiny access-token TTL so revoked entries expire out of the list almost immediately and it stays small. Otherwise this is the universe telling you to use sessions.
+
+**Fix two, the real one: short-lived access tokens plus a revocable refresh token.** This is what serious systems run, and it is a window-narrowing trick, not a cure. Issue an access token that lives five to fifteen minutes and is verified statelessly, the fast path. Alongside it, issue a refresh token that lives much longer but is *stateful*, checked against server state every time it is used to mint a new access token. The revocation check does not vanish. It moves, from every request to every refresh.
+
+A stolen access token is now useful for minutes, not a day, because it expires almost immediately and cannot be renewed without the refresh token. The refresh token becomes the crown jewel, the one credential whose theft actually matters, which is why it gets the heavy protection. The damage window collapses from twenty-four hours to roughly ten minutes for the common theft, and the rare valuable theft is where you spend your defenses. Same move as splitting *received durably* from *fully processed* in [idempotent webhooks](/blog/idempotency-exactly-once): put the expensive guarantee on the rare path, keep the hot path cheap.
+
+Because the refresh token is now the prize, it needs **rotation with automatic reuse detection.** Every redemption issues a new refresh token and invalidates the old one. The clever part is replay: if an already-used refresh token shows up again, two parties hold tokens from the same lineage, one of them an attacker, so the server revokes the entire token family and forces re-authentication. Auth0 built exactly this, and it surfaces an honest production tension. Rotation needs a small overlap window, a few seconds where the just-superseded token is still accepted. Too long and you weaken the replay guarantee. Too short and three tabs refreshing at once, or one flaky-network retry, trips the alarm and logs a legitimate user out. No setting is free. That tension is the tell of a real design instead of a tutorial.
+
+## Where the credential lives, and the trap on each shelf
+
+You can get every flow above correct and still get breached at storage, because the two obvious places to keep a token in a browser fail in opposite directions.
+
+Put the token in `localStorage` and you are exposed to XSS: any injected script reads `localStorage` directly and exfiltrates it, and the only mitigation is *do not have XSS*, which is a wish, not a control. Put it in a cookie and you are exposed to CSRF, because cookies auto-attach to requests, so an attacker's cross-site request rides the victim's session without ever reading the token.
+
+The reflex answer, *use an HttpOnly cookie, done*, is half right in a way that matters. HttpOnly closes one hole: JavaScript can no longer read the cookie, so an XSS payload cannot exfiltrate it. But it does not make XSS survivable. The injected script can still fire authenticated requests in-page, and the cookie auto-attaches to every one. HttpOnly protects the token's *confidentiality*, not the session's *integrity*. XSS is still game over for what the attacker can do as the user. A lot of designs treat HttpOnly as the checkbox that closes the XSS chapter, and it does not.
+
+The same caution applies to `SameSite`. It is real defense against CSRF and you should set it, but treat it as defense-in-depth, because `Lax` still permits top-level GET navigations and cross-subdomain edge cases exist. Keep a CSRF token too, a stateful synchronizer token or a stateless double-submit cookie, and harden the cookie with the `__Host-` prefix, which forces `Secure`, host-locks it, and pins `Path=/`.
+
+The pragmatic shape that survives both threats: access token in memory, refresh token in an `HttpOnly`, `Secure`, `SameSite` cookie. Or, per the IETF's current direction, stop putting tokens in the browser at all.
+
+## OAuth2 the flow, and why the easy path died
+
+Walk the actual handshake, because the way it broke and got fixed is itself a seniority signal.
+
+The modern flow is authorization code with PKCE, traced once end to end. The client generates a random `code_verifier` and derives `code_challenge = SHA256(code_verifier)`. It redirects the user to the authorization server with `response_type=code`, the `code_challenge`, and a random `state`. The user authenticates and consents there, never handing credentials to the client. The server redirects back with a one-time authorization code and echoes `state`, which the client verifies to block CSRF on the callback. The client POSTs that code *plus the raw `code_verifier`* to the token endpoint. The server recomputes the verifier's SHA-256, checks it matches the stored challenge, and only then issues the access token, refresh token, and, with OIDC, the ID token.
+
+The elegance is in step five. An attacker who intercepts the authorization code at the redirect cannot redeem it, because redemption requires the `code_verifier`, which never left the client. The code alone is inert. That is the whole purpose of PKCE, and RFC 9700, the 2025 security baseline, makes it mandatory for public clients and recommends it even for confidential ones, because authorization-code injection is a threat regardless of who can keep a secret.
+
+Now the part that separates memorizing the flow from understanding it: the implicit flow is dead, and knowing *why* is the point. Implicit returned the access token directly in the URL fragment after login, which leaked it into browser history, into `Referer` headers sent to third parties, and into server logs, while offering no way to authenticate the client. It existed for one reason: in the old browser world, a JavaScript app could not make the cross-origin POST to the token endpoint that the code flow requires. CORS made that POST possible, the justification evaporated, and RFC 9700 now says clients SHOULD NOT use implicit. Its cousin ROPC, where the client collects the user's actual password and trades it for tokens, is buried deeper: the same document says MUST NOT. When someone proposes implicit "because it is simpler for our SPA," the reason it was simpler stopped existing years ago.
+
+How your API presents itself to clients in the first place is the decision upstream of this one, and worth its own read in [API design styles](/blog/api-design-styles).
+
+## The attacks that prove the abstract points
+
+Two concrete exploits turn the theory into something you can feel, and both reduce to the verifier trusting attacker-controlled input.
+
+**Algorithm confusion.** Your server verifies JWTs with RS256 and publishes its public key at the standard JWKS endpoint, as it should. An attacker downloads that public key, edits the payload to read `"role":"admin"`, flips the header's `alg` from `RS256` to `HS256`, and signs the result with HMAC-SHA256 *using your published RSA public key string as the HMAC secret*. A naive verifier that reads `alg` from the token and calls `verify(token, publicKey)` dutifully runs HMAC with that same public key, the signature matches, and the forged admin token sails through. The root cause is brutal: the verifier let the attacker-controlled token choose the algorithm. Pin the algorithm at verification, require RS256, never infer it from the header. The degenerate cousin is `alg:none`, where the attacker strips the signature and declares the token unsigned, which any parser must reject outright.
+
+**The `kid` injection family.** The token header names a `kid` (key id) telling the verifier which published key to use, but `kid` is attacker-influenced input, and a verifier that feeds it straight into a file path or a database query inherits path-traversal and SQL-injection bugs through a field nobody audits. The lesson generalizes: a signed token is *not* a license to trust the parts of it that select how verification happens. The same blind spot powers a quieter outage class, sending an ID token to a resource server or accepting an access token as proof of login, both failing because the audiences differ, which is exactly the confused-deputy bug from the opening.
+
+## The staff-grade answer: make a stolen token useless
+
+Notice what every fix so far has in common. Short-lived tokens, rotation, denylists, careful storage, all of them manage the consequences of a token that, once stolen, simply works for whoever holds it. That is the original sin baked into the word **bearer**: possession equals authorization. Whoever bears the token wins. So the deepest fix is not to shrink the theft window. It is to make the stolen token inert on its own.
+
+That is sender-constraining, and the application-layer form is DPoP, defined in RFC 9449. The client holds a private key, and on every request it attaches a small signed proof, a DPoP header JWT, to show it possesses that key. The access token is cryptographically bound to the matching public key, so a token lifted off the wire or out of storage is worthless without the private key it was never separated from. Token theft stops being a fire drill and becomes a non-event. This is where the regulated end of the industry is already heading, with mTLS as the transport-layer sibling and open-banking profiles mandating it. A budget version exists too, OWASP's user-context binding: drop a random fingerprint in a hardened `__Secure-` cookie and store only its SHA-256 hash in the token, so the token alone proves nothing.
+
+The cleanest answer for single-page apps refuses the premise that the browser should hold tokens at all. The backend-for-frontend pattern puts a same-site server in front of the SPA as the confidential OAuth client. It runs the whole code-plus-PKCE dance, holds the access and refresh tokens server-side, and hands the browser nothing but an `HttpOnly` cookie session. The tokens never touch JavaScript, the entire `localStorage`-versus-cookie dilemma evaporates, and you are back to the instantly-revocable session model from the top of this post, now bridging OAuth underneath. The IETF's guidance draws a line that is easy to miss: a *true* BFF, where tokens never reach the frontend, is the goal, while a *token-mediating backend* that just forwards tokens to the browser gives almost none of the benefit.
+
+## How a senior actually decides
+
+The decision is not sessions-or-JWTs as a style preference. It is a sequence of questions about your revocation window and where your trust boundaries fall, and the strongest default is the boring one.
+
+| Question | Default move | Why |
+| --- | --- | --- |
+| One web app, browser sessions | Opaque session id + Redis | Simplest correct design, instant revocation, ~40 bytes on the wire, what Google does |
+| Need instant log-out-everywhere | Sessions, or token_version checked against a fast store | Pure JWTs cannot do this without becoming sessions in disguise |
+| Tokens must cross service boundaries with no shared store | Short-lived JWT access + revocable refresh | The one real constraint that justifies the statelessness trade |
+| Refresh token in a public client | Rotation + reuse detection + tuned overlap window | A long-lived refresh token without family revocation is a standing liability |
+| Login, not just API access | OIDC ID token, audience-bound to your client | A raw access token as a login proof is the confused-deputy bug |
+| SPA token storage | Don't, use a BFF; else access in memory, refresh in HttpOnly cookie | localStorage opens XSS, cookies open CSRF, BFF sidesteps both |
+| The token might leak | Sender-constrain it (DPoP / mTLS) | Makes theft a non-event instead of a race against the clock |
+| Verifying any JWT | Pin the algorithm, treat kid as untrusted input | The verifier must never let the token choose how it is checked |
+
+The thread through every row is the same number. Sessions hand you a revocation window of zero and bill you a lookup per request. JWTs hand you zero-I/O verification and bill you a window you have to actively shrink with refresh tokens, close with sender-constraining, or sidestep with a BFF. No row gives you both columns free. The same logic, *name the scarce resource and design to a budget for it*, runs through the rest of the canon: it is the consistency-versus-latency choice in [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum), the coordination cost in [consensus and Raft](/blog/consensus-raft), the staleness budget in [replication strategies](/blog/replication-strategies), and the structured way to surface any of it under pressure in [the system design interview framework](/blog/system-design-interview-framework). Auth just makes the budget literal, measured in the minutes a stolen credential keeps working.
+
+I have made each of these calls in production, and the deciding factor was always the same revocation question rather than a preference for tokens or sessions. [IntelliFill](/case-study/intellifill) needed delegated, scoped access to a user's documents, which is the exact problem OAuth2 was built for, so the access-token-plus-refresh shape was the natural fit. [Aladeen](/case-study/aladeen), observability for agent CLIs, and [NomadCrew](/case-study/nomadcrew), a group-travel app with live presence, each landed on their own session-versus-token answer against their own trust boundaries. None of them chose by fashion. Each chose by asking which failure they could live with the morning a credential leaked.
+
+## The honest landing
+
+You cannot make a credential un-stealable. Networks leak, browsers get popped, laptops get left on trains, and somewhere a token you issued is going to end up in the wrong hands. The only thing you actually control is how long that token keeps working after you find out, and whether the place you check that is one fast operation or a thousand.
+
+So pick the boring default and make it loud. An opaque session id behind a store revokes instantly and is the right answer far more often than the internet admits. Reach for JWTs only when a real constraint, crossing services without a shared store, forces the trade, and when you do, pay the rest of the bill honestly: short access TTLs, rotating refresh tokens with family revocation, tokens kept out of the browser, an algorithm pinned at the verifier. Do that, and the credential that leaks at 2 a.m. is dead by 2:10 instead of alive until next Tuesday. Skip it, and the most modern-looking auth stack you ever shipped becomes the one where you cannot log the attacker out.
+
+## FAQ
+
+<FAQ />

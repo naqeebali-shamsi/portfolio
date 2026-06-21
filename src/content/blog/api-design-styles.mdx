@@ -1,0 +1,116 @@
+export const meta = {
+  slug: 'api-design-styles',
+  title: 'REST vs gRPC vs GraphQL: Choosing an API Contract',
+  description:
+    'REST, gRPC, and GraphQL are three contracts for three callers, not three fashions. How to match the protocol to the boundary, and why mature systems run all three at once.',
+  headline: 'REST vs gRPC vs GraphQL: Choosing an API Contract',
+  deck: 'The question is never which protocol wins. It is which contract belongs at this boundary, because the caller decides.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['api-design', 'rest', 'grpc', 'graphql', 'system-design', 'distributed-systems'],
+  faq: [
+    {
+      q: 'Is gRPC just a faster REST?',
+      a: "No. They are different paradigms. REST manipulates resources identified by URLs; gRPC calls a typed method, the way you would call a local function. gRPC's real value is the schema-first contract: you write a .proto file, generate client and server stubs from it, and the compiler catches mismatches that hand-written JSON clients ship to production. The binary wire format and HTTP/2 multiplexing make it fast, but speed is the side benefit. The contract is the product.",
+    },
+    {
+      q: 'Can GraphQL responses be cached?',
+      a: "Yes, but not the way REST responses are. HTTP and CDN caching key on the URL, and GraphQL sends every query as a POST to one endpoint with the request shape in the body, so URL-keyed caches cannot help. You compensate in two places: a normalized client-side cache (Apollo, urql, Relay) that dedupes objects by id, and persisted queries that let you send a hash over GET so a CDN can cache again. The cache moved off the URL and onto the client. It did not disappear.",
+    },
+    {
+      q: 'Why does GraphQL return HTTP 200 even when there is an error?',
+      a: "Because a GraphQL response can be partially successful. The protocol returns a top-level data object and an errors array; one field can resolve while another fails, so the response carries both the data that worked and the errors that did not. The HTTP layer stays 200 because the request was understood and partially served. The trap is that uptime monitors and retry logic keyed on HTTP status will read 200 and conclude success, silently missing real failures. You have to inspect the errors array, not the status line.",
+    },
+    {
+      q: 'Why can a browser not call gRPC directly?',
+      a: "Native gRPC needs low-level control over HTTP/2 framing and trailers, and browser JavaScript has no API for that. So browsers speak gRPC-Web, a dialect that rides over a proxy such as Envoy which translates to real gRPC behind it. Even then, gRPC-Web clients cannot do client streaming or bidirectional streaming. This single constraint is why gRPC is an internal default and not a public one: anything a browser or curl has to reach pushes you to REST or GraphQL at the edge.",
+    },
+    {
+      q: 'Do I have to pick one protocol for my whole system?',
+      a: "No, and at scale you should not try. The boundaries inside a system have different callers with different needs. The mature pattern runs gRPC between internal services where both ends are yours, GraphQL or a backend-for-frontend at the edge where your own UI aggregates many services, and REST on the public and webhook surface where third parties and browsers live. Netflix, for one, runs gRPC across roughly 98% of internal traffic and composes a GraphQL layer at the edge. Three contracts, one system.",
+    },
+  ],
+}
+
+There is a version of this debate that gets framed like a fashion show. gRPC is fast, GraphQL is flexible, REST is old but reliable, now pick the winner. It produces strong opinions and bad architectures, because it asks the wrong question. None of these is a trend that replaces the last one. Each is a contract, and a contract is a promise between two parties about how they talk. The useful question is not which promise is best in the abstract. It is which promise the two parties at a given boundary actually need.
+
+Notice that word, boundary. A public API that a stranger's browser hits has nothing in common with a call between two of your own services in the same cluster, and neither resembles your React app trying to assemble one screen out of six backends. Same company, same engineers, three different conversations. The senior move is to match the contract to the conversation, and the giveaway that someone has done this before is that their system runs all three at once and they can tell you exactly where each one lives and why. This is the same instinct the [system design interview framework](/blog/system-design-interview-framework) rewards: start from the caller and the constraint, then choose the mechanism.
+
+## REST is a constraint set, not JSON over HTTP
+
+Start with the most misunderstood of the three, because almost everyone who uses it daily has the definition wrong.
+
+REST is not JSON. It is not HTTP verbs against URLs. It is not CRUD. Roy Fielding defined it in his 2000 dissertation as an architectural style: a set of constraints you apply, in order, to get specific properties out. Client and server separate. The server holds no session state between requests. Responses declare whether they can be cached. The interface is uniform. The system can be layered behind proxies. Code can optionally be shipped to the client. Stack those constraints and you get a system that scales horizontally and survives partial failure, because Fielding designed the constraints to produce exactly that.
+
+Two of those constraints are why REST owns the public edge, and they are worth tracing because the conclusion falls out of them rather than being asserted. The first is statelessness. Fielding's own justification: "Visibility is improved because a monitoring system does not have to look beyond a single request datum... Reliability is improved because it eases the task of recovering from partial failures. Scalability is improved because not having to store state between requests allows the server component to quickly free resources." The second is cache, which he calls out as a first-class constraint with the potential to "partially or completely eliminate some interactions, improving efficiency, scalability, and user-perceived performance by reducing the average latency."
+
+Put those two together and you get the property everyone takes for granted and few can derive: a REST `GET` is cacheable by URL. The HTTP semantics spec, RFC 9110, makes this concrete by defining `GET` as safe, idempotent, and cacheable by default. A URL is a globally meaningful cache key that browsers, CDNs, and reverse proxies already understand, for free, with no work from you. That is the structural reason REST is the right default for a public API. The entire HTTP intermediary ecosystem is infrastructure you did not have to build, and it only works because the contract is stateless and cacheable by design.
+
+Here is the honest part most tutorials skip. The fourth constraint of the uniform interface is HATEOAS, hypermedia as the engine of application state, where responses carry the links that tell a client what it can do next. Almost nobody ships it. What most of us call a REST API is really REST-ish: resources, verbs, status codes, and no hypermedia. That is a defensible trade, and external consumers rarely want to navigate your link graph anyway. The point is to know you are making the trade, and to call the thing by its real name instead of pretending the textbook describes your code.
+
+## gRPC is a contract-first RPC with streaming built in
+
+Now the opposite philosophy. Where REST manipulates resources you identify by URL, gRPC calls a method. You invoke `UserService.GetUser` the way you would call a function, and the framework handles serialization, transport, and the round trip. The mental model is remote procedure call, and the difference from REST is not cosmetic. It changes what the contract is made of.
+
+The contract is a `.proto` file. You define your service and message types in Protocol Buffers, gRPC's interface definition language, and a code generator produces typed client and server stubs in your language. This is the actual product, and it is easy to miss if you arrive expecting a speed story. The reason Netflix moved to gRPC was not that JSON was slow. It was, in their words, that "there wasn't a clear way to annotate and describe exactly how APIs functioned," so every team hand-wrote clients and every hand-written client was a place for bugs to breed. With a generated contract, a field that changes type breaks at compile time on the caller, not at 3 a.m. in production. The numbers Netflix reports are downstream of that: client creation dropping from two or three weeks to minutes, hundreds of lines of bespoke cache-management code collapsing to two or three lines of config, "an incredible reduction in P99s," and gRPC now carrying roughly 98% of internal microservice traffic, with all new Java services starting gRPC-enabled.
+
+The transport earns its keep too. gRPC rides HTTP/2, whose binary framing lets many concurrent calls share one connection without the head-of-line blocking you get at the HTTP layer with HTTP/1.1. Protocol Buffers serialize to a compact binary form: each field becomes a tag computed as `(field_number << 3) | wire_type` followed by a varint payload, and small integers fit in a single byte. The detail that actually explains the size win is that field names never travel on the wire. They live only in the shared `.proto`. A JSON object spends bytes on every key, every quote, every comma; the Protobuf equivalent spends a tag and a varint per field and nothing on names. That same fact is why a consumer without the schema sees gibberish, which is the trade you are accepting.
+
+Then there is the feature REST cannot model natively, and it is the real differentiator more than any benchmark: streaming. gRPC gives you four call shapes, and the official docs describe them cleanly. Unary is "a single request to the server" returning "a single response back, just like a normal function call." Server streaming sends one request and gets back "a stream to read a sequence of messages." Client streaming writes "a sequence of messages" up to the server and waits for one reply. Bidirectional streaming runs "a read-write stream" where "the two streams operate independently, so clients and servers can read and write in whatever order they like." If your workload is push, telemetry, or real-time service-to-service, that last shape alone can decide the protocol, because a request-response contract simply has no way to express it. Deadlines are first class as well: blow past one and you get `DEADLINE_EXCEEDED`, and either side can cancel a call at any time, which matters when you are reasoning about timeouts and backpressure the way you would around a [rate limiter](/blog/rate-limiter).
+
+All of which makes gRPC the right default for internal service-to-service traffic. Both ends are yours, you deploy them together, you do not need human-readable payloads, and you want a typed contract that codegen enforces. It is the lingua franca of the mesh, the layer underneath the kind of feed fan-out you would design in [Design Twitter](/blog/design-twitter-feed) or the inter-node chatter in [consensus and Raft](/blog/consensus-raft).
+
+## GraphQL is client-specified field selection
+
+The third contract solves a problem the first two share. With REST, the server decides the shape of each resource, so a screen that needs a user's name and the titles of their three latest posts either over-fetches whole objects or makes several round trips to stitch the pieces together. GraphQL inverts that. The client sends a query describing exactly the fields it wants, the server returns exactly those fields, and a screen that would have been three REST calls becomes one request that returns precisely what renders and nothing else.
+
+It is a query language and an execution engine over a typed schema, served from a single endpoint. You write `{ user(id: 123) { name posts { title } } }` and you get back a `data` object shaped like your query. The October 2021 specification defines the type system, the validation rules, and a depth-first execution algorithm that walks the query tree. Two structural consequences follow, and they are the whole story of GraphQL's strengths and its costs.
+
+The first is that over-fetching and under-fetching, on the wire to the client, go away. One round trip, exact fields, even across what would have been many REST resources. This is precisely what a frontend aggregating many backend services needs, and it is why GraphQL lives at that boundary rather than between internal services. It moves the composition work out of your client, or out of a hand-rolled aggregation layer, and into a typed schema backed by resolver functions. A resolver is a small function that knows how to fetch one field. The schema is the graph; the resolvers are how you walk it.
+
+The second consequence is the bill. Because every query is a POST to one endpoint with the shape in the body, the free URL-keyed HTTP cache that REST enjoys does not apply. You get it back deliberately, not by default: a normalized client cache that stores objects by id and reuses them across queries, plus persisted queries where you register an operation ahead of time and reference it by hash over GET so a CDN can cache it and you gain an allow-list as a bonus. The cache did not vanish. It moved from the URL to the client, and you pay for it in setup.
+
+## The N plus one problem, and why it is structural
+
+The other half of the GraphQL bill has a name and a number. Because resolvers are independent and composable, with no built-in coordination between them and no automatic batching, a query that looks innocent can hammer your datastore. Shopify's writeup states the arithmetic plainly: to resolve a list of authors and each author's address, "the server makes 1 round trip to a datastore to fetch the authors, then makes N round trips to a datastore to fetch the address for N authors. For example, if there were fifty authors, then it would make fifty-one round trips for all the data." One parent query, N child queries, N plus one total. The flexibility that lets the client ask for nested data is exactly what fans out into a storm of small queries underneath.
+
+The fix is batching, and the canonical tool is DataLoader, with Shopify's `graphql-batch` as a production-grade variant. The mechanism is worth understanding rather than cargo-culting. Resolvers return promises instead of values; the batch library collects every load requested in one tick, issues a single bulk query for all of them, and back-fills the promises with the results. Shopify's fifty-one round trips collapse to "only two round trips to datastores in total, regardless of the number of authors." O(N+1) becomes O(2). The same dedup-and-batch idea shows up whenever independent requests can be coalesced into one trip, the way batching changes the economics in [Kafka vs queues](/blog/kafka-vs-queues).
+
+A staff engineer does not stop at DataLoader, because batching is the floor, not the ceiling. A single deeply nested query can still fan out to thousands of resolver calls and turn into an accidental denial of service. The mitigations are a layered contract: query depth and complexity limits so a pathological query is rejected before it runs, cost analysis that prices a query and refuses anything too expensive, persisted and allow-listed queries so only blessed operations execute, and pagination contracts so a list cannot be unbounded. GraphQL hands the client real power over your backend, and power at the edge has to be governed, which is the same lens you bring to any public-facing throttle.
+
+## Three ways to change a contract without breaking callers
+
+Versioning is where these philosophies diverge most sharply, and the differences are not stylistic. Each protocol has a different blast radius when you evolve it, and that radius is what dictates the strategy.
+
+REST versions explicitly. You ship `/v2`, or you negotiate a version through an `Accept` header, and old and new live side by side. This is the right move for a public contract precisely because the consumers are strangers you cannot coordinate with. A visible, deliberate version boundary is a courtesy to people who cannot redeploy on your schedule, and it keeps your `/v1` promise intact while `/v2` does something different.
+
+GraphQL takes the opposite stance and refuses to version on purpose. You evolve the schema additively: add new fields, mark old ones `@deprecated`, and lean on nullable-by-default typing so a field that fails resolves to null rather than failing the whole request. Clients only fetch the fields they name, so adding a field breaks nobody, and deprecation gives you a signal for when a field is safe to remove. The graph grows instead of forking, which is why a well-run GraphQL API rarely has a v2.
+
+Protobuf does something different again: forward and backward compatibility at the wire level. Field numbers are the contract, and they are immutable. The language guide is blunt about it: "Field numbers should never be reused... add your deleted field number to the reserved list." An old parser encountering an unknown field skips it by wire type rather than choking, and a new parser reading old data sees the missing field as a default. This is the property that lets you deploy a producer and a consumer independently inside a mesh, where coordinated lockstep deploys would otherwise be a nightmare. The one rule you cannot break is reusing a field number, because that makes the wire format ambiguous and silently corrupts decoding. The same discipline that protects a Protobuf schema, treating identifiers as permanent, is what keeps systems sane under change the way stable keys do in [consistent hashing](/blog/consistent-hashing).
+
+## Three error planes, and why you cannot conflate them
+
+Errors are the detail that catches teams off guard, because each protocol reports failure on a different plane and your observability has to know which one it is reading.
+
+REST reports through HTTP status codes. A 4xx is the caller's fault, a 5xx is yours, and the entire monitoring ecosystem already understands them. gRPC reports through its own set of sixteen status codes, `OK` and `INVALID_ARGUMENT` and `DEADLINE_EXCEEDED` and the rest, plus a rich error model via `google.rpc.Status` that carries structured details and is, by design, independent of the gRPC data format. So far these feel similar: a code tells you what happened.
+
+GraphQL breaks the pattern, and this is the one that bites. A GraphQL response returns HTTP 200 even when something failed, with the failure in an `errors` array alongside whatever `data` did resolve. The request was understood and partially served, so the HTTP layer reports success, while the actual outcome lives in the body. Sasha Solomon's widely cited essay, titled exactly "200 OK! Error Handling in GraphQL," exists because this surprises people in production. The concrete danger: an uptime monitor or a retry policy that keys on HTTP status reads 200 and concludes everything is fine, silently swallowing real failures. If you run GraphQL, your alerting has to inspect the `errors` array, and your clients have to treat a 200 as "look closer," not "done." Three planes, three different retry and observability strategies, and conflating them is how outages hide in plain sight. Getting this right at every hop is the same discipline that makes [idempotency and the exactly-once lie](/blog/idempotency-exactly-once) tractable: the contract has to be honest about failure, not just success.
+
+## The decision rule
+
+Strip away the tribalism and the choice reduces to one question asked at each boundary: who is calling, and what does that boundary need to guarantee?
+
+If the caller is the public, a third party, or anything a browser or curl reaches, the answer is REST. It is cacheable by URL through RFC 9110 `GET` semantics, the tooling is universal, the messages are self-descriptive and debuggable by people who do not have your schema, and it is loosely typed on purpose so external consumers are not coupled to your codegen. Version it explicitly with `/vN` or headers. The forcing function here is the browser, which cannot speak native gRPC at all, so the public edge is decided by reachability before any speed argument enters the room.
+
+If the caller is another one of your services, both ends owned and deployed together, the answer is gRPC. The schema-first `.proto` plus codegen kills the hand-written-client bug farm, binary Protobuf over HTTP/2 multiplexing is fast, streaming is first class, and immutable field numbers let you evolve producer and consumer independently. This is the inside of the system, the part the public never sees.
+
+If the caller is your own frontend assembling one screen from many backend services, the answer is GraphQL, or a backend-for-frontend that often is GraphQL underneath. The client selects exact fields from one endpoint and kills over-fetching and under-fetching in a single round trip. You accept two costs going in: HTTP caching is harder, so you reach for persisted queries and a normalized client cache, and the N plus one resolver problem is real, so DataLoader and query-cost limits are part of the build, not an afterthought.
+
+And the coda that separates a senior answer from a junior one: these are not mutually exclusive, and at scale they are not even in competition. The mature architecture runs gRPC inside the mesh, GraphQL or a BFF at the frontend edge, and REST on the public and webhook surface. Netflix is the existence proof, with gRPC across roughly 98% of internal traffic and a GraphQL layer composed at the edge. My own work settled into the same shape: [IntelliFill](/case-study/intellifill) exposes a REST surface for its public document flows over typed internal contracts; [Aladeen](/case-study/aladeen) ships an MCP server with a read-only tool contract, which is the same instinct as a `.proto`, a tightly specified interface the caller cannot misuse; [NomadCrew](/case-study/nomadcrew) and [Audex](/case-study/audex) each split a cache-friendly public edge from chattier internal calls. The decision that matters is never "which protocol." It is "which protocol at this boundary," asked once per conversation in the system.
+
+A few neighbors fill in the edges. Whichever style sits in front of users still has to authenticate them, which is the subject of [the auth deep dive](/blog/auth-deep-dive). The identifiers flowing through these contracts have to stay unique at scale, which is [unique ID generation](/blog/unique-id-generation). And when services coordinating over gRPC need to agree on who holds a resource, that is [distributed locks](/blog/distributed-locks). The same boundary-first thinking runs through [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum), [replication strategies](/blog/replication-strategies), and worked builds like [the URL shortener](/blog/url-shortener): each starts by asking what the caller needs before reaching for a mechanism.
+
+## FAQ
+
+<FAQ />

@@ -1,0 +1,228 @@
+export const meta = {
+  slug: 'learning-to-rank',
+  title: 'How Ranking Works: From BM25 to Learning-to-Rank',
+  description:
+    'BM25 is a hand-tuned formula with a ceiling. Learning-to-rank learns the order from data. How the retrieve-then-rank funnel, LambdaMART, and neural rerankers actually fit together.',
+  headline: 'How Ranking Works: From BM25 to Learning-to-Rank',
+  deck: 'Retrieval finds the few hundred candidates worth looking at; ranking decides the exact order, and they are different jobs with different costs.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '16 min',
+  tags: ['search', 'ranking', 'learning-to-rank', 'bm25', 'information-retrieval', 'machine-learning', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between retrieval and ranking?',
+      a: 'Retrieval narrows billions of documents to a few hundred candidates and optimizes recall, so it has to be cheap per document because it touches the whole corpus. Ranking takes those few hundred and decides the exact order, optimizing precision at the top, and it can afford to be expensive per document because the candidate set is tiny. They run different models against different objectives under different latency budgets. The two-stage funnel exists because no single model is both cheap enough for billions and smart enough for the top ten.',
+    },
+    {
+      q: 'Is BM25 just TF-IDF?',
+      a: 'No. BM25 is derived from the probabilistic relevance model, and it adds two behaviors raw TF-IDF lacks. The k1 parameter makes term frequency saturate, so the fourth occurrence of a word matters far less than the first and keyword stuffing stops winning. The b parameter normalizes for document length so a long document does not score highly just by containing more words. BM25 stays unsupervised, which is its strength because it needs no training data and its ceiling because it cannot learn what relevance means for your users.',
+    },
+    {
+      q: 'Why can you not just train a model to minimize NDCG directly?',
+      a: 'Because NDCG, viewed as a function of the model scores, is everywhere either flat or discontinuous. Nudge a score a little and either the sort order does not change at all, so the metric is flat, or a document jumps rank and the metric steps discontinuously. Gradient descent needs a smooth slope and there is not one. LambdaRank sidesteps this by skipping the loss entirely and writing the gradient down directly: take the pairwise gradient and multiply it by the change in NDCG that swapping the pair would cause.',
+    },
+    {
+      q: 'Did neural rankers replace BM25?',
+      a: 'In most production systems they are stacked rather than swapped. BM25 stays as the retriever that cheaply pulls a candidate set, often the top 1000 documents, and a neural cross-encoder reranks that set. BERT passage reranking on top of BM25 retrieval beat the prior MS MARCO state of the art by roughly 27 percent relative MRR at 10. BM25 stays the universal baseline every neural system is measured against.',
+    },
+    {
+      q: 'Why are gradient-boosted trees still the default for ranking?',
+      a: 'Ranking features are tabular: BM25 scores, click rates, freshness, authority signals. Gradient-boosted trees handle that shape natively. They need no feature scaling, deal with missing values, and capture threshold effects like freshness under 24 hours with axis-aligned splits that neural nets learn slowly. LambdaMART, which plugs LambdaRank gradients into boosted trees, won the 2010 Yahoo Learning to Rank Challenge and is still the thing neural rankers have to beat to justify their cost. Neural nets win at the reranking stage, where the signal is unstructured text instead of tabular features.',
+    },
+  ],
+}
+
+Type a query into a search box and something has to put a handful of results in front of you, in order, out of billions of candidate documents, in under a couple hundred milliseconds. The naive mental model is that one component reads everything and sorts it by relevance. That model is wrong, and the way it is wrong is the most important thing to understand about ranking.
+
+No single system does that job, because the job is actually two jobs with conflicting requirements. One of them has to be cheap because it touches the entire corpus. The other gets to be expensive because by the time it runs, almost everything has already been thrown away. Pretending they are the same step is the design mistake that produces either a system that never returns in time or a system that returns fast junk.
+
+This piece walks the whole arc: why retrieval and ranking are separate, why BM25 is the floor everything else is measured against, how learning-to-rank turns ordering into a supervised machine-learning problem, the one gradient trick that makes the whole thing work, and where neural rankers actually slot in. If you want the data structure underneath retrieval, [the inverted index](/blog/inverted-index-search) is its own story; this is about what happens to the candidates after the index hands them over.
+
+## Two jobs, not one
+
+Start with the shape, because the shape is the thesis. Ranking at scale is a funnel with a cost gradient running down it.
+
+```
+   Billions of documents
+            |
+   [ Retrieval: BM25 / ANN ]      cheap per doc, optimizes RECALL
+            |
+   ~hundreds of candidates
+            |
+   [ Ranking: LambdaMART / cross-encoder ]   expensive per doc, optimizes PRECISION@k
+            |
+        Top 10, ordered
+```
+
+Retrieval answers a coarse question: which few hundred documents are even worth looking at? It runs against the full corpus, so its per-document cost has to be tiny, which forces it into sublinear data structures like an inverted index or an approximate-nearest-neighbor lookup over [embeddings](/blog/embeddings). And because it is the first gate, it optimizes for recall. Its one job is to not lose the good stuff. If a great document fails to make the candidate set here, nothing downstream can rescue it; it simply never reaches the next stage.
+
+Ranking answers a fine question: given these few hundred, what is the exact best order? The candidate set is now small enough that it can afford an expensive model per document, so it optimizes precision at the top. Nobody cares about recall@10000 at this stage; they care about NDCG@10, getting the first screen of results exactly right.
+
+This is not a pattern someone invented for a textbook. It is what every large system at scale converges on. YouTube's recommendation paper frames it cleanly: candidate generation recalls hundreds of videos from millions, treated as an extreme multiclass problem, and then ranking scores those hundreds with, in their words, a more complex model using features that are computationally intractable in the candidate-generation stage. Instagram's feed uses the identical funnel under different names, sourcing then early-stage ranking then late-stage ranking, and the engineering writeups state the operating principle outright: the platform works on fewer candidates as it moves through the funnel, because the operations grow more expensive as it goes. The same retrieve-then-rank skeleton powers search, feeds, and [recommendation systems](/blog/recommendation-systems); only the stage labels change.
+
+The classic mistake comes in two flavors, and naming both is worth it. The first is running your expensive ranker over the whole corpus. It will not return in time, and most of the corpus is junk it wastes compute on. The second is trusting your cheap retriever's score as the final order. BM25 has no notion of freshness, authority, personalization, or whether anyone has ever clicked the result. Conflating the two stages is conflating "find candidates fast" with "order candidates well." Different latency budgets, different objectives, different models. If you have read [the system design interview framework](/blog/system-design-interview-framework), this is the same move as separating read path from write path: the split exists because the requirements genuinely diverge, not because two boxes look tidier than one.
+
+## BM25 is a formula, and that is the whole point
+
+Before anything learns, there is BM25. It is the baseline retriever in essentially every search stack, and the thing to internalize is that it is unsupervised. No training data, no labels, no model to fit. Just a formula with two knobs that you can compute the instant a document is indexed.
+
+The score of a document `D` for a query `Q` is a sum over the query terms:
+
+```text
+score(D, Q) = sum over query terms i of:
+    IDF(q_i) * ( f(q_i,D) * (k1 + 1) )  /  ( f(q_i,D) + k1 * (1 - b + b * |D|/avgdl) )
+```
+
+with the inverse-document-frequency term
+
+```text
+IDF(q_i) = ln( (N - n(q_i) + 0.5) / (n(q_i) + 0.5) + 1 )
+```
+
+where `f(qi,D)` is how often the term appears in the document, `|D|` is the document length, `avgdl` is the average length across the corpus, `N` is the total document count, and `n(qi)` is how many documents contain the term. The defaults you will see almost everywhere are `k1` between 1.2 and 2.0 and `b = 0.75`.
+
+The formula looks fussy, but the two knobs encode two genuinely smart ideas, and both are why "BM25 is just TF-IDF" is wrong.
+
+`k1` controls term-frequency saturation. Plot a term's score contribution against how many times it appears, and with `k1 = 1.2` the curve rises steeply from one to two occurrences and then flattens hard; going from ten to eleven barely moves the needle. Raw TF-IDF would draw a straight line that rewards the eleventh occurrence exactly as much as the second. That saturation is precisely why keyword stuffing stopped working. A page that repeats "cheap flights" two hundred times does not outrank a page that uses it naturally, because BM25 refuses to keep paying for repetition.
+
+`b` controls length normalization. Without it, a long document scores highly just by containing more words, the same way a longer book mentions any given topic more often. The `(1 - b + b·|D|/avgdl)` factor scales the saturation point by how long the document is relative to average. At `b = 0` length is ignored entirely; at `b = 1` it is fully normalized; `0.75` is the empirical middle that Lucene and Elasticsearch ship.
+
+BM25 is not heuristic hand-waving. It falls out of the probabilistic relevance model, the question "what is the probability this document is relevant given these terms?" worked through formally. That pedigree is why it has survived decades as the floor every neural system measures against.
+
+And here is its ceiling, which is the whole reason the rest of this article exists. The weights are fixed by hand. BM25 cannot learn that for your users, recency beats exact term match, or that documents from authoritative domains deserve a boost, or that a particular feature predicts clicks. It has no mechanism to absorb evidence. The moment you want the system to learn relevance from data instead of asserting it with a formula, you have left BM25 and walked into learning-to-rank.
+
+## Turning order into a supervised problem
+
+Learning-to-rank reframes "put these documents in the best order" as supervised machine learning. To do that you need exactly two things: a label and a loss.
+
+The label is a relevance judgment. It comes in two forms. Explicit judgments are human ratings, usually graded 0 to 4, from "irrelevant" to "perfect." This is not hypothetical: Microsoft's MSLR-WEB10K benchmark is 10,000 queries, each query-URL pair described by 136 features, with relevance labels 0 to 4 taken from retired Bing human judgments. That dataset is what makes "feature vector" and "relevance label" concrete; ranking models train on rows that look exactly like that. Implicit judgments are behavioral signals instead: clicks, dwell time, bookings, purchases. Cheaper and far more plentiful, but, as we will see, dangerously biased.
+
+The loss is where the taxonomy lives. There are three ways to define what "wrong order" means, and the differences are not academic.
+
+Pointwise treats each document independently and predicts its relevance score on its own, as plain regression or classification. It is the simplest framing and it has a fatal blind spot: ranking is *relative*, and pointwise loss does not know that. A model that is off by a constant on every single document, scoring everything 0.3 too low, has enormous pointwise error and yet produces a perfect ranking, because the order is untouched. You are penalizing the model for the wrong thing.
+
+Pairwise fixes the framing. Instead of asking "what is this document's score," it asks "for this pair of documents, which should rank higher?" That matches the relative nature of the problem exactly, and it is the dominant practical formulation. RankNet, which we are about to dissect, lives here.
+
+Listwise goes all the way and defines the loss over the entire ordered list at once, using permutation probabilities. ListNet, for instance, models the probability that a given document lands on top via a softmax over scores. Listwise approaches tend to score best on the metrics because they optimize the thing you actually measure, but they are harder to train and to scale. The pragmatic sweet spot, as you will see, is a pairwise update that smuggles listwise information inside it.
+
+## The metric problem, and the trick that solves it
+
+Here is the obstacle that shallow explanations skip, and it is the single most important idea in the whole field.
+
+The metrics we actually care about, NDCG and MRR and MAP, cannot be optimized directly by gradient descent. Not because they are hard to compute, but because of their *shape* as functions of the model's scores. Picture nudging one document's score up by a tiny amount. One of two things happens. Either the nudge is too small to change the sort order, so the metric does not move at all, it is locally flat, gradient zero. Or the nudge is just enough to swap two documents' positions, and the metric jumps in a discontinuous step. Flat everywhere, with cliffs in between. The gradient is either zero or undefined, and gradient descent has nothing to descend.
+
+For years this looked like a wall. You cannot differentiate the thing you want to optimize.
+
+The move that broke through, due to Chris Burges and colleagues, is almost cheeky: skip the loss function entirely and write the gradient down by hand. You never need the cost; you only need to know, for each document, which direction to push its score and how hard. Burges called these per-document gradients lambdas, and the cleanest way to picture them is as forces. Each lambda is a little arrow on a document: its direction says which way the document should move in the ranking, its magnitude says how urgently.
+
+To make those forces optimize NDCG, you start from the pairwise gradient and multiply it by the change in NDCG that swapping that pair would produce. Concretely, LambdaRank's gradient is
+
+```text
+lambda_ij = ( -sigma / (1 + e^( sigma * (s_i - s_j) )) ) * | delta_NDCG_ij |
+```
+
+The first factor is the ordinary RankNet pairwise gradient. The `|ΔNDCG|` multiplier is the entire trick. It says: a swap that would move NDCG a lot, because it involves a great document languishing near the top where the position discount is steep, gets a big force; a swap that barely affects NDCG, because it is shuffling documents deep in the list nobody sees, gets a small one. The model spends its effort exactly where the metric is sensitive. Burges' own summary of the empirical result is the punchline: such a model, intriguingly, optimizes NDCG directly, even though NDCG was never differentiated. Swap `|ΔNDCG|` for `|ΔMRR|` or `|ΔMAP|` and you optimize *those* instead, changing one term. This is why LambdaRank is best understood as listwise-flavored pairwise: the update is per-pair, but the `|ΔNDCG|` factor injects whole-list information into every step.
+
+It is worth seeing why the pairwise base gradient is shaped the way it is. RankNet maps a score difference to a probability with a sigmoid and then applies cross-entropy:
+
+```text
+P_ij = 1 / (1 + e^( -sigma * (s_i - s_j) ))
+C    = (1/2) * (1 - S_ij) * sigma * (s_i - s_j) + log( 1 + e^( -sigma * (s_i - s_j) ) )
+```
+
+Two properties matter. When two documents with different labels get equal scores, the cost is `log 2`, not zero; there is a built-in margin that keeps pushing them apart even when the model thinks they are tied. And the cost grows linearly when the order is wrong but vanishes when it is right, so effort flows to genuine mistakes. There is also a real engineering payoff hiding in the factorization. Because each lambda acts like an independent force, you can accumulate forces per document instead of recomputing per pair, and that single change dropped RankNet training from close to quadratic in the number of URLs per query to close to linear. A correctness idea and a performance idea in the same stroke.
+
+## NDCG, concretely
+
+Throwing "NDCG@10" around is easy; feeling it is better. The definition:
+
+```text
+DCG@T  = sum over i = 1..T of:  (2^(l_i) - 1) / log2(1 + i)
+NDCG@T = DCG@T / maxDCG@T
+```
+
+The numerator of each term, `2^l - 1`, is the gain, and it grows exponentially in the relevance label, so a perfect-rated document (label 3, gain 7) is worth far more than a merely-decent one (label 1, gain 1). The denominator, `log2(1+i)`, is the position discount: a document at rank 1 keeps its full gain, rank 2 keeps 63 percent, rank 5 only 39 percent. Dividing by the ideal DCG, the score you would get from the perfect ordering, normalizes everything into [0, 1].
+
+Work one example. Say the ideal order has relevance labels `[3, 2, 3, 0, 1]` and your ranker returns them in the order `[2, 3, 0, 3, 1]`. Gains become ideal `[7, 3, 7, 0, 1]` and predicted `[3, 7, 0, 7, 1]`. The discounts for ranks one through five are `[1.000, 0.631, 0.500, 0.431, 0.387]`.
+
+- IDCG = 7·1.000 + 3·0.631 + 7·0.500 + 0·0.431 + 1·0.387 = 12.78
+- DCG = 3·1.000 + 7·0.631 + 0·0.500 + 7·0.431 + 1·0.387 = 10.81
+- NDCG@5 = 10.81 / 12.78 ≈ 0.846
+
+Look at where the score bled. A perfect document, gain 7, got stranded at rank 4, where the discount is only 0.431, so it contributed 3.02 instead of the 7.00 it would earn at the top. Moving that one document up recovers far more score than fixing the throwaway document at rank 5. That, made arithmetic, is exactly what `|ΔNDCG|` measures, and exactly why LambdaRank pours its force into the documents whose misplacement costs the most.
+
+NDCG is the right metric when relevance is graded and position-weighted, which is web search. When the task is known-item or question answering, where essentially one right answer exists, MRR (mean of `1/rank` of the first relevant hit) fits better, because it only cares how fast you surface the one answer and ignores everything after it. When relevance is binary and you care about recall across a set, MAP (mean average precision) is the tool. Picking the metric is picking what "good" means for your product, and it is a decision, not a default.
+
+## The workhorse is still trees
+
+With lambdas in hand, what model do you actually attach them to? In production, far more often than not, the answer is gradient-boosted decision trees, and the specific algorithm is LambdaMART: MART, an ensemble of boosted regression trees, with the LambdaRank lambdas plugged in as the gradients each tree fits. The leaf values use a second-order Newton step instead of a plain average, which lets the ensemble correct itself faster.
+
+Why trees, when the field has spent a decade infatuated with neural networks? Because ranking features are *tabular*. BM25 scores, click-through rates, freshness in hours, authority signals, query-document match counts. Trees own that terrain. They need no feature scaling, they handle missing values natively, and their axis-aligned splits capture threshold effects, "freshness under 24 hours," "price below the query's implied budget," that neural nets only learn slowly and approximately. The track record is blunt: an ensemble of LambdaMART rankers won Track 1 of the 2010 Yahoo Learning to Rank Challenge, and when Airbnb shipped its first machine-learned ranker, a GBDT model, it produced one of the largest single jumps in home bookings in the company's history. Even now, LambdaMART is the default starting point, and a neural ranker has to *beat* it to earn its higher serving cost.
+
+There is a subtle property worth knowing. Because each tree split is fit over all the data landing in a node, LambdaMART optimizes globally: it can intentionally lower the score quality for some queries if doing so raises overall utility across the dataset. That is different from LambdaRank's per-query updates, and it is occasionally exactly the lever you want, or exactly the behavior that surprises you in an audit.
+
+## Where neural rankers actually fit
+
+"Neural ranking" is not one thing, and treating it as one is how teams burn quarters. The architecture is dictated by *where in the funnel it sits*, and there are three distinct slots.
+
+```
+  cheap, in retrieval          middle ground            expensive, in reranking
+  bi-encoder  ----------------  ColBERT / late-interaction  ----------------  cross-encoder
+  (1 vector each, ANN)          (per-token vecs, MaxSim)     ([query; doc] together)
+```
+
+A bi-encoder, or dense retriever, encodes the query and each document *separately* into one vector apiece, then retrieves by approximate-nearest-neighbor search. Because document vectors are precomputed and frozen, this is fast and belongs in the retrieval stage, as a complement or alternative to BM25. The cost is expressiveness: a single vector has to summarize an entire document, and detail gets averaged away.
+
+A cross-encoder feeds the query and document *together*, `[query; doc]`, through a transformer and reads out one relevance score. It is maximally expressive because every query word can attend to every document word, but that is also its price: every single candidate needs its own forward pass, so it is only affordable over the few hundred documents the reranking stage handles. This is the BERT passage-reranking result: rerank BM25's top 1000 and beat the prior MS MARCO state of the art by roughly 27 percent relative MRR@10. The canonical modern pipeline is exactly that sentence, BM25 retrieves 1000, BERT reranks them.
+
+ColBERT, or late interaction, sits in between. It keeps a vector per token instead of one per document, and scores a pair by MaxSim: each query token finds its best-matching document token and those maxima are summed. More expressive than a single averaged vector, far cheaper than a full cross-encoder forward pass, which is why it has become a popular compromise for systems that want cross-encoder-grade quality without cross-encoder serving bills.
+
+Notice what did not change. It is still the same retrieve-then-rank funnel. You are dropping neural components into the slots the funnel already defined, choosing the architecture by the latency budget of the stage. The transformer machinery under all of this is its own subject in [how LLMs work](/blog/how-llms-work), and the cost of running these models in production, why a cross-encoder over thousands of candidates is a budget conversation, lives in [LLM inference serving](/blog/llm-inference-serving), [LLM quantization](/blog/llm-quantization), and [model routing](/blog/model-routing).
+
+## The traps a staff engineer worries about
+
+Everything above gets you a system that ranks. Whether it ranks *well* in production turns on a handful of things that never show up in a benchmark.
+
+Click data is position-biased, and training on it naively is a trap. Users click the top result partly because it is relevant and partly just because it is on top. If you log clicks as relevance labels and train, the model learns to reproduce whatever ranking was already there; it ossifies the incumbent. The vicious loop is real: rank, collect clicks skewed by position, retrain on the skew, reinforce the same order.
+
+```
+  model ranks ──► users click the top (because it's top)
+       ▲                                   │
+       │                                   ▼
+  retrain on biased clicks ◄──── clicks logged as "relevance"
+```
+
+The fix is unbiased learning-to-rank: reweight each example by the inverse of the probability that its position got it observed, inverse propensity weighting, so a click at rank 8 counts for more than a click at rank 1. Unbiased LambdaMART goes further and estimates the position bias jointly while training the ranker. Skip this and your "learned" ranker is an expensive way to memorize what was already on top.
+
+Pure ranking and calibrated probabilities are different requirements. A ranker only needs *relative* order to be right. But the moment scores get *combined*, you need them calibrated. Feeds and ads do exactly this: Instagram predicts P(like), P(comment), P(share), P(profile-tap) and blends them into a single score, roughly `Σ wₐ · P(actionₐ)`. Those probabilities have to mean what they say, because they are being multiplied by business weights and added together. And choosing the weights `wₐ` is a product and values decision, not a machine-learning one; it is where the company decides what the feed is *for*.
+
+Your retriever silently caps the whole system. If candidate generation systematically drops a class of good documents, no ranker downstream can recover them, because they never arrive. Recall@1000 at the retrieval stage is a ceiling on everything after it, and it is invisible if you only ever measure ranking quality on the candidates that made it through.
+
+Features drift, and the obvious feature is often the wrong one. Airbnb learned this concretely: raw counts make poor features in a tree-based model when the counts change fast, so ratios and fractions, which stay stable as volume swings, work better. A non-obvious production lesson that has nothing to do with the algorithm and everything to do with the data not standing still. Keeping an eye on this kind of drift is exactly what [Metrics, Logs and Traces](/blog/observability-three-pillars) and [distributed tracing](/blog/distributed-tracing) are for once the system is live.
+
+Techniques do not always transfer, and domain physics wins. The cautionary tale is Airbnb trying listing-ID embeddings, the trick that works beautifully for words and videos. It failed, because a single listing can be booked at most 365 times a year, so the per-listing data is far too sparse to learn a good embedding; the model overfit. Copying an architecture that worked in NLP into a domain with different data physics is how you ship a regression.
+
+Offline NDCG is a proxy, and online is the only ground truth. A higher offline NDCG on your judged dataset is encouraging, not conclusive. The real verdict is an online A/B test against live engagement, bookings, revenue. Offline-to-online gaps are routine and expected, because your judgments are a sample of a frozen world and production is the live one.
+
+## How a senior actually decides
+
+Lay the choices out as a decision stack, because in practice that is how they come.
+
+| Question | Default move | Why |
+| --- | --- | --- |
+| Retrieve and rank with one model? | No, two stages | Recall under whole-corpus cost vs precision@k under per-candidate cost; no single model is both |
+| What is the retriever? | BM25, plus a dense retriever if text-match misses | Unsupervised, strong, the universal baseline; ANN catches semantic matches BM25 cannot |
+| What is the first learned ranker? | LambdaMART | Wins on tabular features, no scaling, the thing neural has to beat |
+| How to optimize the metric? | LambdaRank gradients (lambda × |ΔNDCG|) | NDCG is flat or discontinuous; define the gradient, never differentiate the metric |
+| Pointwise, pairwise, or listwise? | Pairwise with listwise-aware |ΔZ| | Ranking is relative; |ΔNDCG| injects list information without listwise training cost |
+| Add a neural reranker? | Only over the top few hundred, only if it beats LambdaMART | Cross-encoders are expensive per candidate; the funnel makes them affordable |
+| Which metric? | NDCG graded, MRR known-item, MAP binary | The metric is the definition of "good" for this product |
+| Train on clicks? | Yes, but debias with IPW | Naive click training ossifies the incumbent ranking |
+| Trust offline NDCG? | As a proxy only; ship on A/B | Offline-online gaps are the norm, not the exception |
+
+None of this is exotic. What separates a ranking system that holds up from one that looks fine in a notebook is whether the unglamorous rows are honored: the two-stage split, the debiased labels, the calibration where scores get combined, the A/B gate before anything ships. The arc from BM25 to learning-to-rank is not a story of one technique replacing another. It is a story of stacking: a hand-tuned formula as the floor, a learned tree ensemble as the workhorse, a neural reranker at the top where text detail finally pays for itself, and a great deal of discipline about what your labels actually mean. Get the funnel right and each layer does the one job it is cheap enough, or smart enough, to do.
+
+## FAQ
+
+<FAQ />

@@ -1,0 +1,189 @@
+export const meta = {
+  slug: 'vector-databases',
+  title: 'How Vector Databases Work: HNSW, IVF and Product Quantization',
+  description:
+    'Brute-force vector search dies at scale. How HNSW, IVF, and product quantization trade a sliver of recall for huge speed, and how to pick between them.',
+  headline: 'How Vector Databases Work: HNSW, IVF and Product Quantization',
+  deck: 'Every vector index is the same three-way bet between recall, latency, and memory, and the whole job is knowing which corner to give up.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '15 min',
+  tags: ['vector-databases', 'ann-search', 'hnsw', 'rag', 'embeddings', 'system-design'],
+  faq: [
+    {
+      q: 'Do vector databases return the exact nearest neighbors?',
+      a: 'No. Almost all of them run approximate nearest-neighbor (ANN) search, which is what the A in ANN means. A result set at 95% recall is silently missing about 1 in 20 of the true nearest neighbors. You trade that sliver of accuracy for speed that is often two or three orders of magnitude faster than brute force. Exact search exists (a flat index) and is the right call for small datasets, but it does not scale past a few million vectors at interactive latency.',
+    },
+    {
+      q: 'What is the difference between HNSW, IVF, and product quantization?',
+      a: 'They solve different problems and compose. HNSW is a graph index you navigate by greedily hopping toward the query; it is the default for in-memory search up to tens of millions of vectors. IVF partitions vectors into cells with k-means and only searches the few cells nearest the query; it scales to billions. Product quantization is not an index at all, it is a compression codec that shrinks each vector to a handful of bytes so the index fits in RAM. You bolt PQ onto IVF or HNSW, you do not choose between them.',
+    },
+    {
+      q: 'Is pgvector good enough or do I need a dedicated vector database?',
+      a: 'pgvector is usually the right call up to low tens of millions of vectors, and the operational cost of a separate database rarely pays off below that. You reach for a dedicated system (Pinecone, Weaviate, Milvus, Qdrant) when you need billions of vectors, GPU-accelerated search, disk-resident indexes so the graph need not fit in RAM, predictable tail latency under heavy concurrency, or first-class sharding and replication. That boundary is moving: extensions like pgvectorscale now add disk-based ANN to Postgres, so "Postgres cannot scale vectors" is increasingly a 2023 statement.',
+    },
+    {
+      q: 'Why does metadata filtering break vector search?',
+      a: 'Because the filter and the index fight each other. Post-filtering runs the ANN search first and discards non-matching results, so a selective filter can return two hits out of ten or zero. Pre-filtering computes an allow-list first and constrains the search to it, but a selective filter guts the graph connectivity HNSW relies on. The production answer is to over-fetch, intersect with an allow-list, and fall back to brute force when the filter is selective enough that scanning the survivors beats fighting the graph. Weaviate flips to flat search around 15% selectivity for exactly this reason.',
+    },
+    {
+      q: 'What does the efSearch (ef) parameter actually control in HNSW?',
+      a: 'It is the width of the candidate list the search keeps as it walks the graph, and it is the live recall-versus-latency dial you can change per query with no rebuild. A higher ef explores more of the graph before settling, which raises recall and costs latency. On the standard Sift1M benchmark, two orders of magnitude of query latency live entirely in this one knob. M (edges per node) sets memory and is fixed at build time; ef is free at rest and adjustable at query time.',
+    },
+  ],
+}
+
+An embedding turns meaning into coordinates. A sentence, an image, a user, a product becomes a point in a few hundred dimensions, and "similar" becomes "close." That single move is what makes [RAG systems](/blog/rag-system), semantic search, and recommendation feeds possible, and it quietly reduces all of them to one question: given a query point, which stored points are nearest?
+
+The honest version of that question is harder than it sounds. The obvious way to answer it does not survive scale, and every clever way that does has agreed to be wrong a little of the time. This piece is about the machinery underneath the phrase "vector search": why the naive approach dies, the three structures that replace it, and how a senior engineer decides which one a given workload needs.
+
+## Why brute force hits a wall
+
+The simplest correct answer is to compare the query against every stored vector and keep the closest k. This is exact k-nearest-neighbors, and its cost is O(N·d): N vectors, each a d-dimensional distance computation. No index, no preprocessing, no surprises. You pay the full sweep every single query.
+
+That bill is fine until it isn't. On the standard Sift1M benchmark (one million vectors at 128 dimensions), a flat brute-force index answers a query in roughly 18 milliseconds at perfect recall. Tolerable. Now keep the per-vector cost fixed and grow the corpus. A billion vectors is a thousand times the work, so the same query takes on the order of 18 seconds, and it degrades linearly in both N and dimension. There is no constant factor or faster CPU that rescues an 18-second interactive search. The wall is structural, and it is the reason the rest of this article exists.
+
+So you give something up. The trade you make has a precise shape, and it governs every decision that follows.
+
+## The trade-off triangle
+
+Approximate nearest-neighbor search lives inside a three-way tension you cannot escape: recall, latency, and memory. Push any vertex and at least one of the others gives.
+
+```
+            recall (accuracy)
+                  /\
+                 /  \
+                /    \
+               /      \
+   latency / QPS ----- memory (RAM)
+```
+
+Recall@k is the quality axis: the fraction of the true top-k neighbors your search actually returned. Latency and its inverse, throughput (QPS), are the speed axis. Memory is the axis everyone forgets until the bill arrives, because a billion raw float32 vectors at 768 dimensions is roughly 2.7 terabytes of RAM, and RAM is the expensive resource. The standard ANN-Benchmarks methodology plots the first two against each other (recall on x, QPS on y, upper-right is better) precisely because they trade so cleanly. Memory is the silent third dimension every one of those curves is paid for in.
+
+Hold this triangle in your head. Every knob below is a way to slide along it, and the skill is knowing which corner a given product can afford to sacrifice. A RAG pipeline that needs 92% recall at 20ms is a different point than a fraud-similarity check that needs 99% at any cost, and they want different indexes.
+
+## HNSW: search a graph by walking toward the answer
+
+HNSW (Hierarchical Navigable Small World) is the default in-memory index, and for good reason. It treats the dataset as a graph where each vector is a node connected to its near neighbors, and search is just navigation: start somewhere, repeatedly hop to whichever neighbor sits closer to the query, stop when no neighbor improves.
+
+The "hierarchical" part is what makes that navigation fast. HNSW stacks several graph layers. Layer assignment is randomized with an exponentially decaying probability (the level multiplier is 1/ln(M)), so the population thins as you climb. For M=32, roughly 97% of nodes live only on the bottom layer, about 3% reach layer one, and well under 0.1% sit higher. If that distribution sounds familiar, it should: the structure is a probabilistic skip list generalized from a list to a graph, and it earns its place as an analogy because the mechanism is genuinely the same. The sparse top layers have long-range edges that cover huge distances in a few hops; the dense bottom layer has short edges that refine. The same intuition powers the skip-list and tree structures behind [Design Twitter](/blog/design-twitter-feed) feeds and ordered indexes generally.
+
+```
+  L2   (o)---------------------(o)        sparse, long edges
+        |                       |
+  L1   (o)-------(o)-----------(o)----(o)  
+        |         |             |      |
+  L0  (o)(o)(o)(o)(o)(o)(o)(o)(o)(o)(o)(o)  dense, short edges
+                        ^
+                     query lands here after descending
+```
+
+A search enters at the single top-layer node, greedily walks toward the query until it hits a local minimum, drops a layer, and repeats. Long edges up top get you to the right neighborhood in a handful of jumps; short edges at the bottom pin down the actual nearest points. Malkov and Yashunin, in the original paper, claim logarithmic complexity scaling for this descent, which is the whole point: search cost grows like log(N), not N.
+
+The contribution most explainers skip is the part that actually makes HNSW work at high recall. When you insert a node, the naive move is to connect it to its M nearest neighbors. HNSW does not do that. It runs a neighbor-selection heuristic that deliberately picks a *diverse* set of neighbors to preserve graph connectivity, so the graph does not fracture into clusters that the greedy walk can get trapped inside. The paper states this heuristic "significantly increases performance at high recall and in case of highly clustered data," and it is the difference between HNSW and the naive small-world graphs that came before it. If you remember one non-obvious thing about HNSW, make it this: the magic is diverse long-range edges, not the layers.
+
+HNSW exposes three knobs, and confusing them is the most common operational mistake:
+
+- **M** is the number of edges per node. Build-time. It sets memory, and only memory among the three. On Sift1M, M=2 needs about 0.5 GB while M=512 needs about 5 GB. FAISS recommends M between 4 and 64.
+- **efConstruction** is how wide a candidate list the builder keeps while inserting. Build-time. It sets graph quality. It does not touch query memory.
+- **efSearch** (often just `ef`) is how wide a candidate list the *search* keeps. Query-time. It is the live recall-versus-latency dial, changeable per query with zero rebuild. On Sift1M, you can ride from sub-0.1ms at low recall to roughly 50ms at near-100% recall by moving ef alone. Two orders of magnitude of latency live in this one number.
+
+The senior framing: M is the memory dial you commit to at build time, ef is the recall dial that is free at rest and tunable at request time. pgvector ships these as `m`, `ef_construction`, and `ef_search`, defaulting to 16, 64, and 40.
+
+What HNSW gives up is memory and mutability. The graph lives in RAM, the build is slow and memory-hungry, and deletes degrade graph quality over time because removing nodes severs the carefully chosen long-range edges. Production systems paper over the last problem with tombstones and asynchronous graph repair, which is real engineering the academic paper never had to face.
+
+## IVF: don't search the whole space, search the right neighborhood
+
+When the corpus grows past what HNSW can comfortably hold in RAM, the dominant approach changes shape. IVF (inverted file) does not build a graph over every vector. It partitions the space.
+
+Run k-means over the dataset to produce `nlist` coarse centroids. Every vector gets assigned to its nearest centroid, and each centroid owns an inverted list of the vectors in its cell. The space is now carved into Voronoi regions, like a map divided into territories. At query time you do not touch every cell. You find the `nprobe` centroids nearest the query and search only those cells, ignoring the rest of the dataset entirely.
+
+```
+   .  .  | x  x  |  .   .       cells = Voronoi regions around centroids
+  . [A] .| x[B]x |. [C] .       Q lands near B; nprobe=2 also opens C
+   .  .  | x  x ●| .   .        ● = query Q
+  --------+-------+---------     shaded cells searched, rest skipped
+   o  o  |  .  . | + +  +
+  o [D] o| .[E]. |+ [F] +       cells A, D, E, F never opened -> the recall miss
+   o  o  |  .  . | + +  +          made visible
+```
+
+`nprobe` is the recall-versus-speed dial. nprobe=1 is fastest and least accurate, because the true nearest neighbor might sit just across a cell boundary in a region you never opened. Crank nprobe up to nlist and you have searched everything, which is exact search again at full cost. The build choice is `nlist`: more cells mean fewer vectors per cell, so each probe is faster, but each probe also sees a smaller slice of the space, so recall per probe drops and you must raise nprobe to compensate. This is the misconception worth killing directly: more cells is not monotonically better. There is an optimum, and past it you are just paying to probe more cells. pgvector calls these `lists` and `probes`, and `probes` defaults to 1.
+
+The operational fact that distinguishes IVF from HNSW is one word: training. IVF cannot index a single vector until it has run k-means to learn the centroids, which means it needs a representative training sample (FAISS suggests 30K to 256K vectors) before it does anything. HNSW builds incrementally from the first insert. That difference drives a surprising amount of real-world architecture, because it means IVF assumes a data distribution, and a distribution that drifts over time eventually needs a retrain.
+
+## Product quantization: stop storing the vectors
+
+Both indexes so far decide *which* vectors to compare. Neither changes how expensive each vector is to store or to compare against. That is a separate problem, and product quantization (PQ) is the separate tool. This is the cleanest litmus test for whether someone understands this space: a shallow explanation treats PQ as an index, a senior one treats it as a codec that is orthogonal to the index.
+
+Here is the mechanism. Take a 768-dimensional float32 vector, which is 3072 bytes. Split it into M sub-vectors (say M=96, so each sub-vector is 8 dimensions). Inside each subspace, run k-means with 256 centroids, which fits in 8 bits. Now store each sub-vector as the single byte naming its nearest centroid. The vector that was 3072 bytes is now 96 bytes, a 32x reduction.
+
+```
+  [ 768 floats = 3072 bytes ]
+        split into M=96 sub-vectors of 8 dims
+  [s1][s2][s3] ... [s96]
+        each sub-vector -> nearest of 256 centroids -> 1 byte id
+  [ 17 ][203][ 8 ] ... [ 91 ]   = 96 bytes   (32x smaller)
+```
+
+The non-obvious win is that PQ is also *faster*, not just smaller. At query time you keep the query at full precision and precompute, for each subspace, the distance from the query's sub-vector to all 256 centroids. Estimating the distance to any compressed database vector is then 96 table lookups and an add, no floating-point distance math at all. This is asymmetric distance computation: full-precision query against compressed database codes via lookup tables. You replaced arithmetic with memory reads.
+
+What you give up is accuracy, because the codes are lossy. The estimated distance is an approximation of the true distance, and at high compression that approximation starts mis-ranking close neighbors. The production fix is not to compress less. It is **rescoring**, also called over-fetching: run the cheap approximate search over compressed vectors to pull a generous candidate set, then re-rank just those few candidates against their full-precision vectors fetched from disk. Weaviate's own numbers show this recovers near-uncompressed recall while keeping the memory win, which is why the real pattern in production is always PQ-then-rescore, never raw PQ. Knowing to size that candidate bucket is a senior tell.
+
+The numbers are why anyone bothers. On a million vectors, Weaviate reports a corpus dropping from about 5,000 MB to 725 MB. At a billion vectors the headline is the whole reason PQ exists: roughly 2.7 TB collapses to about 0.7 TB, the difference between "needs a fleet" and "fits on a box." And PQ is one rung on a ladder, not a binary switch. float32 to float16 (pgvector's `halfvec`, 2x) to int8 scalar quantization (4x) to PQ (about 32x) to binary quantization (32x, with 1-bit dimensions compared by Hamming distance). Each rung trades recall for memory, and the right rung depends on how much quantization noise your embedding model tolerates and whether you rescore.
+
+Crucially, PQ composes with the indexes above rather than replacing them. The canonical FAISS recipe is `IVF...,PQ...`: partition with IVF to decide which vectors to look at, compress with PQ to make looking cheap, rescore to recover the accuracy PQ cost you. Partition times compress times refine. They are Lego, not alternatives, and the same modular instinct runs through [the distributed cache](/blog/distributed-cache) and [consistent hashing](/blog/consistent-hashing): independent layers that each solve one thing.
+
+## The part that actually breaks in production: filtering
+
+"Find similar vectors WHERE tenant_id = X AND price < 100" sounds like a footnote. It is the single most under-appreciated source of vector-search pain, because metadata filters and ANN indexes interact badly in ways no demo exercises.
+
+There are two naive strategies and both have a failure mode.
+
+**Post-filtering** searches first and filters after. The ANN index, which knows nothing about your WHERE clause, returns the top k by similarity, and then you throw away the ones that do not match. If the filter is selective, you can hand back two results out of ten, or zero. The instinct is to over-fetch (ask for the top 200, filter, hope ten survive), which works until it doesn't and meanwhile inflates latency exactly when the filter is most selective. pgvector hit this so squarely that version 0.8.0 added iterative index scans specifically to keep pulling more ANN candidates when a WHERE clause filters out the first batch.
+
+**Pre-filtering** filters first and searches second. Compute an allow-list of matching IDs from an inverted index, then constrain the vector search to it. Weaviate's implementation builds an allow-list of uint64 IDs, lets HNSW traverse edges normally for connectivity, but only *returns* IDs on the allow-list. The catch is structural: a selective filter guts the graph. HNSW's speed depends on those diverse long-range edges, and when 95% of the nodes are off the allow-list, the walk spends its time hopping through dead nodes that can never be returned.
+
+The senior move is the one Weaviate encodes as a hard rule: when the filter matches under roughly 15% of the dataset, abandon the graph and brute-force the survivors. At high selectivity a linear scan of a small allow-list beats fighting a graph whose connectivity the filter has destroyed. That 15% flat-search cutoff is the kind of detail that signals real operational depth, because it admits that the clever index is sometimes the wrong tool and says exactly when. The same "pick the index per query shape" instinct runs through the broader [system design interview framework](/blog/system-design-interview-framework): the data structure that wins depends on the access pattern, and filtered ANN is an access pattern that breaks the default.
+
+This is live research, not settled practice. Qdrant adds filterable links directly into its HNSW graph, Weaviate's ACORN does two-hop neighbor expansion to route around filtered-out nodes, and Pinecone merges the metadata and vector indexes into a single stage. There is no consensus winner yet, which is itself worth knowing.
+
+## How to actually choose
+
+The decisions stack, and the FAISS "guidelines to choose an index" decision tree plus pgvector's defaults encode most of the field's accumulated wisdom. Here is the compressed version.
+
+| Situation | Default move | Why |
+| --- | --- | --- |
+| Small dataset, exact answers needed | Flat (brute force) | Below a few million vectors the sweep is fine, and you get perfect recall for free |
+| Up to ~10M vectors, RAM available | HNSW (`m` 16–32) | Best recall-per-millisecond in memory; ef is a per-query recall dial with no rebuild |
+| Up to low tens of millions, already on Postgres | pgvector (HNSW) | A separate database rarely pays off below this; one system is cheaper than two |
+| 1M–1B vectors | IVF, sized `nlist` ~ 4·√N to 16·√N | Partitioning beats graph traversal once the corpus stops fitting comfortably in RAM |
+| Memory-constrained at scale | IVF + PQ + rescore | PQ cuts RAM ~32x; rescoring against full-precision vectors recovers the recall PQ costs |
+| Billions of vectors, one box | DiskANN / StreamingDiskANN | A flat graph with predictable file offsets lives on SSD; only compressed copies sit in RAM |
+| Billions, GPU budget, hard tail-latency SLOs | Dedicated vector DB | Sharding, replication, GPU search, and p99 control are what you are actually buying |
+
+A few things that table compresses too far to show.
+
+The billion-scale fork is not really HNSW versus IVF, it is "does the index fit in RAM?" HNSW's multi-layer structure scatters across the address space, which on SSD is random-read death. DiskANN and its Vamana graph use a single flat graph with predictable file offsets, plus an alpha pruning parameter (alpha > 1) that preserves long-range edges, so the graph can live on disk while only a compressed copy sits in RAM. That is why pgvectorscale's StreamingDiskANN matters, and why "does it fit in RAM" is the first scaling question, the same way "does the working set fit in cache" frames [latency and the tail](/blog/latency-throughput-tail).
+
+HNSW and IVF compose too. The FAISS string `IVF65536_HNSW32` uses HNSW as the IVF *coarse quantizer*, the thing that assigns vectors to cells, because finding the nearest of 65,536 centroids is itself a nearest-neighbor problem worth indexing. The categories are not mutually exclusive.
+
+And distance metrics are a quiet footgun. Cosine similarity and inner product are interchangeable only when vectors are L2-normalized. pgvector even returns *negative* inner product (`<#>`) because Postgres index scans only go ascending and it needs smaller to mean closer. Forget the sign and your "most similar" results are your least similar ones, ranked confidently backward.
+
+## What is still genuinely unsettled
+
+It would be dishonest to present any of this as finished. Two live debates are worth carrying.
+
+The hierarchy in HNSW is under attack. A 2024 paper titled "Down with the Hierarchy: The 'H' in HNSW Stands for 'Hubs'" argues that above roughly a million vectors the layers contribute little, and that a flat navigable graph with naturally emerging hub nodes matches full HNSW. Present it as a claim, not a verdict, but it is a useful signal that the canonical 2016 paper is not the last word, and that the diverse-edge structure may be doing even more of the work than the layers get credit for.
+
+And benchmarks deserve suspicion in proportion to who ran them. A figure like "28x lower p95 than Pinecone" is a vendor benchmark, tuned by the party with an interest in the result. The neutral reference is ANN-Benchmarks and its recall-versus-QPS curves, which is what you cite when you want to be believed. Treat vendor numbers as directional and reproduce anything load-bearing yourself.
+
+## The honest landing
+
+There is no index that is fast, accurate, and cheap at once, and anyone selling you one is hiding which corner they sacrificed. The entire discipline is choosing that corner on purpose. Brute force gives up speed and keeps perfect recall, which is the right trade below a few million vectors. HNSW gives up memory and mutability to win in-memory latency. IVF gives up a sliver of recall per probe to scale past RAM. Product quantization gives up precision to make the whole thing fit, then buys the precision back with a rescoring pass. Filtering gives up the graph entirely when the filter is selective enough that the graph stopped helping.
+
+A junior reaches for a vector database the moment embeddings appear and treats the index as magic. A senior asks the four questions that actually decide it: how many vectors, does it fit in RAM, what recall does the product genuinely need, and what do the filters look like. Answer those honestly and the right index usually picks itself, and you will have spent your effort on the parts that move the triangle instead of the parts that look impressive in a demo. That is the same discipline behind every real system, from [how LLMs work](/blog/how-llms-work) to the case study where a multi-agent pipeline ([IntelliFill](/case-study/intellifill)) lived or died on retrieval quality: know exactly what you are trading away, and trade it on purpose.
+
+## FAQ
+
+<FAQ />

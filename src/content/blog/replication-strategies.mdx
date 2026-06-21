@@ -1,0 +1,133 @@
+export const meta = {
+  slug: 'replication-strategies',
+  title: 'Replication Strategies That Survive Failure',
+  description:
+    'Single-leader, multi-leader, and leaderless replication, judged by what they do when a node dies: the durability-latency-availability tradeoff, quorums, and fencing.',
+  headline: 'Replication Strategies That Survive Failure',
+  deck: 'Every replication design is a bet about which failure you can tolerate, and the bet only comes due when a node dies.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '16 min',
+  tags: ['replication', 'distributed-systems', 'consistency', 'postgresql', 'dynamo', 'raft', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between synchronous and asynchronous replication?',
+      a: 'Synchronous replication makes the leader wait for a follower to acknowledge a write before it reports success, so a leader crash loses nothing as long as the follower survives. Asynchronous replication reports success immediately and ships the change in the background, so a leader crash loses every write that had not yet reached a follower. The real production default is semi-synchronous: one follower is synchronous and the rest are async, which bounds the data-loss window without letting one slow replica stall every write.',
+    },
+    {
+      q: 'Does a quorum with R + W > N guarantee I read the latest write?',
+      a: 'Only under a strict quorum with no failures. The overlap between the read set and the write set guarantees at least one node in common, so a read sees the latest acknowledged write. The moment you use a sloppy quorum, writes land on substitute nodes that are not in the home set, the overlap can vanish, and a read hitting the home nodes during a partition can miss the value. R + W > N is a statement about the failure-free case, not a promise that holds while things are breaking.',
+    },
+    {
+      q: 'Why is last-write-wins a dangerous default for conflict resolution?',
+      a: 'Last-write-wins picks a winner by timestamp and silently discards the losers, so two writes that were both acknowledged as successful can collide and one disappears with no error. That makes durability depend on clock accuracy, which turns clock skew into a correctness bug rather than a latency one. When concurrent writes are genuinely independent, you want version vectors or CRDTs that encode happens-before and let the application merge, instead of a timestamp coin-flip that throws data away.',
+    },
+    {
+      q: 'Why does promoting a replica not solve failover by itself?',
+      a: 'Promotion is the easy part. The hard parts are detecting that the old leader is actually dead rather than briefly slow, and fencing it so that if it comes back it cannot accept writes and create split-brain. That requires a single source of truth for leadership, usually a consensus store holding a lease, plus a fencing token the storage layer checks so a demoted leader writing late gets rejected. PostgreSQL gives you a manual promote command and nothing else, which is why production setups add Patroni and etcd on top.',
+    },
+    {
+      q: 'How does Raft prevent two leaders from existing at the same time?',
+      a: 'A Raft leader needs votes from a majority of nodes, and any two majorities share at least one member, so two candidates cannot both win the same term. Terms act as a logical clock carried on every message, so a stale leader that was partitioned away learns its term is old the moment it sees a higher one and steps down. Combined with the rule that a leader holds every committed entry from prior terms, a partitioned old leader cannot commit anything new. It is the quorum-overlap idea applied to votes instead of data.',
+    },
+  ],
+}
+
+Replication is the part of a system that looks free in the demo and expensive at 3 a.m. You add a follower, reads get faster, the dashboard turns green, and nothing about the happy path tells you which of your three replication choices you actually made. The choice only reveals itself when a node dies, because that is the only moment the copies can disagree, and disagreement is the entire subject.
+
+So the right way to judge a replication strategy is not how it behaves when everything is up. It is what it does when something is down. Every design below is a standing bet about which failure you are willing to absorb: a little data loss, a little unavailability, or a little staleness. You do not get to avoid the bet. You only get to choose which way it points, and the discipline is knowing which way you chose before the outage forces the answer.
+
+This piece walks the three models in order of how much they let you forget about conflicts, then spends most of its time on the part interviews and postmortems actually turn on: the durability-latency-availability tradeoff, what a quorum really promises, and why failover is a consensus problem wearing a promotion's clothes. It assumes you have met the [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) framing already; replication is where those abstractions cash out into code.
+
+## Three models, sorted by how much conflict they make you handle
+
+There are exactly three shapes for keeping copies in sync, and the honest way to rank them is by how much conflict resolution each one pushes onto you.
+
+Single-leader is the one you already run. One replica is the leader and takes every write; the others are followers that take reads. PostgreSQL, MySQL, MongoDB, and most systems you have touched work this way. Conflicts cannot happen, because there is exactly one writer deciding order. That single ordering point is the whole value, and also the whole liability: it is the thing that fails over.
+
+Multi-leader accepts writes at more than one node, usually one per datacenter or one per offline client. Now two leaders can accept conflicting writes to the same record at the same time, and you own the convergence. You also own a topology choice. Writes propagate all-to-all, in a ring, or through a star, and the ring and star have a sharp failure mode: a single node on the propagation path going down can stall replication for everyone behind it, so all-to-all is the usual pick despite its message-ordering hazards. The defining cost of multi-leader is the convergence, not the wiring. Write conflicts are now a first-class problem you must solve, and the cheapest solution is to make them impossible by routing each record's writes to the same leader.
+
+Leaderless, the Dynamo shape, drops the leader entirely. The client (or a coordinator on its behalf) writes to several replicas in parallel and reads from several in parallel. No single node's failure can stop a write, which is exactly the point. The price is that there is no global order at all, so reconciliation moves to read time and the application often has to help. This is the model behind [the distributed cache](/blog/distributed-cache) and any store built on [consistent hashing](/blog/consistent-hashing) to spread keys across the ring.
+
+The progression is monotone: each step buys you availability and write-locality by handing you more conflict to resolve. A staff engineer picks the leftmost model that meets the availability requirement, because every step right is a permanent tax on application complexity that you pay forever, not just during failures.
+
+## The one tradeoff under all of it: synchronous versus asynchronous
+
+Before the models diverge, they share a single decision that determines almost everything about failure behavior: does the leader wait for a follower before it tells the client "done"?
+
+Asynchronous replication does not wait. The leader commits locally, returns success, and ships the change to followers in the background. Writes are fast because they are gated only by local disk. The cost is a window of data loss: every write that was acknowledged but had not yet reached a follower vanishes if the leader's disk dies. PostgreSQL's own documentation states it without softening: log shipping is asynchronous, so "there is a window for data loss should the primary server suffer a catastrophic failure; transactions not yet shipped will be lost." You traded durability for latency, and the size of the window is your replication lag at the instant of the crash.
+
+Synchronous replication waits. The leader holds the commit until a follower acknowledges, so a leader crash loses nothing, because the data already lives somewhere else. Postgres again, exactly: with synchronous commit "each commit of a write transaction will wait until confirmation is received that the commit has been written to the write-ahead log on disk of both the primary and standby server. The only possibility that data can be lost is if both the primary and the standby suffer crashes at the same time." That sounds like a clean win until you read what it costs. The commit is now gated by the slowest acknowledger, and if the synchronous standby is down, writes do not slow down, they stall. You did not remove the durability problem. You converted it into an availability problem, which is a different failure with a different blast radius.
+
+This is the move that separates someone who has run replication from someone who has read about it. "Synchronous is safe, asynchronous is fast" is true and useless. The senior version names the third option, because nobody serious runs either extreme. The production default is semi-synchronous: one follower is synchronous, the rest are asynchronous. Kleppmann's framing is that enabling synchronous replication in practice usually means one follower is synchronous and the others are not, and the reason is precise. With exactly one synchronous follower you get the durability guarantee (the data is on two disks before you ack) while bounding the stall risk to a single replica, so one slow follower among ten cannot freeze every write. Push it to all-synchronous and your write availability is the product of every follower being up, which is a worse number the more replicas you add.
+
+Postgres exposes this as a durability ladder through `synchronous_commit`, and the levels are not interchangeable knobs, they are different answers to "durable against what":
+
+| Level | The commit waits until | Survives |
+| --- | --- | --- |
+| `off` | nothing (returns before local flush) | almost nothing; pure throughput |
+| `local` | the primary's own disk | a primary process crash, not a disk loss |
+| `remote_write` | the standby's OS has the data | a primary crash, but not a simultaneous standby OS crash |
+| `on` | the standby has flushed to disk | both nodes crashing, unless truly simultaneous |
+| `remote_apply` | the standby has replayed and made it visible | the above, and a read on the standby will see the write |
+
+The rung that trips people is the gap between `on` and `remote_apply`. With `on`, the standby has the bytes durably, but a query running against that standby may not see them yet, because durable is not the same as replayed-and-visible. If you route read-your-own-writes traffic to a read replica, only `remote_apply` gives you the guarantee, and choosing the wrong level breaks read-after-write silently, with no error to tell you. Each rung up the ladder buys a stronger survival guarantee with commit latency, and the right rung is the weakest one that survives the failure you actually care about. This is the same tail-latency reasoning from [latency and the tail](/blog/latency-throughput-tail): synchronous durability is a tax paid in p99 on every single write, set by your worst acknowledger, so you make N small.
+
+## Quorums, and the promise R + W > N does not make
+
+Leaderless systems replace the leader's authority with arithmetic. Pick N replicas per key, require W of them to acknowledge a write and R of them to answer a read, and set the numbers so the read set and write set must overlap. Dynamo states the rule plainly: "Setting R and W such that R + W > N yields a quorum-like system." The overlap is the whole mechanism. If every write touches W nodes and every read touches R nodes and R + W exceeds N, then any read set and any write set share at least one node, so a read is guaranteed to see at least one replica carrying the latest write.
+
+The knobs are not free, and tuning them is a direct expression of which failure you fear. A few configurations at N=3 make the tradeoff concrete:
+
+| (N, R, W) | R + W | What it buys | What it costs |
+| --- | --- | --- | --- |
+| (3, 2, 2) | 4 > 3 | the balanced default; tolerates one node down on each path | nothing dramatic; the textbook pick |
+| (3, 1, 3) | 4 > 3 | fast reads from any single node | writes need all three, so write availability suffers |
+| (3, 3, 1) | 4 > 3 | cheap, fast writes | reads must reach all three; read availability suffers |
+| (3, 1, 1) | 2, not > 3 | maximum availability on both paths | no overlap guarantee; pure eventual consistency |
+
+Read the last row carefully, because it is where the abstraction leaks. The arithmetic only delivers its promise under a strict quorum with no failures. The instant a node in the home set is unreachable, a real system has a choice: fail the write, or accept it somewhere else. Dynamo chose the second, because its business requirement was that the shopping cart is "always writeable," and a rejected Add-to-Cart is lost revenue. So it relaxes the quorum on purpose. The paper is explicit that a strict quorum "would be unavailable during server failures and network partitions," and instead Dynamo performs reads and writes on "the first N healthy nodes from the preference list, which may not always be the first N nodes encountered while walking the consistent hashing ring."
+
+That is a sloppy quorum, and it deliberately breaks the overlap invariant to keep writing. When node A is down, the write that belonged on A goes to a substitute, say node D, and D's copy carries a hint in its metadata naming A as the real owner. When A recovers, D ships the data back and deletes its local copy. The write never blocked, and durability survived the outage. This is hinted handoff, and it is genuinely clever, but it has a corollary you must say out loud: while A is down, the write set and a read set hitting the home nodes can have an empty intersection, so R + W > N no longer guarantees you read the latest write. The most common quorum misconception is treating that inequality as an absolute. It is a failure-free guarantee that a sloppy quorum trades away to stay available, and the bill comes back as reconciliation debt that an anti-entropy process, Merkle-tree diffing in Dynamo's case, has to pay down later. You can read the same R + W > N machinery applied to a different problem in [the URL shortener](/blog/url-shortener), where the read-heavy ratio pushes the knobs the opposite direction.
+
+## When the data conflicts anyway
+
+A strict single-leader system never has write conflicts. Everything else does, and how you resolve them is the sharpest senior signal in the whole topic, because the easy answer is also the lossy one.
+
+Last-write-wins is the easy answer. Stamp every write with a timestamp, and on conflict keep the highest. It always converges, which is why it is tempting. Kleppmann's phrasing for the cost is the one to remember: with LWW, "only one of the writes will survive and the others will be silently discarded." Two writes that were each acknowledged as successful collide, one is chosen by clock, and the other is gone with no error anywhere. That makes durability a function of clock accuracy, which means clock skew stops being a latency annoyance and becomes a correctness bug. Treating LWW as a safe default is the third common misconception, and it is the most expensive one, because the failure is invisible until a customer notices their change reverted.
+
+The senior move is to encode causality instead of guessing it. Version vectors track, per replica, which versions a value descends from, so the system can tell whether two writes are causally ordered (keep the later) or genuinely concurrent (neither happened-before the other, so do not silently drop either). Dynamo carries this with vector clocks, and its Figure 3 walks the canonical case: two versions `D3 = ([Sx,2],[Sy,1])` and `D4 = ([Sx,2],[Sz,1])` are concurrent, neither descends from the other, so both are returned to the client, and after the application merges them, `D5 = ([Sx,3],[Sy,1],[Sz,1])` subsumes both. The data store did the dumb thing it can do (detect the conflict); the application did the smart thing only it can do (merge two shopping carts into their union). That division is deliberate. Dynamo's design choice is that the store can only resolve syntactically and the application resolves semantically, and pushing resolution to read time is precisely what makes "always writeable" possible. The famous side effect is that a deleted item can resurface, because a concurrent write that did not see the delete is a legitimate version, not an error.
+
+One precision that trips even experienced people, and is worth stating because mixing it up produces subtly wrong code: vector clocks and version vectors have the same shape but different semantics. Vector clocks order events; version vectors compare replica versions and answer equal-or-concurrent-or-dominates. When you can avoid the whole question, do: a CRDT is a data type whose merge is defined to be commutative, associative, and idempotent, so concurrent updates converge without coordination and without throwing anything away. Reach for a naturally mergeable structure before you reach for a timestamp tiebreak, because the structure preserves both writes and the timestamp destroys one.
+
+## Failover is not promotion, it is consensus
+
+Here is where single-leader collects on the bet it made. Its one writer is its one point of failure, and the recovery story is failover: promote a follower to leader. The trap is that promotion is the trivial part. The hard parts are the two questions nobody tests until production asks them.
+
+First, who decides the leader is dead? "Dead" and "slow" look identical from across a network. Promote too eagerly and you crown a second leader while the first is merely garbage-collecting. Promote too slowly and you are down for the duration of your detection timeout. Second, and worse, what stops two nodes from each believing they are the leader? The moment two processes can both accept writes, you have split-brain, and split-brain means divergent histories that no merge can cleanly reconcile, because both sides accepted writes they each thought were authoritative.
+
+Raft is the answer to the first two questions made safe by construction, and the way it works is the quorum idea from the last section pointed at leadership instead of data. It decomposes the problem into leader election, log replication, and safety. Terms are a logical clock: a monotonically increasing number carried on every message, so a leader partitioned away in term 4 learns the instant it sees term 5 that it is stale, and steps down. Elections use randomized timeouts, typically 150 to 300 ms, so split votes are rare and self-correcting rather than a thundering herd. And the reason two valid leaders cannot coexist is exactly R + W > N moved onto votes: a leader needs a majority to win, any two majorities intersect in at least one node, and that shared node will not vote twice in the same term. Layer on the Leader Completeness Property, that a leader for any term already holds every entry committed in prior terms, and a stale partitioned leader cannot commit anything, because it cannot assemble a majority that does not include nodes who have moved on.
+
+Raft has a famous subtlety that is worth knowing precisely, because misimplementing it is the classic Raft safety bug. A leader may not mark a previous-term entry committed merely because it is now replicated on a majority. It must commit an entry from its own current term, which drags the older entries along underneath it. Skip that and a later leader can legitimately overwrite an entry you already told a client was durable. The lesson under the detail is that "replicated on a majority" and "safely committed" are not the same claim, and the gap between them is where consensus bugs live. There is one more misconception to retire here: even a correct Raft leader can serve a stale read until it learns its term is old, so linearizable reads need a lease or a read-index round-trip, and membership changes need joint consensus (agreement from both the old and new majority during the transition) or you can transiently create two disjoint majorities, which is split-brain by another name.
+
+Now the practical gut-punch, the thing that surprises people who assume their database handles this. PostgreSQL does not do any of it for you. Native Postgres gives you `pg_ctl promote` and `pg_promote()`, and that is a manual command. There is no built-in detection that the primary died, no quorum-based promotion, no fencing of the old node. That gap is the entire reason Patroni plus etcd or Consul or ZooKeeper exists: the consensus store holds the leader lease and provides the agreement Postgres lacks, and Patroni does the fencing. If you wire up streaming replication and call it high availability, you have built a building block and mistaken it for the building, and the ninth misconception, that streaming replication is an HA solution, is exactly that mistake.
+
+## The detail that makes failover actually safe: fencing
+
+Suppose you solved detection and consensus. There is still one knife left on the table, and it is the one that cuts in real incidents.
+
+A lease is a lock with an expiry, and you need the expiry because a leader can die without telling anyone, so the lock has to release itself. But an expiry under real-world conditions, process pauses, unbounded network delay, clock skew, is not enough for mutual exclusion. Kleppmann's incident is the canonical proof and worth carrying as a mental model. Client 1 acquires the lease and then suffers a stop-the-world garbage-collection pause. While it is frozen, the lease expires, and Client 2 legitimately acquires it and writes. Then Client 1 wakes up, with no idea time has passed, still believing it holds the lock, and writes. Two writers, one resource, corrupted state, and every individual component behaved correctly. He notes a real 90-second network delay observed in production as existence proof that pauses this long actually happen, so this is not a thought experiment you can wave away.
+
+The fix is a fencing token: a strictly monotonically increasing number handed out at lock acquisition, which the protected resource checks and remembers. Client 1 got token 33. Client 2 got token 34 and wrote. When Client 1 wakes and tries to write with 33, the storage layer has already seen 34, so it rejects 33. The lock no longer has to be perfect, because the resource enforces order independently, refusing any write that arrives with a token older than one it already honored. Kleppmann's specific indictment of Redlock is that it has no facility for generating fencing tokens, so it cannot offer this guarantee no matter how carefully you tune the timeouts.
+
+This is the detail that turns "we have failover" from a slide into a true statement. The token is what makes a demoted leader's late write bounce instead of land. Without it, you are not preventing split-brain corruption, you are hoping the old leader stays down, and hope is not a fencing strategy. The realistic Postgres HA stack makes the missing pieces visible: a primary, a synchronous standby, an async standby, and above them a Patroni-plus-etcd control plane holding the leader lock and issuing the fencing that native Postgres never provided.
+
+## The honest landing
+
+Replication does not have a best answer, because the question is which failure you can live with, and that is a property of your product, not your database. Single-leader gives you a clean order and hands you the failover problem. Multi-leader and leaderless buy availability and write-locality and hand you the conflict problem. Synchronous commit buys durability and hands you a stall. A quorum buys consistency in the failure-free case and hands you reconciliation debt the moment a node drops. Every one of these is the same shape: a guarantee on one axis paid for on another, and the only wrong move is to claim the guarantee while forgetting the bill.
+
+So the tell of someone who has actually run this is small. They never say "strongly consistent" or "highly available" as a finished sentence. They say which knob bought it (sync commit, R + W > N, a Raft majority) and what it cost on the other axis (a stall, write-availability, a stale-read window). Pick the leftmost model that meets your availability bar. Run semi-synchronous, not the extremes. Treat R + W > N as a failure-free promise and plan for the partition that breaks it. And remember that failover is consensus plus fencing, not a promote command, because the copies only ever disagree when something is down, and surviving that moment is the entire job. The replica you provisioned for read throughput becomes, on its worst night, the thing standing between an outage and data loss. Whether it holds depends on choices you made when everything was still green. If you want to fit this into a broader study plan, it slots cleanly behind [the system design interview framework](/blog/system-design-interview-framework) and the [capacity estimation](/blog/capacity-estimation) math that tells you how many replicas you are paying for in the first place.
+
+## FAQ
+
+<FAQ />

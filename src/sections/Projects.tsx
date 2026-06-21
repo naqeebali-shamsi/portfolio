@@ -115,7 +115,7 @@ const Tier2Card: React.FC<{ project: Project }> = ({ project }) => {
       role="button"
       tabIndex={0}
       aria-pressed={flipped}
-      aria-label={`${project.name} — ${flipped ? 'show summary' : 'show more detail'}`}
+      aria-label={`${project.name}: ${flipped ? 'show summary' : 'show more detail'}`}
     >
       <div className="project-flip__inner">
         {/* Front — compact summary */}
@@ -181,7 +181,7 @@ const Tier2Card: React.FC<{ project: Project }> = ({ project }) => {
           open={demoOpen}
           src={project.video}
           poster={project.videoPoster}
-          title={`${project.name} — demo`}
+          title={`${project.name} demo`}
           onClose={() => setDemoOpen(false)}
         />
       )}

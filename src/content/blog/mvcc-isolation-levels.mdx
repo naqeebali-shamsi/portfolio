@@ -1,0 +1,184 @@
+export const meta = {
+  slug: 'mvcc-isolation-levels',
+  title: 'MVCC and Isolation Levels: How a Database Serves Concurrent Transactions',
+  description:
+    "Isolation levels promise which anomalies cannot happen. MVCC keeps readers off the lock path, snapshot isolation leaves write skew open, and SSI buys it back.",
+  headline: 'MVCC and Isolation Levels: How a Database Serves Concurrent Transactions',
+  deck: 'Snapshot isolation feels like serializability right up until two transactions read the same rows, write different ones, and quietly break an invariant nobody guarded.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['mvcc', 'isolation-levels', 'transactions', 'postgresql', 'mysql', 'databases', 'system-design'],
+  faq: [
+    {
+      q: 'Does Postgres Repeatable Read prevent phantoms mean it is serializable?',
+      a: "No, and this is the single most common mistake on the topic. Postgres Repeatable Read is snapshot isolation: it forbids dirty reads, non-repeatable reads, and even phantom reads, which is stronger than the SQL standard requires. But it still permits write skew, where two transactions read an overlapping set of rows, each decides based on a now-stale snapshot, and each writes to different rows so no write-write conflict fires. That gap is exactly why a separate Serializable level using SSI exists.",
+    },
+    {
+      q: 'What is write skew and why can snapshot isolation not catch it?',
+      a: "Write skew is when two concurrent transactions read an overlapping set of rows, make a decision based on what they read, and then write to different rows, breaking an invariant that spans both. The classic case is two on-call doctors each seeing two doctors are on call, each marking themselves off, both committing, and zero doctors remaining. Snapshot isolation checks the rows you wrote for conflicts, not the rows you read to make the decision. Different rows written means no write-write conflict, so SI commits both. Serializable Snapshot Isolation closes it by tracking reads too.",
+    },
+    {
+      q: 'Why does MVCC let readers never block writers?',
+      a: "Under MVCC every write creates a new version of the row instead of overwriting it, and old versions linger until no live snapshot can still see them. A reader picks the version that matches its snapshot and takes no read locks at all, so the read path never contends with the write path. The Postgres docs put it plainly: reading never blocks writing and writing never blocks reading. The cost is not eliminated, it is deferred, and shows up later as dead versions that vacuum or purge must reclaim.",
+    },
+    {
+      q: 'How is Postgres Serializable different from MySQL Serializable?',
+      a: "They reach the same guarantee through opposite mechanisms. Postgres uses Serializable Snapshot Isolation, an optimistic scheme that lets transactions run on snapshots and aborts the dangerous one after the fact with SQLSTATE 40001, so you need retry logic. InnoDB Serializable is pessimistic: it promotes plain SELECT statements to locking reads (effectively FOR SHARE) and uses next-key locks, so a conflicting transaction blocks and waits rather than aborting. One trades retries for throughput, the other trades waiting for fewer aborts.",
+    },
+    {
+      q: 'Why is choosing the strongest isolation level not the safe default?',
+      a: "Stronger isolation is not free safety, it is more aborts, more retries, more contention, and worse tail latency as concurrency rises. The staff-level move is per-transaction: identify the invariant the transaction must preserve, pick the weakest level that still preserves it, and push correctness into the schema or query where you can with unique constraints, SELECT FOR UPDATE, or materialized conflict rows. Read Committed is the right default for most OLTP writes. Serializable is for the read-decide-write invariant that spans rows you do not write.",
+    },
+  ],
+}
+
+A database with one user is a data structure. A database with a thousand concurrent users is a referee, and the rules it enforces between them are the isolation levels. Everyone learns the four level names early and most people stop there, which is how you end up with a system that passes every test and corrupts an invariant the first busy Tuesday it sees real concurrency.
+
+The thing the names hide is that an isolation level is a promise about what *cannot* happen, never a description of how the database makes that promise. Two engines can both say "Repeatable Read" and behave like genuinely different animals underneath. And one level that almost everybody treats as "basically serializable" is the one that will silently let two transactions cooperate to break a rule neither of them broke alone.
+
+This piece is about what each level actually guarantees, the one anomaly the popular table forgets, the mechanism (MVCC) that lets your reads run free, and the senior judgment call hiding in all of it: pick the weakest isolation that is still correct, and make the database your concurrency referee on purpose. If you want the wider map this sits inside, the [database mindmap](/blog/database-mindmap) places concurrency control next to storage and replication.
+
+## Isolation levels are promises, not mechanisms
+
+The SQL standard defines isolation levels by which **phenomena** they forbid. Three phenomena, classically: a *dirty read* (you read another transaction's uncommitted write), a *non-repeatable read* (you read a row twice in one transaction and get two different committed values), and a *phantom read* (you run the same predicate query twice and the *set* of matching rows changes because someone inserted or deleted). A level is then named by which of these it bans.
+
+That sounds clean. It is also leaky, and the leak matters. The 1995 paper "A Critique of ANSI SQL Isolation Levels" by Berenson, Gray, and colleagues showed that the standard's phenomenon definitions admit a strict and a loose reading, so the *same level name* permits wildly different real behavior depending on interpretation. Adya, Liskov, and O'Neil later fixed this with implementation-independent definitions that describe anomalies directly, so the rules cover multiversion and optimistic schemes and not only lock schedules. That shift is why modern database docs talk about anomalies rather than lock orderings.
+
+The practical consequence: "Repeatable Read" means one thing in textbook lock-think, a stronger thing in Postgres, and a third thing in InnoDB. Naming is a trap. You have to ask what each engine actually forbids, because the label will lie to you by omission.
+
+## The anomaly ladder, with the forgotten rung
+
+Here is the canonical table, with what Postgres and InnoDB actually do annotated in, because the standard's version and reality have drifted apart.
+
+| Isolation level | Dirty read | Non-repeatable read | Phantom read | Write skew |
+| --- | --- | --- | --- | --- |
+| Read Uncommitted | Allowed by standard, never in PG (acts as RC) | possible | possible | possible |
+| Read Committed | no | **possible** | possible | possible |
+| Repeatable Read | no | no | standard allows, **PG and InnoDB both forbid** | **possible** |
+| Serializable | no | no | no | no |
+
+Read the Repeatable Read row twice, because it carries the whole lesson. Both major open-source engines make Repeatable Read stronger than the standard demands: they kill phantom reads too. Postgres does it by serving the whole transaction from one consistent snapshot; InnoDB does it with gap and next-key locks. So far Repeatable Read looks airtight.
+
+It is not. Look at the last column. Repeatable Read forbids dirty reads, non-repeatable reads, and phantom reads, and still permits **write skew**. That rung is missing from the three-anomaly version most people memorize, and it is the rung you fall through in production. The reviewer's one-question seniority test is exactly this: "Postgres Repeatable Read prevents phantoms, so it is serializable, right?" The shallow answer is "basically, yes." The correct answer is "no, it still allows write skew, which is precisely why a separate Serializable level exists."
+
+## MVCC: the mechanism that takes readers off the lock path
+
+Before write skew, the engine underneath. The reason a modern database can serve a snapshot at all is Multiversion Concurrency Control, and it earns its keep on read-heavy workloads.
+
+The idea: every write creates a *new version* of the row rather than overwriting the old one in place, and each statement (or each transaction, depending on level) sees a snapshot of the data as it was at some point in time, regardless of what is happening to the underlying rows right now. The Postgres docs state the payoff directly: locks acquired for reading do not conflict with locks acquired for writing, so **reading never blocks writing and writing never blocks reading**. A reader walks the version chain, picks the version its snapshot is allowed to see, and takes *no read locks at all*.
+
+That is the whole trick, and it is why MVCC scales reads: the read path never contends with the write path, so a reporting query and a flood of writes do not serialize against each other the way they would under pure two-phase locking. This is the same family of design tension you see in [LSM-tree vs B-tree](/blog/lsm-tree-vs-btree) storage, where you also pay later (compaction there, version cleanup here) to keep the hot path cheap.
+
+The cost is real and it is *deferred, not removed*. Old versions pile up. Something has to come along later and collect the garbage once no live snapshot can still see it, and that "something" is a system with a hard deadline, which is where this story gets operational. Hold that thought.
+
+## Snapshot isolation, and the exact crack it leaves open
+
+Snapshot isolation (SI) is what you get when MVCC gives every transaction a consistent point-in-time view for its whole duration. Postgres Repeatable Read *is* snapshot isolation. InnoDB's default Repeatable Read is close kin. It feels almost serializable, and that feeling is the trap.
+
+SI does catch write-write conflicts. If two SI transactions try to write the same row, the database enforces first-committer-wins: the later committer aborts with "could not serialize access due to concurrent update." Same row, only one survives. Good.
+
+The crack is what SI checks and what it ignores. **SI validates the rows you wrote. It never validates the rows you read to make your decision.** So picture two transactions that read an overlapping set of rows, each reaches a conclusion from its own snapshot, and each then writes to *different* rows. No write-write conflict fires, because the writes do not collide. Both commit. And the invariant that spanned those rows is now broken, even though each transaction in isolation looked correct.
+
+That is **write skew**, and the canonical example makes it visceral. Invariant: at least one doctor must stay on call. Alice and Bob are both on call.
+
+```
+T1 (Alice)                            T2 (Bob)
+SELECT count(*) WHERE on_call=true;   SELECT count(*) WHERE on_call=true;
+-- sees 2, "safe to leave"            -- sees 2, "safe to leave"
+UPDATE doctors SET on_call=false      UPDATE doctors SET on_call=false
+   WHERE name='Alice';                   WHERE name='Bob';
+COMMIT;  -- ok                         COMMIT;  -- ok
+```
+
+Both read "2 on call, safe." Each removes only their own row. Different rows, no collision, both commit. Zero doctors on call, and the pager is now everyone's problem. Under Postgres Serializable, one of these aborts instead. Under SI / Repeatable Read, both win and the hospital loses.
+
+The Postgres docs ship a minimal reproducible version of this with a table `mytab(class, value)`. Transaction A sums `class=1` and inserts a row into `class=2`; transaction B sums `class=2` and inserts into `class=1`. At Repeatable Read both commit. At Serializable, one fails with `could not serialize access due to read/write dependencies among transactions`, and the docs' reasoning is the heart of write skew: if A had run before B, B would have computed a different sum, and vice versa, so no serial order reproduces this result.
+
+Worth knowing which two errors you are looking at, because they mean different things and both demand a retry:
+
+- Repeatable Read, write-write collision: `could not serialize access due to concurrent update`
+- Serializable, read/write dependency (write skew): `could not serialize access due to read/write dependencies among transactions`
+
+Both arrive as **SQLSTATE 40001**, the universal "abort and retry the whole transaction" signal. Treat 40001 as a contract, not a crash: catch it, back off, re-run the transaction against a fresh snapshot. Only *updating* transactions ever get it, which usefully scopes where your retry logic has to live.
+
+One more distinction that separates people who know this cold from people who skimmed it: **lost update is not write skew.** A lost update is two read-modify-write cycles on the *same* row, where one silently overwrites the other. Its cures are local: an atomic `UPDATE ... SET x = x + 1`, an explicit `SELECT ... FOR UPDATE`, or SI's own first-committer-wins. Write skew is read-decide-write across *different* rows, and no per-row lock saves you because there is no single contended row. Same family, different cure. Conflating them is a tell.
+
+## SSI: buying serializability back without paying for locks
+
+So how does Postgres deliver true Serializable while keeping MVCC's lock-free reads? Not by reverting to two-phase locking. It uses Serializable Snapshot Isolation (SSI), the algorithm from Cahill, Röhm, and Fekete's 2008 paper, and the design is genuinely elegant.
+
+The key theorem: every non-serializable execution under snapshot isolation contains a specific **dangerous structure**, a "pivot" transaction with both an incoming and an outgoing read-write dependency edge, where the transaction on the far end of the outgoing edge commits first. The Postgres SSI implementation notes draw it as:
+
+```
+Tin ------rw------> Tpivot ------rw------> Tout
+                       ^                      |
+                  the one that          commits first
+                  gets aborted (40001)
+```
+
+A read-write dependency means one transaction read a datum that another later wrote. SSI tracks reads using **SIREAD locks**, which are the cleverest part: they are non-blocking markers that merely record "this transaction read this datum." They *never* cause anyone to wait. They are metadata for conflict detection, not access control. When the engine sees one transaction acquire both an inbound and an outbound rw-dependency in this dangerous shape, it aborts the pivot with 40001.
+
+The honest tradeoff: SSI is **conservative**. Detecting the full structure precisely is expensive, so it errs toward safety and will sometimes abort transactions that *would* have been serializable. Those false positives are the price of cheap, lock-free detection, and they are partly tunable. To bound memory, SIREAD locks undergo **granularity promotion**: tuple-level tracking coarsens to page-level and then relation-level as a transaction touches more data, which caps memory but *increases* false aborts as the locks get coarser. There is a real memory-versus-spurious-abort knob under the hood. The punchline is the whole reason SSI is worth it: serializability at snapshot-isolation read cost, paid for with occasional retries rather than constant blocking.
+
+There is one escape hatch worth knowing. `SERIALIZABLE READ ONLY DEFERRABLE` is the single case where a Serializable transaction *blocks* instead of risking abort: it waits until it can take a safe snapshot, then runs lock-free and abort-free. That is the right tool for a long analytic read on an OLTP system you are keeping at Serializable, and it pairs naturally with reading from a replica, which is where [replication strategies](/blog/replication-strategies) and isolation start to interact. Read-only transactions never get serialization failures anyway, so they are the cheap part of the system to reason about.
+
+## Postgres versus InnoDB: same disease, different organs
+
+Both engines are MVCC. How they store versions, prevent phantoms, and deliver Serializable are three places they diverge sharply, and a staff engineer should be able to contrast them without notes.
+
+**Storing versions.** Postgres writes a new tuple *into the heap* for every update and leaves the old one there, dead, until vacuum reclaims it. InnoDB updates the row mostly in place and pushes the prior version into an **undo log**. Every InnoDB row physically carries three hidden fields: `DB_TRX_ID` (6 bytes, the last transaction to touch the row), `DB_ROLL_PTR` (7 bytes, a roll pointer to the undo record that rebuilds the previous version), and `DB_ROW_ID` (6 bytes, materialized only when you gave the table no primary key). A consistent read at Repeatable Read that finds `DB_TRX_ID` newer than its snapshot walks the `DB_ROLL_PTR` chain back into the undo log to reconstruct the version it is allowed to see. Same outcome as Postgres (the right version for your snapshot), opposite physical layout.
+
+**Preventing phantoms.** Postgres leans on the snapshot itself plus SSI's predicate-aware SIREAD tracking. InnoDB leans on **next-key locks**, which lock both the index record and the gap before it, so another transaction cannot insert a row that would satisfy your predicate. One answer is optimistic and snapshot-based; the other is pessimistic and lock-based. Two genuinely different engineering answers to the same anomaly.
+
+**Delivering Serializable.** Postgres Serializable is SSI: optimistic, abort-based, retry-driven. InnoDB Serializable is a *different mechanism entirely*. It promotes every plain `SELECT` to a locking read (effectively `LOCK IN SHARE MODE` / `FOR SHARE`), so conflicting transactions block and wait rather than aborting. This is the deepest "both use MVCC" trap: the same word, *Serializable*, names an optimistic system in one engine and a pessimistic one in the other. Which you prefer depends on your workload. Optimistic wins when conflicts are rare and you would rather not hold locks; pessimistic wins when conflicts are common and you would rather wait than burn work on transactions you will abort.
+
+Also worth pinning down, because the defaults differ: **InnoDB's default isolation is Repeatable Read.** Most other systems default to Read Committed. If you move a workload from Postgres to MySQL or back without checking, your default concurrency semantics change underneath you.
+
+## Vacuum and purge: the bill MVCC always sends
+
+MVCC's deferred cost comes due, and ignoring it is not housekeeping you can skip. It is on the critical path of correctness.
+
+**Postgres VACUUM.** Dead tuples from updates and deletes are not removed immediately, because some live snapshot might still need them. VACUUM reclaims them, maintains the visibility map, and **freezes** old transaction IDs. The freezing part hides a hard deadline. Transaction IDs are 32-bit, so the space wraps after about 4.29 billion transactions, with a usable horizon near 2 billion before old transactions start to look like they are in the future. If freezing falls too far behind, Postgres escalates: first a `WARNING: database "mydb" must be vacuumed within 39985967 transactions`, and eventually `ERROR: database is not accepting commands that assign new XIDs to avoid wraparound data loss`, at which point the database refuses writes and goes read-only until you vacuum. MVCC's bookkeeping has a literal countdown attached.
+
+There is a quieter performance angle too: index-only scans depend on the visibility map. Let bloat accumulate, the map goes stale, fewer scans qualify as index-only, and reads slow down. Cleanup is a performance lever, not only a correctness one.
+
+**InnoDB purge.** Old versions live in the undo logs, and a background **purge** thread removes them once no snapshot needs them. The failure mode is the mirror image of Postgres, and it is the one that bites teams in practice: a single long-running transaction holds an old read view, which means *no version newer than that view can be purged for the entire system*. The undo logs and `ibdata1` balloon, the history list grows without bound, and one forgotten `BEGIN` sitting idle in a connection pool can degrade the whole instance.
+
+That last point is the unifying lesson across both ecosystems. In Postgres, a long transaction, an abandoned replication slot, or an `idle_in_transaction` connection holds back the global xmin and defeats VACUUM the same way. **Same root cause, two engines: the oldest open read view holds version cleanup hostage for everyone.** Whichever database you run, the operational rule is identical: keep transactions short, and hunt down idle-in-transaction connections like the liabilities they are.
+
+## The senior move: weakest isolation that is still correct
+
+Now the judgment call that all of this exists to support, and it is the opposite of the instinct most people have.
+
+Stronger isolation is not "safer by default." It is more aborts, more retries, more contention, and tail latency that degrades sharply as concurrency rises, since SSI's false-positive aborts and InnoDB's lock waits both get worse under load. Reaching for `SERIALIZABLE` everywhere maximizes your abort-and-retry rate and punishes you exactly when traffic is highest. The staff-level decision is not "how strong can I afford," it is **per-transaction: what invariant must this transaction preserve, and what is the weakest level that preserves it?**
+
+A workable default ladder:
+
+- **Read Committed** for the bulk of OLTP writes. Each statement takes a fresh snapshot, so yes, you will see non-repeatable reads, but that is by design and usually fine. This is the right floor for most write transactions.
+- **Repeatable Read / Snapshot Isolation** when a transaction runs several statements that must agree on one consistent point-in-time view (a multi-statement report, a consistent export). Stable snapshot, no phantoms in PG or InnoDB.
+- **Serializable** only when a transaction does a **read-decide-write across rows it does not itself write**, the write-skew shape. That is the one case the weaker levels genuinely cannot make correct on their own.
+
+And before you climb the ladder, ask whether you can push correctness *down into the schema or the query* instead, which is almost always cheaper than raising the global isolation level:
+
+- A **unique constraint** turns "check then insert" into an atomic guarantee the database enforces, killing a whole class of races without any isolation change. (This is the same lever that makes [idempotent webhooks](/blog/idempotent-webhooks) safe under concurrency.)
+- **`SELECT ... FOR UPDATE`** locks the specific rows a transaction read, converting a read-decide-write into an explicit lock and curing lost updates outright.
+- **Materializing conflicts** means inserting real, lockable rows to represent an otherwise-implicit predicate, which gives write skew something concrete to collide on, so even SI can serialize it.
+
+That is the difference between a junior answer ("use the strongest level you can afford") and a staff answer ("use the weakest correct level for *this* transaction, and encode the invariant in the schema where the database can enforce it cheaply"). It is the same instinct that runs through good [system design interviews](/blog/system-design-interview-framework): name the invariant, choose the minimum machinery that protects it, and be explicit about the tradeoff you are buying. The consistency-versus-latency dimension this all rides on is the subject of [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) once these transactions span more than one node.
+
+## Where this shows up in real systems
+
+This is not academic. The write-skew shape is everywhere a real product enforces a cross-row rule. Booking the last seat on a flight or the last room for a date, decrementing inventory to exactly zero, enforcing a spending limit across multiple line items, keeping a minimum staffing count, debiting a wallet that two requests hit at once: each is a read-decide-write where the rows you read are not all the rows you write, and each is a candidate for write skew under snapshot isolation. The ride-dispatch correctness in [Design Uber](/blog/design-uber) and the engagement counters in [Design Instagram](/blog/design-instagram) both live on exactly these decisions. On the product side, IntelliFill's document-processing pipeline ([IntelliFill](/case-study/intellifill)) and NomadCrew's shared trip state ([NomadCrew](/case-study/nomadcrew)) both depend on concurrent writes converging correctly, which is this problem wearing application clothes.
+
+The instinct to reach for it is good, the reflex to max out the isolation level is not. Find the invariant, protect it at the lowest correct level, and let the database referee the rest.
+
+## The honest landing
+
+Isolation levels are promises about which anomalies cannot happen, and the names lie by omission, so you read what each engine actually forbids. MVCC takes readers off the lock path by versioning writes instead of overwriting them, which is why your reads scale, and the bill arrives later as vacuum and purge with a wraparound deadline attached. Snapshot isolation buys you almost everything, then leaves write skew open because it checks the rows you wrote and never the rows you read. SSI buys serializability back with optimistic abort-and-retry; InnoDB buys it back with locks; and SQLSTATE 40001 is a contract you implement, not a crash you fear.
+
+The job, the part that separates staff from senior from "knows the four names," is the decision: name the invariant, choose the weakest isolation that still keeps it true, and push correctness into a unique constraint or an explicit lock whenever the schema can carry it. Do that and your busy Tuesday is uneventful. Skip it, and snapshot isolation will let two perfectly correct transactions break a rule that neither one broke, and you will spend the night learning what write skew is the expensive way.
+
+## FAQ
+
+<FAQ />

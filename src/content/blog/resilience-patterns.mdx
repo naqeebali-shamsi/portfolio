@@ -1,0 +1,166 @@
+export const meta = {
+  slug: 'resilience-patterns',
+  title: 'Retries, Timeouts, and Circuit Breakers: Keeping One Failure From Becoming an Outage',
+  description:
+    "A slow dependency, not a dead one, is what takes systems down. How timeouts, retries with jitter, circuit breakers, and bulkheads keep one failure local instead of total.",
+  headline: 'Retries, Timeouts, and Circuit Breakers: Keeping One Failure From Becoming an Outage',
+  deck: 'A dependency that fails fast returns your thread. A dependency that hangs holds it, and held threads are how one slow service drains an entire fleet.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['resilience', 'distributed-systems', 'circuit-breaker', 'reliability', 'sre', 'system-design'],
+  faq: [
+    {
+      q: 'Why is a slow dependency worse than a dead one?',
+      a: "A dead dependency fails fast and returns the caller's thread immediately, so the pool stays drained for only a moment. A slow one holds the thread for the full duration of the hang, and under steady traffic those held threads accumulate faster than they are released until the pool is exhausted. Once the pool is empty, every caller blocks, including ones that have nothing to do with the slow dependency, and the outage spreads upward. The proximate cause of most cascades is pool exhaustion from latency, not errors.",
+    },
+    {
+      q: 'In what order should I apply these resilience patterns?',
+      a: "Timeout first, because without a bound on how long a call can take, nothing else can fire. Then retries with backoff and jitter, gated on idempotency. Then a circuit breaker so you stop calling a dependency that is clearly down. Then bulkheads to isolate the pools so one sick dependency cannot drain shared capacity. Graceful degradation is the goal the other four exist to enable. The order is a dependency chain, not a menu: a circuit breaker is useless if the underlying call can still block forever.",
+    },
+    {
+      q: 'Does adding retries make my system more reliable?',
+      a: "Only with backoff, jitter, and a retry budget, and only for idempotent operations. Naive retries make a blip worse. If five layers each retry three times, one user action becomes 243 calls on your database, which is a self-inflicted denial of service. Retrying into an overloaded system also adds arrival rate, which raises latency, which trips more timeouts, which triggers more retries: a feedback loop. Retry at exactly one layer, cap the fraction of traffic that may be retries, and never retry a malformed request.",
+    },
+    {
+      q: 'When does a circuit breaker trip?',
+      a: "Not on the first failure. It trips when the error rate crosses a threshold over a minimum request volume inside a rolling window, so a single failure does nothing and should not. Classic Hystrix defaults require at least 20 calls in a 10-second window and a 50 percent error rate. Modern breakers like resilience4j also trip on slow-call rate, counting calls that succeed but exceed a duration threshold, so the breaker opens before the dependency hard-fails and before your pool drains.",
+    },
+    {
+      q: 'What is the difference between a circuit breaker and a bulkhead?',
+      a: "They solve different problems and you usually want both. A circuit breaker stops you from calling a dependency that is sick, failing fast to give it room to recover. A bulkhead stops a sick dependency from consuming all of your threads by partitioning resource pools per dependency, so one drowning compartment cannot sink the ship. A breaker reacts to a dependency's health; a bulkhead caps the blast radius regardless of health.",
+    },
+  ],
+}
+
+Most outages do not start with something breaking. They start with something getting slow.
+
+A dependency that crashes is loud and almost merciful: the call returns an error in a millisecond, your thread comes back, and you move on. A dependency that goes slow is quiet and far more dangerous. The call does not return. It sits there holding your thread, your connection, your slot in a finite pool, while requests keep arriving at the rate they always do. The threads pile up faster than they drain. And the thing that eventually takes down your service is not the original fault at all. It is the pool exhaustion that fault caused, propagating upward into callers that had nothing to do with the slow dependency in the first place.
+
+This is the single most important idea in resilience engineering, and it is the one juniors miss: latency, not errors, exhausts pools. Once you internalize it, the whole stack of patterns below stops being a checklist and starts being a chain of consequences, each one defending against the failure mode the previous one leaves open.
+
+## How one slow service becomes a dead fleet
+
+Google's SRE book gives cascading failure a precise definition: a failure that grows over time as a result of positive feedback. The operative phrase is positive feedback. The failure feeds itself. That is what separates a cascade from an ordinary error spike, and it is why "just add more capacity" so often makes things worse instead of better.
+
+Here is the death spiral in its purest form. You run a service across several replicas. One replica tips over from overload. Its traffic redistributes to the survivors, which are now each handling more than they were sized for. They tip over too. Their traffic redistributes to the ever-shrinking set of survivors, and so on, until the layer is gone. Google's worked example is brutally concrete: a cluster handling 1,000 queries per second loses a peer, inherits the load to reach 1,200 QPS, cannot serve it, runs out of resources, and ends up serving far below the original 1,000. Net throughput collapses below baseline. You did not lose one cluster's worth of capacity. You lost more than all of it.
+
+Michael Nygard, in *Release It!*, traces the mechanism one level down, to the thread. His chain reads: an integration point produces a slow response, the slow response blocks threads, blocked threads exhaust the resource pool, and pool exhaustion cascades into a failure that crosses layer boundaries. Walk a concrete timeline. Say a downstream call normally returns in 20ms, your service runs a 200-thread pool, and you are serving 2,000 requests per second comfortably. Now the dependency degrades to 2,000ms per call. With no timeout, every one of those 200 threads is occupied within roughly 100 milliseconds of arrivals, because they stop coming back. The 201st request waits. So does every request after it, including the ones that never touch the slow dependency. Your service is now down, and the dependency only got slow.
+
+That is the thesis of this entire piece. The patterns below exist to interrupt that chain at five different points, so that one failure stays local instead of becoming everyone's.
+
+## Timeout: the control nothing else works without
+
+A timeout is not a safety net you add at the end. It is the root-cause control, and it is pattern number one for a structural reason: every other pattern here assumes the call eventually returns. A circuit breaker cannot trip on a call that never completes. A retry cannot fire on a request still in flight. A bulkhead bounds how many threads you lose but does nothing to release the ones already stuck. Without a bound on how long a single call may take, the thread is captured, and nothing downstream of that fact can help you.
+
+So the question is not whether to set a timeout but what value to set, and "30 seconds because that felt safe" is how you build the bug rather than the fix. The AWS Builders' Library method is the one to internalize: decide on an acceptable rate of false timeouts (requests that would have succeeded if you had waited longer), then set the timeout to the corresponding latency percentile of the downstream. If you can tolerate cutting off 0.1 percent of otherwise-good requests, set the timeout at the downstream's p99.9. Add worst-case network latency for clients coming over the internet, and add padding when p99.9 sits suspiciously close to p50, because a tight distribution gives you little headroom before a normal blip starts tripping timeouts. This is why understanding [latency and the tail](/blog/latency-throughput-tail) is a prerequisite, not a nicety: your timeout is a statement about a percentile, and you cannot pick it without knowing the shape of the distribution it cuts.
+
+Now the number that should change how you think. Google's SRE book runs the math on a deadline set far too generously: a 100-second deadline against a service whose normal latency is 100ms. Let just 5 percent of requests hit that deadline. Those slow requests pin 5,000 threads, and effective capacity drops from 100 percent to 19.6 percent. A 5 percent slow tail produces an 80 percent error rate. Their conclusion is worth memorizing verbatim: having deadlines several orders of magnitude longer than the mean request latency is usually bad. The generous timeout you set "just to be safe" is the thing that converts a small slow tail into a total outage.
+
+One refinement that separates senior from staff thinking: propagate deadlines, not fixed timeouts. A 1-second timeout at the edge paired with an independent 1-second timeout on a service four hops deep means the leaf is still grinding away on work the user abandoned a second ago. The gRPC-style answer is to pass an absolute deadline down the call chain, and have each hop subtract the time already elapsed. The leaf then knows there is no point starting work that cannot finish in time. A timeout is local and naive; a deadline is a budget the whole request shares.
+
+## Retry: necessary, and a loaded gun
+
+Retries are where good intentions cause outages. The instinct is correct, transient failures are real and a single retry often turns a blip into a non-event, but the naive implementation is a self-inflicted denial of service waiting for a bad day.
+
+Start with the arithmetic, because it is more violent than people expect. Suppose every layer in your stack retries three times on failure. Five layers deep, one user request becomes 3 to the fifth power, which is 243 calls landing on your database. AWS uses exactly this figure. Google's version of the same warning uses four layers issuing three retries each (four attempts per layer) and lands on 64 calls (4 cubed) from a single user action. Whichever multiplier applies to your topology, the point holds: when every layer retries independently, load on the bottom of the stack grows multiplicatively, and your retry policy quietly DDoSes your own datastore at the worst possible moment, precisely when something is already failing.
+
+The fix has three parts, and you need all three.
+
+First, retry at exactly one layer. AWS and Google both say this explicitly. Pick the layer closest to the failure that can meaningfully retry, and have every layer above it pass failures straight through. This is the single change that collapses 243 back toward 3.
+
+Second, impose a retry budget. AWS limits retries with a token bucket: you may retry freely while tokens remain, and once they run out you fall back to a fixed, low retry rate (this has shipped in the AWS SDK since 2016). Google's client-side rule is a ratio, retry only while retries divided by total requests stays under 10 percent, and its server-side rule is an absolute cap of 60 retries per minute per process, beyond which you fail instead of retrying. A budget is what turns "retry on failure" from an amplifier into a bounded, survivable behavior.
+
+Third, separate retriable from non-retriable errors, and make overload say so. A 400 or a malformed request will fail identically every time; retrying it is pure waste. More subtly, an overloaded backend should return a distinct "overloaded; do not retry" signal so callers back off rather than pile on. This matters because retrying into an overloaded system is throwing fuel on a fire: the retry adds arrival rate, the added arrival rate raises latency, the higher latency trips more timeouts, and the timeouts trigger more retries. That loop is positive feedback again, and the "do not retry" signal plus the circuit breaker below are how you break it. This is the same backpressure conversation that runs through queue design; if you want the deep version of "how a system tells its callers to slow down," that is the subject of [backpressure](/blog/backpressure).
+
+And the precondition under all of it: retries are only safe for idempotent operations. Retry "create payment" without protection and you double-charge a customer. AWS's framing is clean, an idempotent operation is one that can be retransmitted or retried with no additional side effects, and the practical mechanism is an idempotency token (EC2's `ClientToken` is the canonical example): the service records the token atomically with the mutation, and a duplicate token returns an equivalent response without re-executing the work. That is the "at most once" guarantee retries depend on. The full treatment, including why exactly-once delivery is a fiction and exactly-once processing is achievable, lives in [idempotency and the exactly-once lie](/blog/idempotency-exactly-once). When the operation spans multiple services and cannot be made atomic, you are in [distributed transactions and sagas](/blog/distributed-transactions-sagas) territory, where each step needs its own compensating action.
+
+## Jitter: the part everyone forgets
+
+Here is the misconception that survives even in teams that do everything else right: that exponential backoff is enough. It is not. Backoff alone keeps your clients synchronized.
+
+Picture 10,000 clients that all hit a failure at the same instant. They all back off "exactly 1 second, then 2, then 4," in perfect lockstep. So they all retry at the same moments too. The backend that just buckled under a spike now gets hit by a second identical spike one second later, and a third two seconds after that. Exponential backoff spread the retries out in time, but it did nothing to spread them out across clients. Every client is still marching to the same drumbeat. That synchronized wall has a name, the thundering herd, and backoff without jitter does not prevent it, it schedules it.
+
+Jitter is the fix, and it is just randomization added to the backoff so that clients decorrelate. The AWS Architecture Blog gives the formulas directly:
+
+```text
+No jitter:      sleep = min(cap, base * 2 ** attempt)
+Full Jitter:    sleep = random_between(0, min(cap, base * 2 ** attempt))
+Equal Jitter:   temp  = min(cap, base * 2 ** attempt)
+                sleep = temp / 2 + random_between(0, temp / 2)
+Decorrelated:   sleep = min(cap, random_between(base, last_sleep * 3))
+```
+
+AWS ran a simulation comparing these, and the honest summary, since the source presents the results as graphs rather than a numeric table, is qualitative: no-jitter backoff performed so badly it had to be removed from the chart to keep the others legible. Among the jittered strategies, Full Jitter and Decorrelated Jitter win, and Equal Jitter is the loser because it does slightly more work than Full for no benefit. Marc Brooker's verbatim takeaway: of the jittered approaches, Equal Jitter is the loser, and the choice between Decorrelated and Full is less clear. So the practical rule is short: any jitter beats no jitter by a wide margin, and Full Jitter, `random(0, cap)`, is the safe default. It smears 10,000 retries uniformly across the interval, and the backend sees a flat line where it would otherwise see a wall.
+
+## Circuit breaker: stop knocking on a door no one will answer
+
+Once a dependency is genuinely down, retrying it (even politely, with budget and jitter) is still wrong. You are spending threads and time on calls you have strong evidence will fail, and every one of those calls is a thread held for the duration of a timeout. The circuit breaker, Nygard's pattern, is the fix: when a dependency looks unhealthy, stop calling it and fail fast, which both protects you from wasting resources and gives the dependency room to recover instead of being pounded while it is down.
+
+The state machine is the same across implementations. CLOSED means calls pass through normally. When failures cross a threshold, the breaker goes OPEN and rejects calls immediately without even attempting them, this is the "fail fast" that returns the thread in microseconds instead of seconds. After a cooldown it goes HALF-OPEN and lets a probe through; if the probe succeeds it closes, and if it fails it opens again.
+
+The misconception to kill here is that a breaker trips on the first failure. It does not, and it must not, because one failure in a healthy stream is noise. It trips on an error rate crossing a threshold over a minimum request volume inside a rolling window. The classic Hystrix defaults make the conjunction explicit:
+
+| Hystrix property | Default |
+| --- | --- |
+| `circuitBreaker.requestVolumeThreshold` | 20 |
+| `circuitBreaker.errorThresholdPercentage` | 50 |
+| `circuitBreaker.sleepWindowInMilliseconds` | 5000 |
+| `metrics.rollingStats.timeInMilliseconds` | 10000 |
+| `execution.isolation.thread.timeoutInMilliseconds` | 1000 |
+
+Read it as a sentence: the breaker can trip only if at least 20 calls occurred in the rolling 10-second window AND the error rate is at least 50 percent; once open, it waits 5 seconds, then allows exactly one probe request through. Netflix ran this at a scale that makes the defaults credible, on the order of 10 billion-plus command executions per day across 40-some thread pools.
+
+The modern successor, resilience4j, ships different defaults and one genuinely important upgrade:
+
+| resilience4j property | Default |
+| --- | --- |
+| `failureRateThreshold` | 50% |
+| `slowCallRateThreshold` | 100% |
+| `slowCallDurationThreshold` | 60000 ms |
+| `slidingWindowSize` | 100 |
+| `minimumNumberOfCalls` | 100 |
+| `waitDurationInOpenState` | 60000 ms |
+| `permittedNumberOfCallsInHalfOpenState` | 10 |
+
+The upgrade is slow-call detection. A call that succeeds but exceeds `slowCallDurationThreshold` still counts toward tripping the breaker. This is the difference that matters, and it is the staff-grade point: an error-only breaker, like classic Hystrix, reacts too late. By the time calls are erroring outright, your pool may already be drained by the slow-but-not-yet-failing calls that came first, exactly the latency-exhausts-pools mechanism from the top of this piece. A breaker that trips on slow-call rate opens before the dependency hard-fails, while the calls are merely slow, which is when intervening still saves you.
+
+Two operational notes. First, defaults are starting points, not answers, and a single global config across heterogeneous endpoints is an anti-pattern. resilience4j's 100-call minimum will never trip on a 5-requests-per-second endpoint inside any useful window, so a low-traffic service needs those numbers tuned down or it has no breaker at all. Second, half-open is itself a thundering-herd risk. Let exactly one request through (Hystrix) or a small N (resilience4j permits 10), because flooding a freshly recovering dependency with the full backlog re-trips it instantly, and you get recovery oscillation instead of recovery. This is also why an architecture grounded in [the system design interview framework](/blog/system-design-interview-framework) treats breaker placement as a first-class decision rather than a library default, and why systems like [Design Netflix](/blog/design-netflix) lean on fast failure and fallbacks as a core property rather than a bolt-on.
+
+## Bulkhead: so one drowning compartment does not sink the ship
+
+A circuit breaker stops you from calling a sick dependency. It does nothing about the threads already stuck calling it before it tripped, and nothing about a dependency that is slow but not yet over the breaker's threshold. For that you need the bulkhead, and the conflation of the two ("bulkheads are basically circuit breakers") is a tell that someone has read the words but not run the systems.
+
+Nygard's metaphor is the ship's hull, partitioned into watertight compartments so that a breach floods one and the vessel still floats. In software, the bulkhead partitions resource pools, thread pools or connection pools, so that one sick dependency can only consume its own slice and cannot drain the capacity every other dependency shares. Give each downstream dependency its own pool. When one goes slow and fills its pool, calls to that dependency queue or get rejected, and every other dependency keeps serving from its own untouched pool. The blast radius is one compartment instead of the whole fleet.
+
+There are two ways to build it, and the tradeoff is real. Thread-pool isolation gives each dependency its own pool of threads; this is what Hystrix does by default, and it doubles as a bulkhead, but every call pays for a thread handoff and a context switch. Semaphore isolation just caps the number of concurrent calls on the calling thread with a counter, far cheaper, but it provides no separate thread to interrupt, so it cannot bound a call that ignores its timeout. resilience4j offers both: a `SemaphoreBulkhead` that caps concurrent calls (default `maxConcurrentCalls` of 25) with no shadow thread pool, and a `FixedThreadPoolBulkhead` with a bounded queue and fixed pool. The architectural shift from Hystrix to resilience4j is instructive here. Hystrix wraps each call in its own thread; resilience4j leaves the function call outside the critical section entirely and decorates it functionally, which is lighter but means the semaphore variant trades away the ability to forcibly time out a stuck call. How a senior decides: thread-pool isolation when you must contain calls that can block uncontrollably, semaphore isolation when overhead matters and your timeouts are trustworthy.
+
+## Graceful degradation: the goal the other four serve
+
+Everything above is machinery. This is the point of the machinery. The success criterion for a resilient system is not "no failures." It is "failure stayed local and the core journey survived." Graceful degradation is shedding the optional to keep the essential alive, and it is the goal the timeout, the retry, the breaker, and the bulkhead all exist to make possible.
+
+Google's load-shedding approach is the blunt version: as you approach overload, proactively drop a proportion of load, for example returning HTTP 503 once in-flight requests exceed a threshold. Serving 80 percent of requests well beats cratering all of them to zero, which is exactly what the death spiral does if you let it. The richer version is feature degradation. Google's Shakespeare search service, under load, stops returning the pictures and small maps that normally accompany the text and keeps the core answer alive. It sheds the expensive, optional parts and preserves the thing the user actually came for.
+
+The nuance that separates a thoughtful degradation strategy from a dangerous one: degradation has to be prioritized, and your fallback must not become a second outage. Shed cheap, low-value traffic first, which requires a notion of request criticality, because without one you shed randomly and may drop the requests that matter most. And watch the fallback carefully. The most common trap is "the breaker opened, so we degrade to the cache," when a cold or recently cleared cache turns that degradation into a dogpile on the very dependency you were protecting. Serve stale data and coalesce duplicate requests rather than letting every miss stampede the origin. This is precisely the failure mode [the distributed cache](/blog/distributed-cache) is built to prevent, and it is why "degrade to cache" is a real plan only when the cache itself is designed to absorb the load.
+
+There is a clean field example in [NomadCrew](/case-study/nomadcrew): its WebSocket hub drops events from a full 256-deep buffer rather than block the producer. That is graceful degradation as a deliberate design choice. A slow or stuck consumer cannot back up into the hub and stall everyone else, because the hub would rather lose an event than hold the thread, which is the entire lesson of this article expressed in one buffer. The same instinct shows up across [Aladeen](/case-study/aladeen), [IntelliFill](/case-study/intellifill), and [Audex](/case-study/audex): decide in advance which work is droppable, and drop it on purpose before the system decides for you by falling over.
+
+## How a senior actually wires it
+
+The five patterns are not a menu you pick from. They are a dependency chain, applied innermost to outermost, each closing the gap the previous one leaves open.
+
+| Layer | What it controls | The failure it stops |
+| --- | --- | --- |
+| Timeout | How long one call may take | Threads held forever by a slow dependency |
+| Retry + backoff + jitter | Recovering from transient blips safely | Both the missed-blip and the retry-storm extremes |
+| Circuit breaker | Whether to call a sick dependency at all | Wasting threads on calls you know will fail |
+| Bulkhead | How much of your capacity one dependency can take | One sick dependency draining shared pools |
+| Graceful degradation | What the user sees when things break | A local fault becoming a total outage |
+
+Read top to bottom, the logic is forced. Timeout first, because nothing else fires on a call that never returns. Retry next, gated on idempotency and bounded by a budget, because un-bounded retries amplify load 243-fold and you retry at one layer only. Breaker next, because once a dependency is clearly down, the right number of retries is zero and the right behavior is fail-fast. Bulkhead next, because the breaker does not protect the threads already stuck nor isolate the merely-slow, and you want the blast radius capped per dependency regardless. Degradation last, because it is the entire point: partial, fast, honest failure over total collapse.
+
+The deepest of these is the one no library hands you. A breaker is configuration; a budget is a number; jitter is a one-line formula. But deciding which features are droppable, which requests are critical, and what "degraded but alive" means for your specific product, that is a design judgment, and it is the one that determines whether your 2 a.m. incident is a graph that dipped and recovered or a postmortem with your name on it. The dependency that goes slow is coming. The only question this stack answers is whether its slowness stays its own problem, or becomes yours, and then everyone's.
+
+## FAQ
+
+<FAQ />

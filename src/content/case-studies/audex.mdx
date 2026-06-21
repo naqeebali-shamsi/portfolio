@@ -1,0 +1,289 @@
+export const meta = {
+  slug: 'audex',
+  title: 'Audex: A Byte-Deterministic Excel-to-PDF Audit Engine | Naqeebali Shamsi',
+  description: 'Audex: an offline Electron app (vanilla JS, pdfmake) that compiles a fixed-structure Excel audit workbook into a byte-identical PDF statement set, locked by a golden SHA256: a pure pipeline, a DOM-free layout engine, and a framework-agnostic command/undo editing core.',
+  headline: 'Same Workbook In, Same PDF Out: Engineering Determinism End to End',
+  deck: 'A layout problem wearing a document problem’s clothes. The adversary was nondeterminism, and the deliverable had to match to the byte on every run, including after an operator edits the notes.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  tags: ['Electron', 'JavaScript', 'pdfmake', 'determinism', 'system design', 'concurrency', 'offline-first', 'audit software'],
+  metrics: [
+    { value: 'byte-identical', label: 'Output, pinned to a golden SHA256' },
+    { value: '3-pass', label: 'Pure DOM-free layout engine' },
+    { value: '17', label: 'IPC channels (pure DI factory)' },
+    { value: '181 / 573', label: 'Tests / assertions (node:test)' },
+    { value: 'O(1) clock', label: 'Wall-clock inputs frozen to one constant' },
+    { value: '4', label: 'Statement types parsed by an FSM' },
+  ],
+  links: [
+    { label: 'Microsoft Store', href: 'https://apps.microsoft.com/detail/9P87TFB7D3TD' },
+  ],
+  faq: [
+    {
+      q: 'What is Audex?',
+      a: "Audex is an offline Electron desktop app (vanilla-JS renderer, Node/CommonJS main, pdfmake) that compiles a firm's fixed-structure Excel audit workbook into a byte-deterministic A4-portrait PDF statement set: Financial Position, Profit or Loss / OCI, Cash Flows, Changes in Equity, plus a cross-referenced Notes appendix. It runs fully offline on Windows and ships through the Microsoft Store. Its defining property is determinism: every layer on the bytes path is a pure function of its input, the single wall-clock input is frozen, and the whole output is pinned to a committed golden SHA256.",
+    },
+    {
+      q: 'How do you make PDF output byte-for-byte deterministic?',
+      a: "Kill the one nondeterministic input and make everything else a pure function. PDFs stamp wall-clock time into /CreationDate and /ModDate, so I freeze both to 2000-01-01T00:00:00Z; the parser, the layout engine, and the generator never read a clock, DOM, or canvas. Then the whole statements-plus-notes output is locked to a committed golden SHA256 (fb46bef2…) that only an explicit UPDATE_GOLDEN=1 can rewrite. A missing golden is a hard failure, never a silent self-rebaseline.",
+    },
+    {
+      q: 'How does determinism survive an operator editing the notes?',
+      a: "The editing core holds CANONICAL note JSON, not the transient ProseMirror editor model, so an unedited note is never re-serialized. A two-tier serializer returns clean blocks byte-identical (a structuredClone of the original, because ProseMirror JSON is lossy on bare-string vs {text} segments) and re-serializes only edited blocks into one idempotent canonical normal form. An unedited note therefore can't perturb the golden hash.",
+    },
+    {
+      q: 'How do you lay out text without a browser or canvas to measure it?',
+      a: "Width comes from a pure character-class estimator seeded with the font's real glyph advances at 2048 units-per-em: digit = 1024/2048 (0.500), lowercase = 0.459, with per-class bold multipliers and an 8% margin biased one-directionally toward over-estimation. That 8% bias converts a bounded per-glyph error into a hard no-overflow invariant (a clipped audit figure is unshippable, a slightly wide column is fine), and the purity is exactly what keeps the 3-pass layout engine pure and the golden stable.",
+    },
+    {
+      q: 'How do operator edits reach the PDF safely with no database and an untrusted renderer?',
+      a: "A per-(client,period) JSON 'material bank' written atomically (tmp → fsync → .bak → rename), serialized per-ref behind a tail-chained promise lock, carrying a monotonic generation counter computed from the persisted value. Export is send-and-verify: it re-derives client and period server-side, rejects any mismatch the renderer claims, does ONE bank read shared by both the lost-write generation guard and the notes payload (no TOCTOU), and renders only notes it read itself.",
+    },
+    {
+      q: 'Why is the note schema the security boundary instead of HTML sanitization?',
+      a: "There is no HTML sink to sanitize. Operator rich text is stored as a closed grammar, not markup. So two closed grammars ARE the boundary, with deliberately different verbs: editor-schema.js validates-and-REJECTS at the ProseMirror seam, and content-model.js coerces-and-DROPS malformed rich text before disk. Both are own-property-hardened with Object.hasOwn / Reflect.ownKeys, so __proto__ and constructor are unknown types rather than truthy members, killing prototype pollution at the door.",
+    },
+  ],
+};
+
+## The problem
+
+Audex is an offline desktop app that compiles a firm's fixed-structure Excel audit workbook into a print-ready, byte-identical PDF statement set. It exists because a firm was spending two full working days, every engagement, re-typing those statements into Microsoft Word from a workbook that already had the exact, standardized layout they needed. No analysis. No judgment. Pure formatting toil, and a fresh chance to mistype a number into a filed regulatory document.
+
+The workbook is fixed-structure across all clients: same sheet names, same column shapes, the trial balance already finalized out of Tally. So it looked like a document-automation problem.
+
+It was a determinism problem. The deliverable had to be the *same* PDF, to the byte, every single run, generated in a Node process with no browser to measure text in, for a document where one clipped figure or one dangling cross-reference is a real defect. And it had to *stay* deterministic after an operator edited the per-client notes, with no server, no database, and a sandboxed renderer that can't be trusted to say which client's notes to file. Audex reads the finalized workbook and emits an A4-portrait statement set (Financial Position, Profit or Loss / OCI, Cash Flows, Changes in Equity, plus a cross-referenced Notes appendix) that matches the firm's gold-standard reference PDFs, fully offline, on Windows, shipped through the Microsoft Store.
+
+<KeyTakeaways items={[
+  "Audex compiles a fixed-structure Excel audit workbook into an A4-portrait PDF statement set whose entire bytes path is a pure function of its input; the single wall-clock input (/CreationDate) is frozen to 2000-01-01 and the whole output is pinned to a committed golden SHA256 that only an explicit env flag can rebaseline.",
+  "With no browser to measure text in, layout runs off a pure character-class width estimator hand-calibrated from real font glyph metrics (digit = 1024/2048 em; lowercase corrected from a wrong 0.52 to 0.459), with an 8% one-directional bias that turns bounded per-glyph error into a hard no-overflow invariant.",
+  "The editing core is a framework-agnostic command/undo state machine: inverse-command factories with exact apply→invert, a transactional compute-before-mutate ring history (cap 100), and deep-frozen immutable snapshots, holding canonical note JSON so an unedited note never re-serializes and never perturbs the golden.",
+  "Operator-edited notes reach the filed PDF with no database: atomic JSON (tmp → fsync → .bak → rename), a tail-chained per-(client,period) write lock with a monotonic generation counter, and a send-and-verify export that re-derives identity server-side and does ONE read for both the lost-write guard and the notes payload (no TOCTOU).",
+  "The 17-channel IPC layer is a pure dependency-injected factory: buildHandlers(deps) references no Electron at construction, so all 181 tests / 573 assertions run under node:test with stubs, no Electron launch.",
+]} />
+
+> Generating a PDF was never the hard part. Generating the *same* PDF every time was, including the run right after an operator edits the notes. So every layer on the bytes path is a pure function, the document's creation date is frozen to 2000-01-01 (the only wall-clock byte in the file), and the whole output is locked to a committed SHA256 that fails the build the day it drifts.
+
+## Constraints
+
+The constraints set the architecture before a line of layout code existed.
+
+- **Fully offline, no cloud, no account.** Client financial data never leaves the machine: a Microsoft Store certification requirement for the target buyers, not a preference. "Offline-by-certification" is what reframes the scaling axis: there is no throughput problem, only a latency-and-reproducibility problem on one desktop CPU.
+- **Portrait-only. Landscape forbidden by client decree.** A six-column Changes in Equity statement that won't fit A4 portrait can't be rotated; it has to be shrunk, then split deterministically.
+- **Deterministic output is a product contract.** "Same Excel in, same PDF out" is something the firm can verify themselves with `sha256sum`. That makes a golden-hash regression test both possible and worth writing.
+- **No AI/ML extraction, deliberately.** The workbook is fixed-structure, so a deterministic parser is reliable and reproducible. PROJECT.md records the call bluntly: AI/ML data extraction "is a trap." An LLM on a path whose entire value is determinism would be self-defeating.
+- **Single-window tool, team of one.** That pushed the renderer to vanilla JS; an early React/Vite prototype was deleted and the codebase consolidated to one vanilla-JS renderer.
+
+## Architecture
+
+The shape is a strict Electron separation with a service-oriented compile pipeline behind it, plus two side subsystems: a persistence layer (the material bank) and a framework-agnostic in-memory editing core.
+
+A vanilla-JS stepper renderer runs sandboxed (`sandbox` + `contextIsolation` + `nodeIntegration:false`, CSP injected on every response via `session.webRequest.onHeadersReceived`) and can `require` **no** Node or shared module. It reaches the main process *only* through `window.itsubiApp`, a preload `contextBridge` that forwards to `ipcRenderer.invoke` across 17 channels.
+
+Those channels are built by a pure dependency-injected factory, `buildHandlers(deps)`, which references no Electron at construction and returns a plain `{ channel → handler }` map; `registerIpcHandlers()` lazily wires the real services. **That one boundary is the testability seam:** every handler runs under `node:test` with stubs, Electron never enters module load, and it's where the security invariants live (path allowlist, generation guard, per-ref write lock, payload cap).
+
+Downstream of IPC is a pure, mostly-synchronous compile pipeline:
+
+`excel-service` runs a **per-row finite-state machine** over the sheet into a canonical four-statement `FinancialModel` → `validation-service` is model-level admission control (hard errors block export, soft warnings warn) → `layout-engine` runs a pure **3-pass** layout into a `LayoutPlan` with **no DOM or canvas** → `pdf-generator` lowers that plus notes into a pdfmake `docDefinition` → a `worker_threads` Worker renders it to a PDF buffer off the UI thread and posts it back as a zero-copy transferable `ArrayBuffer`.
+
+To the side: a **material bank** stores per-(client,period) editable notes as atomically-written, checksum-verified, generation-stamped JSON; and a **framework-agnostic editing core** (`bank-store.js` wiring `note-ops.js` + `note-history.js` + `canonicalize.js`) is a headless command/undo state machine that holds canonical note JSON and emits deep-frozen snapshots: zustand-free, DOM-free, Electron-free, clock-free, so 100% of the editing logic is `node:test`-loadable.
+
+<TechStack rows={[
+  { layer: 'Desktop runtime', tech: 'Electron 42.3.2', why: 'Local-only shell, strict main/preload/renderer separation. sandbox + contextIsolation + nodeIntegration:false; CSP on every response. The sandboxed renderer can require no shared module: capability confinement, least privilege.' },
+  { layer: 'Language', tech: 'Vanilla JS (Node/CommonJS)', why: 'Single-window tool; the React/Vite prototype was deleted. The pure shared core is dual-process CJS so it loads identically in main and renderer.' },
+  { layer: 'PDF generation', tech: 'pdfmake 0.3.6', why: 'Declarative, reproducible doc-definition model, chosen over headless-browser HTML-to-PDF. A custom 3-pass engine owns measurement and pagination on top, because pdfmake’s auto-layout has documented bugs with financial tables.' },
+  { layer: 'Excel parsing', tech: 'SheetJS (xlsx) 0.18.5', why: 'Reads .xlsx/.xlsm with cellNF + cellStyles, so the parser sees raw values AND number-format codes that drive parenthesized-negative rendering and width measurement.' },
+  { layer: 'Concurrency', tech: 'Node worker_threads', why: 'The render (~2s, project-notes figure) runs in pdf-worker.js with a 30s hard timeout + partial-file cleanup so the UI thread never blocks; the buffer returns as a transferable ArrayBuffer (zero-copy).' },
+  { layer: 'Editing core', tech: 'Pure CJS (no zustand/DOM)', why: 'bank-store.js wires note-ops (inverse commands) + note-history (transactional ring undo) + canonicalize. Holds canonical JSON, emits deep-frozen snapshots; the renderer adapts it to a vendored zustand-vanilla global.' },
+  { layer: 'Fonts', tech: 'TexGyreTermes TTF, 4 faces', why: 'A Times-class serif matching the reference audit PDFs. Glyph advances at 2048 UPM were measured to calibrate the DOM-free width estimator, not eyeballed.' },
+  { layer: 'Test runner', tech: 'node:test + node:assert/strict', why: 'Zero external test deps; 181 tests / 573 assertions across 21 files via node --test. The IPC factory is pure DI, so handlers test with stubs and no Electron.' },
+  { layer: 'Distribution', tech: 'electron-builder 26.8.1 + Windows AppX', why: 'Builds and SHA256-signs an .appx for local sideload; published via the Microsoft Store, which re-signs under the developer managed identity.' },
+]} />
+
+## The hard problems
+
+Six problems carry the weight, and they share one spine: **determinism**. Each later one leans back on it. I'll take the five with the most design substance.
+
+### 1. How do you make the whole bytes path a pure function, and prove it?
+
+The aha is small and brutal. PDFs are casually nondeterministic: pdfmake/pdfkit stamp the current wall-clock time into `/CreationDate` and `/ModDate`, so the same input produces a different file, and a different hash, every second. The product contract is the opposite, and a golden-hash regression test is worthless if the output legitimately changes run to run.
+
+So I removed the only wall-clock input to the bytes and kept every other layer pure. `pdf-generator.js` pins both dates to a frozen instant:
+
+```js
+info: {
+  title: (metadata.companyName || 'Company') + ' - Financial Statements',
+  author: 'Audex',
+  creationDate: new Date("2000-01-01T00:00:00Z"),
+  modDate: new Date("2000-01-01T00:00:00Z"),
+}
+```
+
+With the timestamp frozen and the parse → validate → layout → lower path otherwise pure, a golden test becomes meaningful. `determinism.test.js` renders the committed fixture twice, asserts the buffers are byte-equal *and* hash-equal, then compares the SHA256 to a checked-in baseline (`test/golden/financial-statements.sha256 = fb46bef2…`). The third assertion is the kicker: it verifies the notes payload is actually *present* in the doc, so notes can't be silently dropped while the file still hashes green. The baseline only rewrites under an explicit `UPDATE_GOLDEN=1`; a missing golden is a hard failure.
+
+This is a **reproducible-build** discipline applied to a document: the single nondeterministic byte is identified and pinned, and everything downstream is referentially transparent.
+
+<Callout type="tradeoff" title="The cost of a frozen timestamp">
+Every PDF reports a fake 2000-01-01 creation date in its metadata. Accepted deliberately. The real engagement date lives in the visible header and content; reproducibility plus a working regression guard matter more than an accurate hidden timestamp. The alternative, leaving the clock in and diffing PDFs structurally, would have meant writing a tolerant PDF comparator and giving up the firm’s own `sha256sum` verification.
+</Callout>
+
+### 2. How do you measure text width with no DOM and no canvas?
+
+To lay out a financial table (fit columns, pick a font size, decide page breaks), you must know how wide rendered text will be. But layout runs in the Node main process with no DOM and no canvas, and the result must be byte-deterministic. Measure wrong by a few percent and you overflow A4 or waste whitespace.
+
+Width comes from a pure function in `text-metrics.js`, seeded with ratios that are *measured, not guessed*. The values in `design-tokens.js` are read from the actual TexGyreTermes font at 2048 units-per-em: digit = exactly `1024/2048` (0.500), space/comma/period = 0.250, paren/dash = 0.333, uppercase = 0.667, lowercase = 0.459, with the source comment recording the correction verbatim: `// average of a-z (NOT 0.52 -- that was wrong)`. Bold uses per-class multipliers (uppercase 1.058, lowercase 1.066; digits and punctuation 1.000 because they're metrically identical bold and regular). The estimator walks codepoints, buckets each into a class, and multiplies the total by `(1 + safetyMargin)` with `safetyMargin = 0.08`.
+
+```js
+if (code >= 48 && code <= 57) { ratio = CHAR_WIDTHS.digit; boldKey = 'digit'; }
+... else if (code >= 65 && code <= 90) { ratio = CHAR_WIDTHS.uppercase; boldKey = 'uppercase'; }
+else { ratio = CHAR_WIDTHS.lowercase; boldKey = 'lowercase'; }
+if (bold) ratio *= BOLD_MULTIPLIERS[boldKey];
+totalWidth += fontSizeMm * ratio;
+```
+
+The load-bearing property is the **one-directional bias**: the 8% margin makes every estimate an *over*-estimate, converting a bounded per-glyph error into a hard no-overflow invariant. Purity is the other half. Because measurement reads no DOM, canvas, or clock, the 3-pass engine built on top of it is also pure, and *that* is what keeps the golden hash a clean equality.
+
+That engine is richer than "size columns, scale font, break pages." **Pass 1** sizes columns from measured natural widths and scales to the 170mm usable width. **Pass 2** steps the font 11pt → 10pt in 0.5pt increments; when nothing fits, it halves the value columns and labels them `(1 of 2)` / `(2 of 2)`, re-pairing each with the description/note columns: the portrait-only escape hatch the no-landscape rule forced. **Pass 3** is a constrained-allocation algorithm: `computePageRowHeights` distributes a page's slack height proportionally to per-type minimum heights but **caps each row at a per-type max, iterating up to three passes** to redistribute the budget freed when a row caps, so dense pages (a 40-row balance sheet) stay tight and sparse pages (a 14-row P&L) breathe. Page breaks use a **heading look-ahead** (a heading needs ≥3 rows fitting under it or it's pushed forward) and, on overflow, a **backward scan** (`findBestBreakPoint`) that prefers a break after a subtotal/grand-total, never after a heading, and pulls a subtotal back to keep it with a preceding line item. After a carry-over it recomputes consumed height for the carried rows, and `buildPage` enforces a reconciliation **invariant**: if dynamic heights exceed the available space, fall back to minimum heights, so a page is never assigned more rows than fit.
+
+<Callout type="insight" title="Why measured ratios beat clever solvers here">
+A character-class estimator can't match a font's true per-glyph kerning, and an optimal column-fit solver would pack tighter. Both were rejected. Seeding from real em-unit advances gets within a margin I can *bound*, the 8% bias turns that margin into a guarantee, and a predictable half-split is reviewable for a regulated, golden-pinned document in a way a bin-packer's output is not. The cost is honest: columns are slightly generous and a split page can come out lighter than its pair. For an audit PDF, that's the right side to err on.
+</Callout>
+
+> There was no browser to measure text in, so column widths come from a pure function seeded with the font's real glyph advances: digit = 1024/2048 of an em, lowercase = 0.459, "NOT 0.52, that was wrong", with an 8% bias that makes every estimate an over-estimate. That one-directional error is the difference between a column that's slightly wide and a filed audit that clips a number.
+
+### 3. How does determinism survive an operator editing the notes?
+
+Notes are mostly firm boilerplate, but operators edit them per client and period, and those edits *must* reach the filed PDF without breaking the golden. The naive move (make the rich-text editor's ProseMirror model the source of truth) quietly destroys determinism: ProseMirror JSON is lossy about whether a text run originated as a bare string or a `{text}` segment, and the seed mixes both, so re-serializing an *untouched* note changes its bytes and breaks the hash. The earlier version also shipped a real bug here: sidecar note edits never reached the PDF output (closed in Phase 7).
+
+So the editing core holds **canonical note JSON** (the same shape `validateBank` accepts), not the transient editor model, and an unedited block is never touched. `bank-store.js` is a framework-agnostic state machine wiring three pure modules, with three CS fundamentals doing the work:
+
+- **Command pattern with exact inverses.** `note-ops.js` exposes inverse-command *factories*; each returns `{ type, apply, invert }`. `apply(model)` returns a **new** model and never mutates input. The touched note is `structuredClone`d, siblings shared by reference. `invert()` returns the exact inverse (`setBlock` swaps prev/next; `insert ↔ delete`; `move(from,to) ↔ move(to,from)`; a `batch` inverts to the reversed child inverses), and payloads are deep-cloned **at creation** so an inverse is self-contained. Derived fields (number/id/letter) are never set here (field setters allowlist only `title` and throw otherwise), and out-of-range indices **fail loud** so a bad splice can never silently corrupt the apply→invert round-trip.
+- **Transactional ring history.** `note-history.js` is a functional command ledger, not a model owner: `undo(model)` / `redo(model)` take the current model and return the new one, so the store stays the single source of truth. `push()` clears the redo branch (linear history) and ring-evicts the oldest entry past `cap = 100`. The invariant is **compute-before-mutate**: undo computes `next = newest.invert().apply(model)` *before* touching the stacks, so a throwing apply surfaces the error and leaves the ledger intact rather than dropping a command.
+- **Immutability via deep freeze.** `getState()` returns a recursively `Object.freeze`d snapshot, so a caller can't reach into `getState().bank.notes[i]` and bypass ops/history/canonicalize/validateBank. Every action computes a brand-new model via copy-on-write array ops and freezes before emit.
+
+The bridge between editor and canonical store is `note-serializer.js`, a **two-tier round-trip** that *is* the editing determinism contract:
+
+```js
+// UNEDITED (clean) block: returned byte-identical via structuredClone of the ORIGINAL.
+// PM JSON can't recover bare-string vs {text} origin, so we MUST clone, never re-serialize.
+if (dirty === false) {
+  if (originalBlock === undefined) throw new Error("identity passthrough requires opts.originalBlock");
+  return structuredClone(originalBlock);
+}
+// EDITED (dirty) block: ONE canonical normal form — non-bold run => bare string,
+// bold => {text,bold:true}, adjacent same-bold runs coalesced — idempotent under re-application.
+```
+
+And `editorModelToNote` enforces **positional alignment, fail-loud**: a clean block that differs from its original's PM form (a reorder or unmarked edit) throws rather than silently discarding the edit; a shorter clean array (a delete) throws; an inserted block with no original must be marked dirty. Structural reconciliation by stable id is explicitly delegated to the store/undo layer. The result: an unedited note is *idempotent* through the whole loop and cannot move the golden, while an edited block lands in one normal form.
+
+<Callout type="tradeoff" title="Canonical JSON over the editor model">
+Holding canonical note JSON instead of the ProseMirror model is what keeps the core zustand/DOM/Electron/clock-free (and a single structuredClone snapshot enough to enforce immutability), so 100% of the editing logic loads under node:test. The cost is a second boundary: a serializer with a strict two-tier discipline, and structural edits (insert/delete/reorder) that must be reconciled in the store/undo layer rather than guessed by the serializer, which fails loud on any positional mismatch.
+</Callout>
+
+### 4. With no HTML to sanitize, the schema IS the security boundary
+
+Operators author rich text (bold runs, bullet lists, sectioned tables) that's persisted and rendered into a filed PDF. There is no HTML sink (the content is stored as a closed grammar, not markup), so the data still has to be *trusted* into the document. The decision was two closed grammars with **deliberately different verbs**, non-redundant by design:
+
+- `editor-schema.js` encodes the locked TipTap/ProseMirror grammar **as deep-frozen data** and `validatePmNode` **validates-and-REJECTS**: any node type, mark, attr, attr value, or content-model violation outside `SCHEMA` is rejected. It's the headless analog of TipTap's runtime closure (which can't run under `node:test`), and it's total. A getter-throwing or uncloneable input hits a fail-closed backstop returning `ok:false`, with recursion bounded by `MAX_DEPTH 50` / `MAX_ERRORS 100`.
+- `content-model.js` `validateBank` / `coerceSegments` **allowlist + coerce-and-DROP**: malformed rich-text segments are dropped, never stringified (the explicit "[object Object] defense"), and the bank is the gate before disk and on import.
+
+Both are own-property-hardened, which is what kills prototype pollution. `validateBank` checks `Object.hasOwn(BLOCK_KEYS, type)`, so `__proto__` / `constructor` / `toString` are *unknown types*, not truthy members; `editor-schema` closes each node's shape with `Reflect.ownKeys`, rejecting symbol and non-enumerable side channels and a polluted-prototype-supplied `type`/`content`/`marks`.
+
+```js
+// validate-and-reject (editor-schema): own-key closure defeats inherited names + side channels
+for (const key of Reflect.ownKeys(node)) {
+  if (typeof key !== "string" || !NODE_KEYS[type].has(key))
+    add(`${where}: unexpected node key ${JSON.stringify(...)}`);
+}
+// coerce-and-drop (content-model): malformed segment dropped, never '[object Object]'
+else if (isPlainObject(seg) && typeof seg.text === "string")
+  out.push(seg.bold ? { text: seg.text, bold: true } : { text: seg.text });
+```
+
+The cross-reference layer is the companion invariant. Notes get inserted, deleted, and reordered, which renumbers everything, so `canonicalize.js` re-derives note ids from array position after **every** action (a guaranteed no-op on an already-canonical bank, idempotent). `xref.js` **imports** the renderer's anchor parser rather than mirroring it, a deliberate single-source-of-truth call, because a copied parser would silently drift and produce links pointing at moved or deleted notes:
+
+```js
+// xref.js: import, don't mirror, the anchor parser:
+const { resolveNoteAnchorId } = require('../main/services/notes-renderer');
+const anchorId = resolveNoteAnchorId(ref);
+if (!anchorId || !anchorIndex.has(anchorId))
+  findings.push({ code:'DANGLING_NOTE_REF', severity:'error' /* blocks export */ });
+```
+
+`DANGLING_NOTE_REF` blocks export. `PROSE_REF_DRIFT`, a stale "note 19" inside a note's own prose, is lint-only and **deliberately never auto-rewritten**, because silently rewriting operator wording could change meaning. (The prose-ref scan bounds its whitespace with `\s{0,4}` to stay ReDoS-safe; a test asserts it's linear on adversarial input.)
+
+> With no HTML to sanitize, the note schema itself is the security boundary: two closed grammars with different verbs (validate-and-reject at the editor seam, coerce-and-drop before disk), where `Object.hasOwn` and `Reflect.ownKeys` quietly turn `__proto__` into an unknown type instead of an injection vector.
+
+### 5. How do editable notes reach the PDF crash-safely, with no database and an untrusted renderer?
+
+No server, no database, concurrent writes possible, a crash mid-write must not corrupt a client's notes, and a sandboxed renderer can't be trusted to say which client's notes to file. This is a small distributed-systems problem in a desktop app, and it's solved with four named guarantees.
+
+**Crash-safe atomicity + write-ahead durability.** `atomic-json` writes a uniquely-named temp file → `fh.sync()` (flush before it's referenced) → `copyFile` the current target to `<target>.bak` (last-good snapshot) → atomic `rename` over the target → best-effort directory `fsync`. A crash leaves either the last-good file or its `.bak`, and reads degrade primary → `.bak` → seed. The Windows reality is reasoned about explicitly in the source: directory `fsync` is unavailable there, so rename *durability* is filesystem-dependent, and `readJson({ recoverFromBak:true })` recovers the `.bak` for **both** a corrupt primary *and* a missing one (a rename that never became durable). A present-but-corrupt primary surfaces `EBANKCORRUPT` **without overwriting** the corrupt file: forensics over silent clobber.
+
+**Monotonicity via a generation counter, behind a per-ref lock.** Concurrency is serialized per `(clientId, periodId)` behind a tail-chained promise queue keyed by a NUL-delimited ref (`NUL` can't appear in a slug), so a read-bump-write can't interleave:
+
+```js
+function withBankWriteLock(clientId, periodId, fn) {
+  const key = bankRefKey(clientId, periodId);
+  const prev = bankWriteChains.get(key) || Promise.resolve();
+  const run = prev.then(fn, fn);              // run regardless of the prior write's outcome
+  const chain = run.then(() => {}, () => {}); // settles after run
+  bankWriteChains.set(key, chain);
+  chain.then(() => { if (bankWriteChains.get(key) === chain) bankWriteChains.delete(key); });
+  return run;
+}
+```
+
+`generation` is always computed from the **persisted** value read inside the lock, never the renderer's, guaranteeing strict monotonicity. Tests assert two concurrent writes yield `[2, 3]` and write+resetNote+write yields `[2, 3, 4]`. `bank:seed` is create-only and runs under the *same* lock, so the exists-check + create is atomic and concurrent seeds don't collide on `rename` (a documented Windows `EPERM` avoidance). Exactly one of N seeds creates, the rest reject `EBANKEXISTS`. The checksum is computed over notes **only**, so a bump alone doesn't churn integrity.
+
+**Send-and-verify export, no TOCTOU.** Export validates the generation-token *shape* up front on every path, then re-derives the bank ref server-side from metadata via `deriveBankRef` (`clientId = slugify(companyName)`; `periodId = `the **latest** four-digit year, latest-wins), which **throws `EBANKREFDERIVE`** rather than file under a fabricated period if no year exists. A supplied client/period that mismatches the derivation is rejected. It then does exactly **one** bank read used for *both* the lost-write guard and the notes payload (a deliberate no-TOCTOU choice), refuses an empty bank, and renders only those server-read notes:
+
+```js
+const bank = await bankService.read(derived.clientId, derived.periodId, { seedIfMissing: false });
+if (Number.isInteger(expectedGeneration) && persistedGen < expectedGeneration)
+  return { success:false, error:"Couldn't confirm your latest edits were saved -- retry." };
+if (!Array.isArray(bank.notes) || bank.notes.length === 0)
+  return { success:false, error:"This client's note bank has no notes -- nothing to export." };
+```
+
+**Capability confinement.** Output paths (PDF + validation log) are added to a per-session `sessionAllowedPaths` Set; `pdf:open` / `pdf:openFolder` refuse any path not produced this session. The IPC handler caps `bank:write` payloads at **5 MB** before the service even runs. Because the renderer is sandboxed and can share no module, the one place it *must* know a shared format (the `rowEmphasis` key) is hand-duplicated under a test-pinned "keep in lockstep" contract.
+
+<Callout type="tradeoff" title="Fail loud, not silent">
+The export path is studded with rejections: bad token, ref mismatch, stale generation, empty bank, corrupt file. It favors aborting over silently shipping the wrong or stale notes. For a filed audit, a blocked export the operator retries is far cheaper than a lost edit found after submission. The serialization is per-ref and in-process, so it gives no cross-process locking; acceptable because the app is single-window. And a bank write pays an fsync plus a full .bak copy every save: the price of crash-safety without a database.
+</Callout>
+
+## Design decisions, sharpened
+
+The honest version of each major call, as chosen-vs-rejected-why-cost:
+
+- **Where editing state lives.** *Chosen:* a framework-agnostic store of canonical note JSON with pure commands + a transactional history, emitting deep-frozen snapshots. *Rejected:* the ProseMirror editor model as source of truth (the obvious choice for a rich-text editor). *Why:* persisting editor state forces re-serializing untouched blocks and silently breaks the golden; a clock/DOM/zustand-free core is what makes the editing logic load under `node:test`. *Cost:* an extra serializer boundary and a strict two-tier round-trip; structural edits reconciled in the store, failing loud on positional mismatch.
+- **Text measurement.** *Chosen:* a pure character-class estimator from real glyph advances, 8% over-biased. *Rejected:* pdfmake auto-layout (financial-table pagination bugs), headless-browser measurement (nondeterministic, heavy), and a precise per-glyph kerning solver. *Why:* only a pure function keeps the engine pure and the hash stable; biasing upward turns bounded error into a guarantee. *Cost:* slightly generous columns, wasted horizontal space.
+- **Portrait fitting.** *Chosen:* shrink 11→10pt, then halve value columns into `(1 of 2)` / `(2 of 2)`. *Rejected:* landscape rotation (forbidden by client decree) and a global bin-packing solver. *Why:* a reviewable, deterministic half-split beats a clever optimizer for a regulated, golden-pinned document. *Cost:* a heuristic, not optimal packing; one split page can be lighter than the other.
+- **Concurrency for the note store.** *Chosen:* a tail-chained per-ref promise lock with generation from the persisted value, create-only seed under the same lock. *Rejected:* embedded SQLite, or computing generation from the renderer / allowing lock-free writes. *Why:* offline single-user with a JSON-file-per-ref store makes a tiny in-process queue enough for strict monotonicity and crash-safety without a DB. *Cost:* no cross-process locking; an fsync + full .bak copy per write.
+- **Trust on note content.** *Chosen:* two closed grammars, validate-reject and coerce-drop, own-property-hardened and fail-closed. *Rejected:* an open schema with output-time HTML sanitization, or one validator doing double duty. *Why:* there is no HTML sink; an allowlist that rejects unknown keys naturally kills prototype pollution and the `[object Object]` class of bug. *Cost:* every future note feature must be added to *both* grammars in lockstep.
+
+## By the numbers
+
+Each number is attached to a claim, not listed for effect. And these are design facts, not vanity metrics.
+
+- **181 tests / 573 assertions across 21 files, on `node:test` alone**, zero external runner, because `buildHandlers(deps)` is a pure factory and the shared core is pure, so the IPC layer and editing core test with stubs and no Electron.
+- **17 IPC channels**, the entire renderer↔main surface, each a handler in the DI factory map.
+- **5 validation checks.** Missing-statement and the balance-sheet math gate (`Math.abs(Assets − (Equity + Liabilities)) > 1` AED) block export; missing-noteref, orphan-noteref, and empty-value warn.
+- **Golden SHA256 `fb46bef2…`**, the whole statements-plus-notes output, rewritable only under `UPDATE_GOLDEN=1`; a missing golden hard-fails.
+- **Bounded against adversarial input as a coherent posture:** parser `maxRow` cap of 500 scanned rows; content-model `LIMITS` (maxNotes 200, maxBlocksPerNote 1000, maxTextLen 20000, maxSegments 500); a 5 MB `bank:write` cap before the service runs; `MAX_DEPTH 50` / `MAX_ERRORS 100` in the schema walker; ReDoS-safe `\s{0,4}` regexes. Malformed or hostile input degrades to a *bounded rejection*, never unbounded work.
+- **~2s render, 30s hard timeout** in a worker thread, result transferred as a zero-copy `ArrayBuffer`. The ~2s is project-notes prose, not an instrumented benchmark.
+
+## What was hard / what I'd change
+
+The genuinely hard part was never "generate a PDF." It was making *the same* PDF every time, including after an edit, for a document where a clipped number or a broken cross-reference is a real defect. Three forces collided: determinism, measurement-without-a-DOM, and trust. The candid beats:
+
+- **The sidecar-notes gap shipped first.** An earlier version had an integration gap where sidecar note edits never reached the PDF. That bug motivated the entire send-and-verify export design: the generation token, the server-side ref derivation, the single read. It was real, it shipped, and closing it properly is most of why problems #3 and #5 look the way they do.
+- **A known edge case is deferred on purpose.** Note sub-sections past 26 (`6(aa)`-style) have an anchor-id asymmetry between the editor and renderer. I documented it as a deliberately-deferred edge case rather than fix it, because broadening the convention touches the shipped golden PDF path. And changing that path means rebaselining the hash I designed the whole product to defend.
+- **The timing numbers are prose, not measurements.** The ~2s render and the 2-day manual baseline come from project notes, not an instrumented benchmark in the repo. I'm not dressing them up as measurements.
+- **The serializer's strictness is a bet.** `editorModelToNote` throwing on a positional mismatch is the right call for determinism, but it pushes real complexity, stable-id reconciliation of inserts/deletes/reorders, onto the store/undo layer. That's where I'd keep the most test pressure as the editor surface grows.
+
+## FAQ
+
+<FAQ />
+
+The whole product is one promise the firm can verify with `sha256sum`: same workbook in, same PDF out, every layer on the path a pure function, and a committed hash that fails the build the day that stops being true.

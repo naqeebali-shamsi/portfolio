@@ -1,0 +1,136 @@
+export const meta = {
+  slug: 'design-logging-system',
+  title: 'Design a Logging and Monitoring System: Centralized Logs at Scale',
+  description:
+    'Logs outgrow the traffic they describe. How to collect, buffer, index, and store them at fleet scale without going bankrupt or blind: the volume problem.',
+  headline: 'Design a Logging and Monitoring System: Centralized Logs at Scale',
+  deck: 'Logging volume routinely exceeds the production traffic it reports on, and every real design decision falls out of surviving that fact cheaply.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '17 min',
+  tags: ['logging', 'observability', 'system-design', 'kafka', 'clickhouse', 'distributed-systems'],
+  faq: [
+    {
+      q: 'Why not just put everything in Elasticsearch and full-text search it?',
+      a: "Elasticsearch is built on Lucene, which is optimized for low-write, high-read workloads. Logs are the inverse: high-write, low-read. When you full-text-index every field, the inverted index can grow larger than the raw data it indexes, and the write path becomes your bottleneck and your bill. It still works, and for moderate volume it is a fine default. At fleet scale you either index a small set of low-cardinality labels and scan the body (the Loki approach), or move to columnar storage like ClickHouse for analytical queries. Cloudflare's migration off Elasticsearch took documents from 600 bytes to 60 bytes per row and cut inserter CPU and memory by 8x.",
+    },
+    {
+      q: 'What is a cardinality bomb and how do I avoid one?',
+      a: "In label-indexed systems like Loki, the number of streams is the product of every label's distinct value count. Three status codes times five HTTP methods is fifteen streams; add three endpoints and you have forty-five. Put an unbounded field like user_id or request_id into a label and you get millions of streams, a huge index, and thousands of tiny chunks that wreck performance. The rule: labels describe origin and context and must be low-cardinality. High-cardinality identifiers belong in the log body or structured metadata, where they stay searchable but unindexed.",
+    },
+    {
+      q: 'Why put Kafka between the agents and the indexer?',
+      a: "The durable buffer decouples producers from the indexer so neither blocks the other. Producers never stall on a slow or restarting indexer, and the indexer consumes at its own pace. That decoupling is what absorbs spikes like deploy storms and incident log floods without dropping data, and the replayable log lets the indexer fall behind or restart and catch up from where it left off. Reliability is real but secondary; decoupling, spike absorption, and replay are the primary architectural value.",
+    },
+    {
+      q: 'Does tail-based sampling reduce ingestion cost?',
+      a: "No, and this trips up a lot of designs. Tail sampling decides whether to keep a trace after seeing all of its spans, which means you must ingest and buffer the full volume before you can drop anything. Ingest and processing cost stays near the unsampled level. Only head sampling, which decides at the source before transmission, actually cuts ingestion cost. For logs, the senior move is to keep 100% of errors and slow requests and sample only the common success case, deciding at the source.",
+    },
+    {
+      q: 'How do you know you are not silently dropping logs?',
+      a: "You measure it. Salesforce treats completeness as an SLO, not an assumption, and runs a fidelity service that reconciles record counts at three points: A at the source host, B at the aggregate Kafka layer, and C at final storage, with completeness defined as C divided by A. They climbed from roughly 25% to five-nines completeness by graphing and alerting on that ratio. Count reconciliation turns the question are we losing logs from a postmortem surprise into a dashboard and an alert.",
+    },
+  ],
+}
+
+Most systems generate more logs than they do work. That inverts the intuition everyone starts from: you picture logs as a quiet exhaust beside the real traffic and size storage as if they were a rounding error on the requests they describe. Then you turn on debug logging across a fleet, or a retry storm multiplies every failed request by five log lines, and the exhaust is louder than the engine.
+
+Peter Bourgon put it plainly years ago: logging "tends to be overwhelming, frequently coming to surpass in volume the production traffic it reports on." That sentence is the entire design brief. Buffering, label indexing, sampling, retention tiers, columnar storage, completeness SLOs: every one exists to survive log volume economically. The volume is not a side effect of the system. It is the system.
+
+So the interesting question is never "how do I store logs." It is "how do I store ten to a hundred times my production traffic, keep the last few days fast, keep the long tail cheap, and still answer a query at 3 a.m. without setting money on fire." This is a [system design interview](/blog/system-design-interview-framework) staple because the naive answer and the correct answer diverge so hard, and the gap is where seniority shows.
+
+## Put a number on it first
+
+Before any architecture, do the [capacity estimation](/blog/capacity-estimation), because the number reframes everything downstream. Take a mid-sized fleet: 5,000 hosts, each emitting around 200 log lines per second at about 500 bytes a line. That is 500 MB per second, roughly 43 TB per day of raw logs. Not your peak. Your steady state. Full-text-index all of it and the index can be larger than the data, so now you write and store eighty-plus TB a day to make it searchable, a budget line that gets you a meeting with finance. That number is why you cannot index everything, why you need a buffer to absorb spikes, and why retention is tiered rather than "keep ninety days and hope." And it is not hypothetical: Cloudflare handles 35 to 45 million HTTP requests per second, of which 500,000 to 800,000 fail, each failure several log lines; trip.com built a 50 PB logging system after leaving Elasticsearch.
+
+## The spine: agents, a durable log, an indexer, two kinds of storage
+
+The pipeline every serious shop converges on has the same five stages, worth drawing once.
+
+```
+  hosts                  durable buffer          indexing            storage              query
+  +-----------+          +--------------+         +---------+        +-------------+       +-----------+
+  | app +     |  push    | Kafka-style  | consume | process |  write | hot index   | <---- | dashboards|
+  | forwarder | -------> | partitioned  | ------> | + index | -----> | (recent)    |       | + alerts  |
+  | (agent)   |  block/  | commit log   |  at own |         |   +--> | object store| <---- | (ruler)   |
+  +-----------+  spill   +--------------+  pace    +---------+   |    | (cold/cheap)|       +-----------+
+                                                                +----> columnar/snapshots
+```
+
+A forwarding agent on each host tails files and ships events into a partitioned commit log that acts as a durable buffer. An indexing stage consumes from it at its own pace and writes to two stores: a hot index for recent data you query constantly, and cheap object storage for the cold long tail. The query layer on top feeds dashboards and alerts.
+
+Each arrow has a failure behavior, and naming them is half the design. The left arrows share the decision where data quietly vanishes: backpressure. When a hop's downstream is slower than its upstream you have three choices and no fourth. Block, which protects data but can stall the app emitting logs. Drop, which protects the app but loses data. Or spill to disk, buffering on the host's filesystem (Fluent Bit and Vector both support this), getting most of both at the cost of local IO. The choice is per-hop: a payment audit log biases toward block or spill and never drops; verbose debug logging during a flood can drop the overflow. The durable buffer in the middle is what lets you mostly choose "block briefly" at the edges, because it absorbs the surge that would otherwise force a drop.
+
+## Index the labels, scan the body
+
+This is the decision that separates a logging system that scales from one that falls over, and it is the least intuitive one. The instinct, inherited from search engines, is to build an [inverted index](/blog/inverted-index-search) over every word in every log line so any query is fast. That is correct for search and wrong for logs, and the reason is workload shape. Lucene, the engine under Elasticsearch, is tuned for low-write, high-read: index a document once, serve it to many readers many times. Logs are the mirror image, high-write and low-read. You write 43 TB a day and query a sliver of it, so a full inverted index pays enormous write and storage cost for queries that mostly never come. As the Grafana team observed when they built Loki, the full-text index "is sometimes even bigger than the original data."
+
+Loki's answer is to index almost nothing: a small set of low-cardinality labels (`app`, `namespace`, `env`) plus the timestamp and the location of the compressed chunk holding the actual lines. The body is not indexed. A query uses the tiny label index to narrow to the handful of chunks that could match, then brute-force greps those chunks in parallel.
+
+That trade is the whole game. You give up instant full-text lookup and accept that a query scans some data, in exchange for an index that is a rounding error instead of a second copy of your logs. It wins when queries are label-scoped and then grep-shaped: "errors from the checkout service in the last hour containing this string." It is a bad fit when you need fast analytical aggregations across high-cardinality dimensions, and we will get to what wins there. The misconception to kill along the way: indexing is not searching. Loki does not index the body and still searches it; indexing narrows the search space, it is not the only way to find a line.
+
+## Cardinality is the enemy, and it multiplies
+
+If you take the label approach, there is exactly one way to blow it up, and it is the most common mistake in the space. The number of distinct streams is the product of the distinct values of each label. Not the sum. The product. Loki's own docs work the example: three status codes times five HTTP methods is fifteen streams; add an endpoint label with three values and you are at forty-five. Still fine. The math is benign as long as every label is bounded.
+
+Now do the thing that feels helpful and is catastrophic: add `user_id` as a label "so we can search by user faster." With two million users you have just multiplied your stream count by two million. The index explodes into millions of streams and the system spawns thousands of tiny chunks, one per stream. The instinct that should make queries faster detonates the whole index. This is the cardinality bomb, and it is almost always an unbounded identifier smuggled into a label.
+
+The rule that prevents it is sharp and worth memorizing: labels describe origin and context and must be low-cardinality; high-cardinality data (`user_id`, `request_id`, `trace_id`) belongs in the body or in structured metadata, where it stays fully searchable but does not multiply the index. This is why [structured logging](/blog/observability-three-pillars) makes the whole thing tractable: a typed schema lets you promote a small bounded set of fields to labels while keeping the rest as a payload that, as Grafana puts it, "would cause a cardinality explosion if written to Prometheus, yet it remains easily accessible in Loki."
+
+## The buffer earns its keep by decoupling, with reliability a side effect
+
+Everyone reaches for Kafka here, and most explanations are shallow. "Add Kafka for reliability" is technically true and misses the point. The durable commit log sits between the agents and the indexer so the two are decoupled in time: producers push at the rate the world generates events, the indexer consumes at the rate it can index, neither waits on the other. Three things fall out. Spike absorption: a deploy storm at 5x normal swells the buffer, and the indexer drains it over the next few minutes instead of toppling. Replay: the indexer can crash or fall behind, then resume from its last committed offset without losing a byte. And isolation: a slow indexer slows the indexer, not the app emitting logs. Without the buffer, a GC pause in the indexer forces the agents to block application threads or drop data, exactly during the incident when you most need the logs. The buffer turns "the indexer is having a bad time" from an outage into a few minutes of consumer lag.
+
+This is why you want a log and not a plain queue, a distinction [Kafka vs queues](/blog/kafka-vs-queues) draws out: a queue deletes a message once consumed, so you cannot replay and a second consumer cannot independently read the stream, whereas a log retains messages and tracks each consumer's offset. You size that retention to your tolerance for indexer downtime: a six-hour buffer means the indexer can be down six hours before you lose data off the tail. And because agents and Kafka give at-least-once, duplicates are a fact, not a risk; the indexer must dedup on insert, or it double-counts. (The same logic underpins [idempotent webhook processing](/blog/idempotent-webhooks): you cannot stop the duplicates, so you make the second arrival a no-op.)
+
+## Columnar storage is the cost lever
+
+The label-index-and-grep model is one fork. The other, which a staff engineer raises the moment the workload turns analytical, is columnar storage, a genuine fork in the road and not a detail. When your queries stop being "find the lines matching this string" and become "count errors by status code, grouped by endpoint, filtered by three high-cardinality fields," grep does not cut it and a label index does not help. You want a column store, which keeps each field in its own column and so gives two things logs love: enormous compression (a column of repeated status codes compresses to almost nothing) and fast aggregation (scan one column, skip the rest). It is the same [row-versus-columnar](/blog/columnar-olap) distinction that splits OLTP from OLAP databases, applied to log analytics.
+
+The numbers from real migrations are the argument. Cloudflare moved log analytics from Elasticsearch to ClickHouse and went from 600 bytes per document to 60 bytes per row, a clean 10x, with inserter CPU and memory down 8x and p99 latency improved. The headline result captures the whole thesis: because storage got 10x cheaper, they removed sampling entirely and stored 100% of log lines for the retention window without raising cost. Geocodio reports compression 5 to 10x better than InnoDB; trip.com built that 50 PB system on ClickHouse.
+
+But columnar has a sharp edge. Column stores punish small writes: they keep data in immutable parts merged in the background, so inserting row by row creates parts faster than the engine merges them. Geocodio hit exactly this and got the famous `TOO_MANY_PARTS` error; the fix is aggressive batching, 30,000 to 50,000 records per insert. The Loki analog is "thousands of tiny chunks" from high cardinality. Either way, write amplification is a first-class concern, and the buffer earns its keep again by letting the indexer accumulate large batches before it writes.
+
+So which fork? State the workload first. Label-index-and-grep wins on operational simplicity when queries are label-scoped and grep-shaped; columnar wins when you need fast aggregations and ad-hoc filtering across high-cardinality columns, which is why Cloudflare, trip.com, and Geocodio all chose it.
+
+## Tiered storage: recent fast, old cheap
+
+Even with columnar's 10x, 43 TB a day adds up, so you do not keep everything on the fastest storage. You tier it, driven by a real observation: query recency decays hard. The vast majority of queries hit the last 24 to 72 hours. Almost nobody greps a log line from four months ago, and when they do (a compliance request, a forensic investigation) they will wait.
+
+That decay curve is the design. Elastic's data tiers make it concrete: hot, warm, cold, frozen, with a lifecycle policy moving data through them on age and size. Hot is SSD, expensive, millisecond queries, for the data everyone hammers. The frozen tier is the interesting one: it mounts searchable snapshots directly from object storage (S3) with only a tiny metadata footprint on the node, so the data lives in cheap storage, still queryable, just slower. Elastic's numbers: frozen extends capacity roughly 20x versus warm and costs 10 to 20x less than hot SSD. Same data, an order of magnitude cheaper, seconds instead of milliseconds, for queries that are rare anyway. The retention policy is not "ninety days" pulled from nowhere; it is the query-recency curve crossed with cost per GB per tier.
+
+And cheaper storage does not make the volume problem vanish: Cloudflare eliminated sampling because columnar made storage 10x cheaper, which moved where the line sits, not whether there is one. At 43 TB a day, retention tiers, field dropping, and sometimes sampling are still on the table.
+
+## Sampling, and the trap inside it
+
+When volume genuinely exceeds what you can afford to keep, sampling enters, and there are two ways to get it wrong.
+
+The first is uniform sampling: keep one line in ten, drop the rest. But errors are rarer than successes, so it throws away the exact lines you needed. The senior approach inverts it: keep 100% of errors and slow requests, sample only the common success case. You lose almost nothing of diagnostic value and shed most of the volume, because most of the volume is success.
+
+The second trap sinks designs that sound sophisticated. There is head sampling (decide at the source, before transmission) and tail sampling (decide after seeing everything, used for traces so you can keep the slow or failed ones). The trap: tail sampling does not reduce ingestion cost, because to decide on the full picture you must first ingest and buffer the entire volume. Only head sampling cuts ingest, by dropping data before it is sent. So if your goal is to cut the ingestion bill, head sampling is the only lever that pulls; tail sampling buys signal quality, not ingest savings. Confusing the two is how a "cost optimization" ends up cutting nothing.
+
+## Dashboards and alerts are queries, not separate systems
+
+A common mental model treats dashboards and alerting as standalone products bolted on beside the store. They are not. They are scheduled and continuous queries over the same store. Take Loki's ruler: it continuously evaluates LogQL expressions, fires alerts to Alertmanager when a threshold trips, and writes recording rules (pre-computed metric queries) back into a Prometheus-compatible store. That last part is the efficiency move. Instead of a dashboard re-grepping raw logs every fifteen seconds to plot an error rate, a recording rule pre-aggregates the series once and the dashboard reads the cheap result. Alerts are just scheduled queries with thresholds plus routing, dedup, and silencing on top. There is no separate alerting database; there is a query engine and a scheduler.
+
+This is where logging meets the other [three pillars](/blog/observability-three-pillars). Logs are the base layer; you derive metrics and alerts from them rather than treating logs as a write-only graveyard, and a recording rule counting error lines per minute is exactly that, a metric derived from logs. The link runs the other way too: when a log line carries a `trace_id`, you pivot from a single discrete event straight into the full [distributed trace](/blog/distributed-tracing) of that request. Three views, correlated by shared IDs, with logs as the substrate.
+
+## Completeness is a measured SLO, not a hope
+
+The last piece is the one juniors skip and staff engineers insist on: how do you know the system is not silently losing logs? The shallow answer is "logs are best-effort, some loss is fine." That is not good enough, because the loss you do not measure is the loss you discover during an incident when the line you needed is gone. Make completeness an SLO and measure it.
+
+Salesforce is the reference implementation. They set a 99.999% completeness target and built a fidelity service that reconciles record counts at three points: A at the source host, B at the aggregate Kafka layer, C at final storage. Completeness is C divided by A. With that ratio graphed and alarmed, "are we dropping logs" stops being a question and becomes a number on a dashboard. They climbed from roughly 25% completeness in late 2016 to five-nines by mid-2017, and the fixes were unglamorous: MirrorMaker batch size dropped from 1 MB to 250 KB to stop rejects, Logstash set to always read from the beginning so file rotation did not lose lines. None of that happens without the measurement that points at it. If you cannot answer "what fraction of emitted logs reached storage in the last hour" with a number, you do not know whether your logging system works. You only know whether it appears to.
+
+## How a senior actually decides
+
+Strip away the vendors and one rule sits under every decision in this piece: each knob falls out of the volume constraint at the top. What to index, the body. How to label, origin only. Whether to buffer, always, for decoupling. Which store, columnar when the query is analytical, label-index when it is grep. How to write, in big batches. How to retain, hot small and frozen cheap on the recency curve. How to sample, all errors and head-sample the rest. How to alert, scheduled queries with recording rules. How to trust it, a measured completeness SLO.
+
+None of those is exotic. What separates a logging system that survives production from one that looks fine in a design doc is whether the unglamorous ones are present: the bounded labels, the durable buffer, the batched writes, the measured completeness. And the same shape recurs across this batch. [GPU economics](/blog/gpu-economics) is a volume-and-cost problem with hardware utilization as the binding constraint instead of bytes per day. [Learning to rank](/blog/learning-to-rank) takes the [recommendation systems](/blog/recommendation-systems) and [inverted index](/blog/inverted-index-search) machinery and optimizes for relevance over recall. The broader [system design interview framework](/blog/system-design-interview-framework) is, in the end, the discipline of finding the one constraint that drives every decision before you draw a single box.
+
+## The honest landing
+
+You do not get to wish away log volume. It will exceed your production traffic for as long as systems are worth observing, which is forever, and no clever index makes that go away. The only thing you control is where the volume lands and how cheaply each tier holds it: index the labels and scan the body, keep the buffer in the middle so the indexer can stumble without taking the app down, pick columnar when the query is analytical, push the long tail to object storage, sample at the source if you must but never drop an error, and measure completeness because a logging system you have not measured is one you only believe in. Do that, and the incident at 3 a.m. finds the line it needs. Skip it, and you find out which corner you cut at the exact moment you cannot afford to.
+
+## FAQ
+
+<FAQ />

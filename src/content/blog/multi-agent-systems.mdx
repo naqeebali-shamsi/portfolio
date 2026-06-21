@@ -1,0 +1,135 @@
+export const meta = {
+  slug: 'multi-agent-systems',
+  title: 'Designing Multi-Agent Systems (and When a Single Agent Is Better)',
+  description:
+    'Multi-agent systems cost about 15x the tokens of a chat. The narrow band where that buys performance, the failure taxonomy when it does not, and how to choose.',
+  headline: 'Designing Multi-Agent Systems (and When a Single Agent Is Better)',
+  deck: 'Most designs that call themselves multi-agent should be one agent with good tools, and the token bill is the reason why.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['multi-agent', 'ai-agents', 'llm', 'orchestration', 'system-design', 'agentic'],
+  faq: [
+    {
+      q: 'When should I use a multi-agent system instead of a single agent?',
+      a: 'When three conditions hold at once: the subtasks are parallelizable reads rather than writes, the information exceeds a single context window, and the task value is high enough to pay roughly 15x the token cost of a chat. Breadth-first research that fans out across many independent directions is the canonical fit. If any of those conditions is missing, default to one agent with well-described tools. Anthropic found token usage alone explains about 80% of performance variance, so the architecture decision is really a spend decision.',
+    },
+    {
+      q: 'Why do multi-agent systems fail so often?',
+      a: 'The Berkeley MAST study found a 41% to 86.7% failure rate across seven open-source multi-agent frameworks, and traced failures to design and coordination rather than model capability. The categories are Specification and System Design at 43.9%, Inter-Agent Misalignment at 32.15%, and Task Verification at 23.95%. The single most common failure is step repetition at 15.7%: agents redoing each other work because context is partitioned and nobody owns the boundary.',
+    },
+    {
+      q: 'What is the difference between a workflow and an agent?',
+      a: 'Anthropic draws the line at who controls the path. A workflow orchestrates LLMs and tools through predefined code paths that you wrote. An agent lets the LLM dynamically direct its own process and tool usage in a loop based on environmental feedback. Most production systems that work are workflows wearing the agent label, because predefined paths are easier to test, cheaper to run, and far easier to debug than emergent coordination.',
+    },
+    {
+      q: 'Is multi-agent the same as parallelization?',
+      a: 'No, and conflating them is a common mistake. Parallelization runs predefined subtasks concurrently, so you know the decomposition in advance. Orchestrator-workers dynamically decompose the task at runtime, so you do not. The distinction matters because reads parallelize safely while writes do not: N agents reading in parallel is cheap and safe, while N agents writing in parallel produces conflicting decisions that are far worse than conflicting reads.',
+    },
+    {
+      q: 'How do I make a multi-agent system more reliable without adding more agents?',
+      a: 'Fix the contract and the verifier first, because both are cheaper than more agents. The MAST study measured a 9.4% success-rate gain from improving role specifications alone, and a 15.6% gain from adding a single task-objective verification step. Give every subagent an objective, an output format, tool guidance, and clear task boundaries, then make verification a first-class node with its own tests. More agents widen the coordination surface; a sharper contract narrows it.',
+    },
+  ],
+}
+
+The fastest way to make an AI system worse is to split it into a team.
+
+That sounds backwards, so let me make it concrete. You have an agent that reads a document, extracts fields, and fills a form. It works, but it feels monolithic, so you do it properly: one agent to classify, one to extract, one to validate, one to handle errors, all talking to each other. Now it costs five times as much, it is slower, and on a bad day the validator and the extractor disagree about what they are even looking at and the whole thing spins. Nothing in any single agent was wrong. The assumption underneath was that more agents means more capability.
+
+Usually it means more coordination, and coordination is where these systems go to die. This piece is about the narrow band where splitting genuinely pays, the wider band where it does not, and how to tell which one you are in before you write the orchestrator.
+
+## The default is one agent, and the model vendor says so
+
+Start from the position you should have to argue your way out of, not into. Anthropic, in [Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents), draws a line the whole field now uses. A *workflow* orchestrates LLMs and tools through predefined code paths that you wrote; an *agent* lets the LLM dynamically direct its own process and tool usage, typically just an LLM using tools in a loop on feedback. The distinction is who holds the steering wheel: your code, or the model at runtime.
+
+Their advice is blunter than most teams want to hear: add complexity only when it demonstrably improves outcomes, and aim for the right system rather than the most sophisticated one. The company that profits from your token spend is telling you to spend less. Take the hint.
+
+Before you reach for multiple agents, five workflow patterns solve most of what people think they need a team for. These are the canonical vocabulary, and understanding [how LLMs work](/blog/how-llms-work) as next-token predictors that drift over long horizons explains why each one exists.
+
+- **Prompt chaining.** Sequential steps where each LLM call processes the prior output. Use it when a task cleanly decomposes into fixed subtasks; it trades latency for accuracy by inserting checkpoints the model has to pass.
+- **Routing.** Classify the input, then dispatch to a specialized handler. Use it when distinct categories are genuinely better handled separately, like refunds on a different path than technical questions.
+- **Parallelization.** Two flavors: *sectioning* runs independent subtasks concurrently for speed, *voting* runs the same task N times for consensus. Use it when work fans out or multiple looks at one input raise your confidence.
+- **Orchestrator-workers.** A central LLM dynamically decomposes the task, delegates to workers, and synthesizes results. Use it when you cannot predict the subtasks in advance. This is the one people mean when they say multi-agent.
+- **Evaluator-optimizer.** A generator produces, a critic evaluates, they loop. Use it when you have clear evaluation criteria and iterative refinement measurably helps.
+
+Notice that four of these five are workflows: predefined paths, fully testable, cheap to reason about. Only orchestrator-workers hands real control to the model, and that ratio is the whole argument. Most of the wins come from [agentic workflows](/blog/agentic-workflows) with fixed structure, and the gap between that and emergent multi-agent coordination is where most projects quietly fail.
+
+The surface almost everyone under-budgets is the agent-computer interface, the tool definitions and argument shapes and error messages the model reads back. Anthropic says to invest in it as much as in a human UI and to apply poka-yoke, changing arguments so a mistake gets harder to make: a model that keeps passing relative paths needs an absolute-path argument, not a sterner prompt. Good [tool-calling](/blog/tool-calling) ergonomics removes more failures than another agent adds, and [MCP](/blog/mcp-tool-ecosystems) standardizes that surface so you design it once.
+
+## The patterns, as a menu with price tags
+
+When you have genuinely outgrown a single agent, four coordination topologies cover the field, and cost is the deciding factor among them.
+
+**Orchestrator-worker.** A lead agent decomposes the task at runtime and spawns workers for the pieces. This is the legitimate multi-agent win, priced in the next section. Its failure is a lead that misjudges complexity and spawns too many workers for a trivial query or too few for a hard one.
+
+**Hierarchical, the manager pattern.** A manager agent allocates tasks to workers by capability and validates their output, tasks not pre-assigned. [CrewAI](https://docs.crewai.com/en/concepts/processes) implements it directly: set `Process.hierarchical`, give it a `manager_llm`, and it generates a manager that delegates and reviews. The risk concentrates in that manager: misread one worker result and a wrong validation poisons the whole run.
+
+**Blackboard.** Specialists (historically, knowledge sources) read and write a shared structure instead of messaging directly, and a control component opportunistically picks who acts next. This is not new: it is HEARSAY-II, built at CMU in the early 1970s for speech recognition, the ideas predating LLMs by half a century. Everything sits on the board, which designs out the failure where one agent withholds information another needed. The cost is a hard arbitration problem: who writes next, and how do conflicting writes resolve.
+
+**Debate and evaluator-optimizer.** A generator and an independent critic loop, or N agents argue to consensus. This is the cheapest multi-call pattern and almost always worth it, because it runs over a *shared* context: voting and critique rather than coordination across partitioned state, so it sidesteps the entire failure category that wrecks the other three.
+
+The frameworks shape what feels easy. [AutoGen](https://github.com/microsoft/autogen) popularized conversable agents in a group chat with a manager routing turns, though it is now in maintenance mode with Microsoft Agent Framework named as the successor. CrewAI draws a useful line between Crews (autonomous role-based collaboration) and Flows (the deterministic `@start`/`@listen`/`@router` primitive it recommends for production). The framework built for multi-agent collaboration tells you to use its *deterministic* primitive in production. Same hint, second source.
+
+## The honest economics: you are buying performance with tokens
+
+Here is the number that should govern the decision and almost never appears in the architecture diagram. In [How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system), Anthropic reports that agents use about 4x more tokens than chats, and multi-agent systems about 15x more. To a first approximation that is not a tax on the architecture; it *is* the architecture. On the BrowseComp benchmark, token usage by itself explained 80% of the variance in performance. Tool-call count and model choice are the other drivers they name, but four-fifths of the result is just how many tokens you were willing to burn. So choosing a multi-agent topology is choosing to spend, and the performance is what you bought. The gate is economic, stated by Anthropic in one sentence: multi-agent systems require tasks where the value is high enough to pay for the increased performance. Design the token budget before the topology.
+
+When does that bill clear? Their multi-agent system on Opus 4 outperformed single-agent Opus 4 by 90.2% on an internal research evaluation, and the win showed up specifically on breadth-first queries that pursue multiple independent directions at once, on heavy parallelization, on information exceeding a single context window, and on interfacing with many complex tools. Pair the two numbers on the same line, always: 90.2% better, 15x the tokens, never one without the other.
+
+When does it not clear? On domains that require all agents to share context, or that have many dependencies between agents. Anthropic is explicit that most coding tasks involve fewer truly parallelizable subtasks than research: if your problem is one tightly-coupled artifact built up step by step, a team is the wrong shape for it. And [latency and the tail](/blog/latency-throughput-tail) sneak in, because fanning out to N workers makes your latency the slowest worker plus synthesis, a tail worse than any single agent's.
+
+## Why they fail, with the taxonomy attached
+
+If multi-agent were merely expensive, you could buy your way to reliability. You cannot, and the reason is the most useful empirical result in this area. The [MAST study](https://arxiv.org/abs/2503.13657) out of Berkeley and collaborators, peer-reviewed at NeurIPS 2025, did the unglamorous work: 150 traces to build a taxonomy, then over 1,600 annotated traces to measure it, with inter-annotator agreement of κ = 0.88. They found a 41% to 86.7% failure rate across seven widely-used open-source multi-agent systems, plurality-to-majority failure on real frameworks.
+
+The headline conclusion licenses every claim in this article: failures stem primarily from design and coordination, not from raw model capability. You cannot fix a coordination bug by swapping in a smarter model. The breakdown lands in three categories.
+
+| Category | Share | What it is |
+| --- | --- | --- |
+| Specification and System Design | 43.9% | Agents told the wrong thing, or the system built wrong: disobeyed task or role specs, lost history, missed termination conditions |
+| Inter-Agent Misalignment | 32.15% | Agents talked past each other: derailed tasks, withheld information, ignored each other, reasoning that did not match action |
+| Task Verification | 23.95% | Nobody checked the work: terminated early, verified incompletely or incorrectly |
+
+The single most common failure mode, across all 1,600 traces, is step repetition at 15.7%: the most frequent way multi-agent systems fail is agents redoing work other agents already did. That is a missing boundary, a failure of the contract over whose job it was, and no smarter model fixes it.
+
+Which points straight at the cheapest fixes, measured in the same study. Improving agent role specifications alone yielded a 9.4% success-rate increase on one system. Adding a single high-level task-objective verification step yielded a 15.6% improvement on a programming task. Both are cheaper than adding an agent. So the fix order is: sharpen the contract, add the verifier, then add agents only if the work is genuinely parallelizable reads. Sibling pieces in this batch go deeper, [AI guardrails](/blog/ai-guardrails) on enforcing the contract at the boundary and [eval harnesses](/blog/eval-harnesses) on building the verifier so the 15.6% is measurable rather than hoped-for.
+
+And that 23.95% for verification understates the problem, because many systems do not verify at all, so the missing checker hides inside the other modes as derailment or premature termination. Make the verifier a first-class node and you convert invisible failures into catchable ones.
+
+## The fight that is not a fight: read versus write
+
+A day before that Anthropic post, [Cognition published "Don't Build Multi-Agents"](https://cognition.ai/blog/dont-build-multi-agents), arguing from their coding agent that multi-agent is a tempting idea that is quite bad in practice. Two of the most credible teams in the field, opposite titles, within 24 hours. It looks like a contradiction, and resolving it gives you the sharpest heuristic in this article. Cognition's case: share context, including full agent traces rather than individual messages, because actions carry implicit decisions and conflicting decisions across agents produce incoherent results. Their named root cause is that context is partitioned, so sub-agents miss the nuance their subtasks need. That is MAST Inter-Agent Misalignment, found in production rather than on a benchmark.
+
+[LangChain reconciled the two](https://www.langchain.com/blog/how-and-when-to-build-multi-agent-systems) with one observation: read actions are inherently more parallelizable than write actions, and conflicting writes produce far worse outcomes than conflicting reads. Anthropic's own design proves it. They parallelize the reading, spawning research subagents across independent directions, and keep the writing on one agent: a single LeadResearcher does final synthesis, a separate CitationAgent attaches attributions. So the fight dissolves. Research is read-heavy, so fanning out wins; coding is write-heavy, so a team writing code in parallel produces incoherent merges and one agent with engineered context wins. Before you split a task, ask one question: are the parallel parts *reads* or *writes*?
+
+There is a third option the dichotomy hides. A single lead agent can call subagents *as tools*, getting results back inline, in one orchestrating context with one coherent trace. That captures most of the parallel-read benefit while keeping the shared context Cognition insists on and the single writer Anthropic settled on. It is the shape both teams quietly converge toward, and for most problems it is the right amount of multi-agent: barely any. [Agent memory](/blog/agent-memory) keeps that single context durable across a long run instead of degrading as the trace grows.
+
+## IntelliFill: a pipeline that earns its graph, and admits what it cannot prove
+
+Theory is cheap, so let me ground it in a system I can show you the seams of: [IntelliFill](/case-study/intellifill), a document-extraction pipeline sitting exactly on the seam this article is about. It is a TypeScript LangGraph `StateGraph` of five specialized roles over six nodes (classify, extract, map, QA, error-recovery) that reads identity and business documents and auto-fills government PDFs, retrofitted behind seven feature flags onto a live PII pipeline. Crucially, it is closer to Anthropic's prompt-chaining-plus-orchestrator workflows than to autonomous spawned agents: a single process with an explicit graph, which is what most well-built multi-agent systems actually are.
+
+The honest question is whether it should be a graph at all, because much of it could be one agent with five well-described tools. The graph earns its keep on one specific edge: error recovery has to route *backward*. QA routes to finalize or error-recover, and error-recover routes back to extract, back to classify, or forward to finalize, bounded by a `MAX_RETRIES` of 3 and a five-minute timeout. A linear prompt chain handles forward progress fine and backward routing poorly. That backward edge is the concrete reason the [agentic workflows](/blog/agentic-workflows) graph beats a promise chain here, and the kind of thing a topology should be justified on. Context isolation is done the boring, correct way: 19 state channels with last-write-wins reducers, every value an agent touches a named channel with defined merge semantics, which addresses the MAST misalignment category directly by refusing to let agents talk past each other through implicit shared state.
+
+Verification, the most-skipped MAST category, is made literal. The QA agent is a deterministic 0-to-100 scoring state machine plus an ICAO-9303 MRZ checksum, the real passport machine-readable-zone check with its 7-3-1 digit weighting and four check digits, cross-validated against the visually-extracted passport number. That is incorrect-or-incomplete verification designed out rather than hoped away, and it names its own gap: a garbled MRZ currently returns valid and skips cross-validation, a soft spot documented rather than buried, because pretending the verifier is airtight is how you ship the 23.95%. The cross-validation is itself a micro-debate, two noisy extractors whose agreement buys a plus-10 confidence boost.
+
+The most important beat is confidence calibration. `estimateVLMConfidence()` is hard-capped at 85, refusing to inject a fake 99%, because a vision model's self-reported confidence is not a calibrated probability and laundering it through as a high number poisons every downstream gate that trusts it. Then the beat that earns the study its credibility: the measurement loop is half-built. Schema and dashboard exist; the write path does not, so the accuracy delta the architecture is designed to measure cannot be measured yet. The one trustworthy number is 274 passing agent unit tests, with the LLM mocked. The system distinguishes, in writing, what it was *designed for* from what it has *measured*. As the study puts it: the clever part was never getting an LLM to read a passport; it was building the machinery that knows when not to believe it, and being honest about which parts are wired and which are still just schema. Trust only the measured row.
+
+One trap surfaces only once you go multi-agent: IntelliFill's circuit breakers and semaphore are process-local, so across workers they do not coordinate and N workers can each hammer a globally rate-limited provider. Splitting into agents means inheriting every hard distributed-systems problem, consistency, partial failure, idempotency, on top of LLM nondeterminism, which is why it keys jobs with a deterministic `jobId` so retries do not become duplicate side effects. The patterns in [RAG systems](/blog/rag-system) and [vector databases](/blog/vector-databases) inherit the same lesson the moment retrieval fans out across workers.
+
+## How a senior actually decides
+
+The decision you make before writing any orchestrator is a short tree with one default at the bottom. Any "no" routes to a single agent with good tools.
+
+1. **Does the task value clear roughly 15x the tokens of a chat?** If no, stop here; the economics decided it before anything else.
+2. **Are the parallel parts reads or writes?** Conflicting writes are far worse than conflicting reads, so write-parallelism stays on one agent with engineered context. Only read-parallelism is a reason to fan out.
+3. **Does the information genuinely exceed a single context window?** This justification weakens every time windows grow, so re-evaluate it when your model changes. If today's window holds the problem, one agent holds it.
+4. **Is there hard specialization with clean boundaries**, where a backward-routing edge or a truly distinct skill set earns its own node? If all four pass, reach for a topology smallest-first: debate or evaluator-optimizer over shared context, then orchestrator-workers, then a full hierarchy.
+
+And whatever you build, fix the contract and the verifier before the fourth agent: those are the 9.4% and 15.6% gains, cheaper than any new agent and aimed at the two largest failure categories. Wire [observability for the three pillars](/blog/observability-three-pillars) into that verifier node so step repetition shows up in the traces instead of as a guess. The [Aladeen](/case-study/aladeen) work is the other half: agent-CLI observability that classifies failures and exposes them through an MCP server, which turns the MAST taxonomy from a paper into a dashboard you watch.
+
+The litmus test: a reader who walked in wanting a multi-agent system should walk out planning to build a single one, able to name the three conditions under which they would change their mind: parallelizable reads, context overflow, and a task value that clears the token bill. Most of the time those will not all hold. The senior move is knowing the team is usually the wrong answer, naming the exact case where it is right, and getting the token budget approved first.
+
+## FAQ
+
+<FAQ />

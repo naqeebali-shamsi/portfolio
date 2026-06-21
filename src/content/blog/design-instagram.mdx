@@ -1,0 +1,148 @@
+export const meta = {
+  slug: 'design-instagram',
+  title: 'Design Instagram: The Feed and the Media Pipeline',
+  description:
+    'Instagram is two systems wearing one trench coat: a fan-out feed of media-id references and an async media pipeline of immutable blobs. Separate them or fail.',
+  headline: 'Design Instagram: The Feed and the Media Pipeline',
+  deck: 'The feed never stores a single pixel, and the day you understand why is the day this problem gets tractable.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '16 min',
+  tags: ['system-design', 'instagram', 'feed', 'blob-storage', 'cdn', 'distributed-systems'],
+  faq: [
+    {
+      q: 'Does the Instagram feed store the actual photos?',
+      a: 'No. A feed entry is a tiny tuple of (media_id, author_id, timestamp) living in a Redis sorted set or a Cassandra row. The image bytes live in object storage like S3 or Facebook Haystack, fronted by a CDN. The feed is an index of references, not a store of pixels. This split is the whole game: feed throughput is bounded by id-list operations and metadata fan-out, while image delivery is bounded by CDN egress, and you size those two budgets independently.',
+    },
+    {
+      q: 'Why is fan-out on write not always the right answer for the feed?',
+      a: 'Fan-out on write pre-computes each follower feed at post time, which makes reads cheap but makes a single post cost O(followers) writes. For a normal account that is fine. For a celebrity with millions of followers it melts: pushing one post to every follower feed is on the order of ten million Redis writes you cannot do synchronously. Real systems go hybrid: push for the masses, and pull-and-merge a small set of high-follower accounts at read time. Instagram does the fan-out asynchronously in a queue precisely so a high-follower post never blocks the upload.',
+    },
+    {
+      q: 'Why not just store images in a normal filesystem or NAS?',
+      a: 'At billions of small files the bottleneck is filesystem metadata I/O, not the bytes. Facebook measured a NAS read costing around ten disk accesses per photo (three even when heavily tuned) just to walk directory metadata and inodes before touching the file. Facebook built Haystack to shrink per-photo metadata small enough to keep the entire index in RAM, so a read becomes a single disk seek for the bytes themselves and never a seek for metadata.',
+    },
+    {
+      q: 'What is the difference between replication and erasure coding here?',
+      a: 'Replication keeps full copies and is about IOPS: hot photos get read constantly, so Haystack triple-replicates plus RAID-6 for an effective factor near 3.6x, which is great for throughput and wasteful for bytes. Erasure coding is about bytes: warm photos that barely get read do not need that throughput, so f4 encodes them with Reed-Solomon(10,4) and drives the effective replication factor down to roughly 2.1x. The decision is driven by temperature, and age is the proxy for temperature.',
+    },
+    {
+      q: 'Why use a 64-bit time-sortable ID instead of an auto-increment key?',
+      a: 'Auto-increment breaks under sharding and gives you no time ordering. Instagram generates a 64-bit ID with the millisecond timestamp in the high-order bits, then the shard id, then a per-shard sequence. Two properties fall out: the shard id is embedded so you can route without a lookup, and ORDER BY id equals ORDER BY created_at, so feed pagination becomes a cheap range scan and you never build a separate time index. It is generated inside Postgres with no central coordinator, so there is no single point of failure.',
+    },
+  ],
+}
+
+Ask someone to design Instagram and watch where they point first. The weak answer draws one box labeled "Instagram" and hangs features off it: upload here, feed there, likes over there, all of it one undifferentiated blob. That box is the trap. The strong answer splits Instagram into the two systems it actually is, which share almost nothing except a single thin reference.
+
+Instagram is two systems wearing one trench coat. The first is the **feed**: an ordered list of who-posted-what, fanned out across followers, read far more than written. The second is the **media pipeline**: an upload becomes an immutable blob, gets transcoded into a handful of sizes, lands in object storage, and serves through a CDN. The feed is a timeline-assembly problem with the same push-versus-pull, hot-key, read-amplification shape as a Twitter timeline. The media pipeline is a small-file blob-storage and async-transcoding problem, the one Facebook solved twice with two different papers. They meet at exactly one point, and naming that seam precisely is the difference between a mid-level answer and a staff-grade one. For the scaffolding to work any problem like this end to end, [the system design interview framework](/blog/system-design-interview-framework) is the companion read.
+
+## The seam: the feed never touches a pixel
+
+Start at the join, because everything else makes sense once you have it.
+
+A feed entry is a tuple: `(media_id, author_id, timestamp)`. That is the entire payload of one home-feed item at the storage layer. No image data, no caption blob, a handful of bytes in a Redis sorted set or a Cassandra row. The `media_id` is a reference, and the JPEG or MP4 it points at lives somewhere else entirely, in object storage fronted by a CDN.
+
+This is the single most important fact in the design, and the one people get wrong. A feed read moves three layers: the feed service hands you an ordered list of `media_id`s (the index), each id is hydrated through a metadata cache into the small facts you need (author, caption, dimensions, CDN URL), and the browser fetches the actual image bytes from the CDN, which pulls from the backing blob store only on a miss.
+
+Obsess over this split because it gives you two independent budgets. Feed throughput is bounded by id-list operations plus metadata fan-out, and a feed entry is tiny, so one machine assembles a lot of feeds. Image bytes are bounded by CDN egress, a different cost in a different system. Conflate them and you will reason about a 200 KB photo flowing through your feed database, which never happens, and size everything wrong. This is the same reference-not-payload move that makes [the URL shortener](/blog/url-shortener) trivial: store the small mapping, never the thing it points to.
+
+## The feed: fan-out and the celebrity that melts it
+
+The feed is fundamentally a question of *when* you assemble a timeline. Two extremes, one answer.
+
+**Fan-out on write (push).** When a user posts, you immediately write that post's `media_id` into every follower's feed list. Reads become trivial: a home feed is already pre-computed, so reading it is one range query. The cost moved to write time, and it is O(followers) writes per post.
+
+**Fan-out on read (pull).** When a user posts, you store it once on the author's own timeline and do nothing else. Reading a home feed gathers the recent posts of everyone you follow and merges them on the fly. Writes are cheap; reads are now O(people you follow) lookups plus a merge, paid on every feed load.
+
+Stated as a tradeoff: pre-compute makes reads cheap and writes expensive; store-once makes writes cheap and reads expensive. A read-heavy product wants reads cheap, so the instinct is pure push. The instinct is wrong, and the thing that breaks it has a name.
+
+The celebrity. An account with ten million followers, on pure push, costs ten million feed-cache writes for one post. With a 400-million-feed cache and a target of fanning a post out within thirty seconds, that lands on the order of ten million writes per second of pressure. You cannot do that synchronously inside the upload request, and would not want to, because it is a self-inflicted hot-key storm every time someone famous posts. This is the [Design Twitter](/blog/design-twitter-feed) problem in a different shirt, and the answer is the same: go **hybrid**. Push for the masses, pull-and-merge for the few. Normal accounts fan out on write, so most feed content is pre-computed and reads stay cheap; high-follower accounts are tagged and skipped at write time, their recent posts pulled at read time and merged into each home feed. You pay the merge cost only where push would be catastrophic.
+
+Two refinements separate a good answer from a great one. The celebrity threshold is not a constant; it is an operational knob tuned against the actual follower-count distribution and your Redis write-throughput ceiling, and it drifts as the graph grows, so it lives in config, not code. And the read-time merge is itself cached: you do not re-merge a celebrity's recent posts once per viewer, you cache that recent-post list and splice it into each home feed at read time. Skip that cache and you have just moved the explosion from write time to read time, which on a read-heavy product is worse.
+
+Instagram's own engineering writeup says the quiet part out loud: *"We also do our feed fan-out in Gearman, so posting is as responsive for a new user as it is for a user with many followers."* That sentence is the entire thesis. The fan-out is asynchronous, off the upload path, in a queue, *precisely* so a high-follower post does not block the person posting it. The write path is "drop a job and return."
+
+This survives only because the feed tolerates **eventual consistency**. A post showing up two seconds late is fine, and that relaxation is what makes async fan-out and aggressive caching viable. Demand strict consistency on the feed and the architecture collapses back into something synchronous and slow.
+
+## The feed read path: caching, and the herd that takes down your database
+
+The feed is read-heavy, so the read path is where caching earns its keep. Outermost to innermost: CDN for the image bytes, an application cache (Memcached, or a graph store like TAO) for metadata and id-lists, and the database underneath as the source of truth. A read walks inward only as far as it must.
+
+The interesting failure is the **thundering herd**. A hot feed key expires from cache, and in the instant it is gone every concurrent request for it misses at once and stampedes the database for the same value. The cache, whose entire job is to protect the database, just funneled a coordinated flood straight at it. The fix is a **lease**: when a key is missing, the cache hands exactly one requester a token to recompute it while everyone else waits briefly for the result. Facebook's "Scaling Memcache" work put a number on the win: a lease at most once every ten seconds per key dropped a peak database query rate from 17,000 per second to 1,300. That is the canonical figure for how caching protects the database on a hot key. The same single-flight idea, request coalescing in front of the backing store, is the load-bearing pattern behind [the distributed cache](/blog/distributed-cache); the herd is the problem it exists to solve.
+
+## The IDs that make feed pagination free
+
+A small, load-bearing piece of plumbing connects the feed and the media metadata, and skipping it marks you as junior: the ID scheme. An auto-increment primary key is the wrong tool. It does not survive sharding (two shards both want to mint id 1001), and it carries no time information. Instagram designed a **64-bit time-sortable ID** instead, and the bit layout is worth memorizing:
+
+```
+[ 41 bits: ms since custom epoch ][ 13 bits: shard id ][ 10 bits: per-shard sequence ]
+```
+
+The 41-bit millisecond timestamp gives about 41 years of ids from a chosen epoch. The 13-bit shard id is `user_id % num_logical_shards`, so the shard is *embedded in the id* and you route a lookup without a separate directory hop. The 10-bit sequence is a per-shard counter mod 1024, giving 1,024 ids per shard per millisecond, roughly a million per second per shard, more than any shard needs.
+
+Two things make this beautiful. It is generated inside Postgres in PL/pgSQL with no external coordinator, unlike a Snowflake scheme that leans on ZooKeeper, so there is no central service to be a single point of failure. And because the timestamp sits in the high-order bits, `ORDER BY id` is identical to `ORDER BY created_at`. You never build a separate time index, which saves a large amount of RAM, and feed pagination becomes a cheap range scan: "next page" is `WHERE id < cursor ORDER BY id DESC LIMIT n`, index-free on time. That shard-embedded, time-sortable id is exactly what lets feed assembly merge per-source id-lists cheaply, the kind of property that only shows up once you treat [consistent hashing](/blog/consistent-hashing) and sharding as one connected idea.
+
+The feed later outgrew pure Redis, which is RAM-bound and expensive at that scale, so Instagram moved feed and activity storage onto Cassandra, then hit JVM garbage-collection tail latency, the P99 pain [latency and the tail](/blog/latency-throughput-tail) is about. Their answer, Rocksandra (a pluggable RocksDB storage engine under Cassandra), took P99 read latency from 60 ms to 20 ms and cut GC stalls from 2.5% to 0.3% on a production cluster. That is a storage-engine swap beating more machines: the bottleneck was pause time, not capacity, and you fix pause time by getting off the garbage-collected heap, the same durability-versus-latency thinking as [replication](/blog/replication-strategies).
+
+That is the feed. Now the other system entirely.
+
+## The media pipeline: why a filesystem is the wrong store
+
+Here is where most candidates wave a hand and say "put the images in S3," and where a staff engineer explains why that sentence hides the actual problem.
+
+At Instagram and Facebook scale the catalog is billions of small files. Facebook's Haystack paper, the canonical source for this subsystem, opens with the numbers: 260 billion images, about 20 PB, a billion new photos a week, over a million images per second served at peak. The read pattern is lopsided in a way that defines the design: news feed plus albums are 98% of photo requests, almost all of it "show me a grid or stream of recent-ish photos." And images are written once, read often, never modified, rarely deleted, which is the entire reason a custom append-only store is viable.
+
+The trap in a naive filesystem or NAS is that at billions of files the bottleneck is **metadata I/O, not bytes**. Facebook measured it: a directory of thousands of images cost around ten disk accesses per image, and even tuned to hundreds per directory a single read still took three (read directory metadata, read inode, then finally read the file). The latency is in the access itself, not the tiny transfer; you spend almost all your IOPS walking metadata before you ever touch a pixel.
+
+And a CDN does not save you. It serves the *head* of the distribution beautifully (profile pictures, brand-new posts, the hot stuff everyone wants now) but does nothing for the **long tail** of old photos, which is most of the catalog. There are, in the paper's words, too many possibilities and too few used, so you cannot keep the tail in any cache, and a meaningful fraction of traffic falls through to the backing store anyway. The CDN handles the easy reads; the backing store has to handle the hard ones efficiently, which is exactly what a filesystem fails at.
+
+## Haystack: put the index in RAM, take one seek for the bytes
+
+The core insight of Haystack is one sentence, and it is genuinely clever. You cannot keep all the photo *files* in RAM, nor even enough to cover the long tail, but you *can* shrink the per-photo *metadata* until the entire index fits in main memory. Then a read is an in-memory lookup plus exactly one disk seek for the bytes, never a seek for metadata. You traded three-to-ten metadata seeks per photo for one data seek, and at a million images per second, going from three seeks to one removes roughly two million disk seeks per second of load.
+
+The mechanism: photos are appended into big physical volumes, each around 100 GB. For each photo the Store keeps a tiny in-memory entry, the **needle**, mapping `<photo id, type>` to `<flags, size, offset>`, plus a preloaded open file descriptor per volume. A read is a hash lookup for the offset, then a single `pread(fd, offset, size)`. The footprint makes it work: a needle is tens of bytes, so even 100 million photos' worth of index is only a few GB of RAM, small enough to keep resident. Index in RAM, one seek for the bytes.
+
+Three components cooperate. The **Store** holds the physical volumes and the in-memory index. The **Directory** maps logical volumes to physical replicas, load-balances writes across logical volumes and reads across physical ones, and flips a volume read-only when it fills. The **Cache** is an internal CDN keyed by photo id, with a sharp admission rule: cache a photo only if the request came directly from a user rather than the CDN (a CDN miss is unlikely to hit in your smaller internal cache anyway), and only if it lives on a write-enabled volume. That second condition encodes a real I/O insight most candidates miss: a volume does reads *or* writes well, not both at once, so you shelter reads away from volumes actively being appended to.
+
+The read path is encoded right into the photo URL:
+
+```
+http://<CDN>/<Cache>/<Machine id>/<Logical volume, Photo>
+```
+
+Each layer strips its own component and forwards the rest. A CDN miss falls through to the Cache; a Cache miss falls through to the named Store machine; an un-CDN'd photo simply starts at the Cache step. The upload path mirrors it: the web server asks the Directory for a write-enabled logical volume, assigns a unique id, and synchronously appends the photo to *every* physical volume backing it (replication on write). Deletes flip a flag in the needle, reclaimed later by compaction. For durability, Haystack triple-replicates across racks and datacenters and adds RAID-6 per node, an effective factor around 3 times 1.2, or about 3.6x. Excellent for IOPS, terrible for storage efficiency, and that gap is the exact problem the next system was built to close.
+
+## f4: when a photo cools down, stop paying for IOPS
+
+Photos have a temperature, and it drops fast. The f4 paper measured it: for eight of nine blob types, week-old content gets an order of magnitude fewer requests than day-old content, and for six of nine the rate drops 100x within 60 days. **Age is a good proxy for temperature**, the load-bearing observation, because age is trivial to know and temperature is not. f4 draws the hot-to-warm line around one month (three months for photos), and in the oldest interval more than 80% of objects are warm. The economic argument follows: Haystack's 3.6x replication exists to serve IOPS, and a warm photo that barely gets read does not need that throughput, so you are buying IOPS for objects that no longer generate any.
+
+So f4 changes the durability mechanism for warm blobs from replication to **erasure coding**, encoding them with **Reed-Solomon(10, 4)**: ten data blocks plus four parity per stripe, where a lost block is rebuilt by decoding any 10 of the 14. The storage math is the point. Triple replication costs 3x; RS(10,4) costs 1.4x per copy, so a single-cell f4 deployment lands at 1.4x, double-replicated across datacenters it is 2.8x, and XORing two copies across a third datacenter for geo-resilience lands at roughly 2.1x, because (1.4 times 2, plus 1.4) divided by 2 equals 2.1. As reported, f4 stored over 65 PB of logical data and saved over 53 PB versus the Haystack scheme, the difference between replicating for IOPS you no longer need and erasure-coding for bytes you still have to keep.
+
+Two details signal you read the paper. **Online reconstruction**, on a CPU-heavy backoff node, rebuilds only the single requested ~40 KB blob when a read hits a failed block, not the whole 1 GB block, while a full **offline rebuild** of a lost 1 GB block runs in the background, throttled so it never starves live reads. Separating "rebuild the tiny thing the user is waiting on" from "rebuild the big thing nobody is waiting on" is precisely how you hold P99 during a failure, the tail-protection thinking from [latency and the tail](/blog/latency-throughput-tail). And **delete means discard the encryption key**: every f4 blob is encrypted with a key in an external store, so deleting the key makes the blob permanently unreadable, crypto-shredding instead of erasure, which lets f4 skip Haystack's journal and avoid compaction entirely.
+
+The storage-side seam mirrors the feed-side one. A **Router tier** hides storage from clients and a **Transformer tier** does resize and crop on retrieved blobs, while behind them Haystack handles all creates and most deletes and f4 handles reads only. Separating transform from storage is the same instinct as separating transcode from upload: compute and storage scale independently and want different hardware, CPU-dense versus disk-dense.
+
+## The write path: one upload, two async fan-outs
+
+Now stitch the two subsystems together at the upload, because one user action triggers both, and the senior move is making both asynchronous. An upload returns fast and kicks off two independent async fan-outs. The **media** fan-out stores the original in object storage, enqueues a transcode job producing several renditions (240p, 480p, 720p, 1080p, plus HLS or DASH segments for video), and writes the rendition metadata. The **feed** fan-out enqueues the push of this `media_id` into followers' feed lists. Both run off the request, historically through Gearman with around 200 Python workers, so the user's POST returns the instant the upload is durably recorded.
+
+Transcoding belongs off the write path, as a tradeoff. Encode synchronously and you couple upload latency to encode time, which is slow, variable, and tied to file size, so a large video leaves the user staring at a spinner. Encode asynchronously and the upload is fast, at the cost of brief eventual consistency: the post exists before all its renditions do. That is the same shape as deferring slow work behind a fast acknowledgment in [idempotent webhooks](/blog/idempotent-webhooks): acknowledge durably and fast, do the heavy work where the caller cannot time you out.
+
+Those transcode jobs must be **idempotent and retryable**, with a dead-letter queue for the ones that keep failing, because a worker will crash mid-encode and the job will run again, and "runs again" must not corrupt or duplicate output. This is the same exactly-once-processing discipline that [idempotency and the exactly-once lie](/blog/idempotency-exactly-once) lays out: you cannot make a queue deliver exactly once, so you make the *processing* idempotent and let at-least-once delivery be safe. A transcode that lands twice should produce one rendition, not two.
+
+I have built this shape of pipeline. [IntelliFill](/case-study/intellifill) is a multi-agent LLM pipeline with the same rules: long-running work fanned out across workers, each stage idempotent and retryable so a mid-run failure resumes instead of corrupting. The payload is form-filling rather than photos, but an async pipeline of retryable stages is an async pipeline of retryable stages. Keeping it observable, knowing which stage failed and why without guessing, is the discipline [Aladeen](/case-study/aladeen) exists for, so the dead-letter queue tells a story instead of a count, and [NomadCrew](/case-study/nomadcrew) and [Audex](/case-study/audex) lean on the same reference-not-payload and async-fan-out patterns in their own media and event paths.
+
+Two final notes on the read side close the loop. First, the CDN should be **pull**, not push: pull is self-managing (first request misses to origin, every request after is fast from the edge), which is right for a huge, mostly-warm catalog where you cannot predict which old photo someone opens. Push only pays off for a small set of always-hot assets you know in advance, a launch banner rather than a billion-photo back catalog, the same head-versus-tail reasoning that decides what [the distributed cache](/blog/distributed-cache) should and should not hold. Second, visibility lives in the graph layer, not the blob layer: a read resolves a *handle* through the social graph store (TAO) into a CDN URL, so "who may see this photo" is answered before the blob store is ever consulted. The blob store just serves bytes to whoever holds a valid URL, which is what lets it stay a dumb, fast, append-and-seek machine, the only way it hits a million images per second.
+
+## The honest landing
+
+Design Instagram and the instinct is to draw one box. Resist it. That box is a feed and a media pipeline that share exactly one thing, the `media_id`, and the problem becomes tractable the moment you stop pretending they are one system.
+
+The feed is a small, ordered list of media-ids fanned out across followers, push for the masses and pull-and-merge for the celebrities who would otherwise melt it, served read-heavy through layered caches with a lease guarding the hot key. The media pipeline is an async transcode pipeline writing immutable blobs into a metadata-in-RAM hot store that ages into an erasure-coded warm tier, fronted by a pull CDN. They meet at the media-id and the read-hydration step, nowhere else.
+
+Get the seam right and each side becomes a known problem with a known answer. Blur it, store pixels in your feed and replicate your cold photos like they are hot, and you have built something that demos fine, costs a fortune at scale, and falls over the first time someone famous posts a photo.
+
+## FAQ
+
+<FAQ />

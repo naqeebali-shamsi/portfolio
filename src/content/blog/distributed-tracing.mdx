@@ -1,0 +1,194 @@
+export const meta = {
+  slug: 'distributed-tracing',
+  title: 'How Distributed Tracing Works: Spans, Context Propagation, and Sampling',
+  description:
+    'Distributed tracing reconstructs one request across many services. How spans form a tree, how W3C trace context propagates, and why sampling is mandatory.',
+  headline: 'How Distributed Tracing Works: Spans, Context Propagation, and Sampling',
+  deck: 'Metrics tell you the p99 got worse and logs scatter the story across twenty services; a trace is the only signal that reassembles one request as a single connected object.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['distributed-tracing', 'observability', 'opentelemetry', 'sampling', 'distributed-systems', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between a trace and a span?',
+      a: 'A span is one timed unit of work: a name, a start and end timestamp, an id, and a parent id. A trace is the full set of spans for a single request, reconstructed into a tree where each span points at the span that caused it. You emit spans; the backend assembles them into a trace by joining on the shared trace id. The tree is never built on the wire, only at query time.',
+    },
+    {
+      q: 'How does context propagation work in distributed tracing?',
+      a: 'On an inbound request, a service extracts the W3C traceparent header, which carries the trace id and the caller span id. It starts a child span, rewrites the parent-id field to its own new span id, and injects the mutated header onto every outbound call. OpenTelemetry formalizes this as the Propagators API with inject and extract operations, defaulting to W3C Trace Context, so a Go service and a Java service agree without sharing a library.',
+    },
+    {
+      q: 'What is the difference between head sampling and tail sampling?',
+      a: 'Head sampling decides at the start of a trace, from a hash of the trace id, before any spans exist. It is cheap, stateless, and consistent, but blind to how the request turned out, so it misses the rare errors and slow requests you actually want. Tail sampling waits until the trace is mostly complete, then keeps errors and slow traces, but it must buffer every span in memory and route all spans of a trace to one collector. Serious pipelines run both: cheap head sampling at the edge, tail sampling in the collector.',
+    },
+    {
+      q: 'Why does a child span sometimes start before its parent?',
+      a: 'Almost always clock skew, not corruption. Each span timestamps itself from its own host clock, and two hosts disagree by milliseconds. The rendered timeline can show a child beginning before its parent, but the causal structure stored in parent_span_id is still correct. The timestamps lie; the parent pointers do not.',
+    },
+    {
+      q: 'Does distributed tracing replace logs and metrics?',
+      a: 'No. Tracing is the third pillar that joins the other two. Metrics tell you something is wrong, a trace tells you which span owns the latency, and logs tell you the exact error on that span. The connective tissue is the trace id, stamped into every log line and attached to metrics as exemplars so a spike on a histogram links straight to a representative slow trace.',
+    },
+  ],
+}
+
+You can watch a request leave the load balancer and you can watch a database get slow, but between those two facts sit nineteen other services, and the question that pages you at 2 a.m. lives in the gap. The checkout is slow. Which hop? Metrics will not tell you, because they aggregate, and the one request that took four seconds is averaged into a p99 that moved by forty milliseconds. Logs will not tell you either, because across twenty services you get twenty disconnected stories with no shared key to stitch them. You are holding a pile of evidence about a crime and no way to prove the suspects were ever in the same room.
+
+Distributed tracing is the signal that puts them in the room. It reconstructs a single request as one connected object you can follow across every process it touched. This piece covers how that works: how spans form a tree, how two headers carry the context that makes the tree possible, and why you can never keep all of it, so sampling becomes the central design decision rather than an optimization. For the wider framing, the companion piece on [Metrics, Logs and Traces](/blog/observability-three-pillars) lays out where each pillar's authority begins and ends. This one goes deep on the third.
+
+## Why the other two pillars structurally cannot answer "why"
+
+Start with the limitation, because it is the whole reason tracing exists.
+
+Metrics are counters and histograms: cheap, real-time, the right tool for "is anything wrong." But aggregation is the entire point of a metric, and aggregation throws away the individual. A latency histogram tells you the p99 climbed. It cannot tell you which request lived at that p99, what it called, or where its seconds went, because by then the request that produced the number has been summed into a bucket with a million others. Slack's tracing team put it plainly: metrics give an aggregated view, and "we don't have granular information about why a specific request was slow."
+
+Logs have the opposite shape and the same hole. A log line is per-process and richly detailed, but nothing joins it to the line in the next service. You can grep one service's logs and reconstruct its side of the story; you cannot put twenty services' stories in causal order, because there is no shared key threading them and the timestamps come from twenty different clocks. (The [latency and the tail](/blog/latency-throughput-tail) post is the companion on why the worst request, not the average, defines user experience, and the worst request is precisely the one aggregates hide.)
+
+A trace is the only signal designed to reconstruct one request as a connected whole. That is what it does that the other two cannot, and it is why a mature stack runs all three rather than picking a favorite.
+
+## A trace is a tree, and the tree is emergent
+
+The vocabulary is old and stable. It comes from Dapper, Google's 2010 internal tracing system and the paper every later tool descends from, and the model has barely changed in fifteen years.
+
+A trace is a tree. The nodes are **spans**, each a timed unit of work with a name, a start and end timestamp, and a status. The edges are parent-to-child causal relationships: this span happened because that span called it. A span also carries **attributes** (key-value metadata like the HTTP route or the database statement), **events** (timestamped annotations within the span), and a **status** of unset, ok, or error. The root span is the whole request; its children are the downstream calls; theirs are the calls those made, on down.
+
+Here is the part most explainers skip, and it makes everything else make sense. Nobody assembles the tree while the request is running. Each service emits flat, independent spans, every one tagged with three ids: its own `span_id`, the `trace_id` it belongs to, and the `parent_span_id` of whatever called it. These spans are shipped off separately, often by different services, in any order, with no knowledge of each other. The backend reconstructs the tree later by joining all spans that share a `trace_id` and wiring each one to its parent via `parent_span_id`.
+
+So the tree is an emergent property of two propagated ids, recovered by a join at query time. The wire never carries the tree; it carries only your current position in it. There is no master object everyone appends to, no central coordinator stitching things live. There are flat spans and a join, and the "trace" in the UI is a query result.
+
+```
+   Service topology (one request highlighted)
+   gateway --> checkout --> payments --> bank-api
+                   |  \---> inventory
+                   \------> pricing --> cache
+
+   The SAME request as a span waterfall (indentation = parent/child):
+   [gateway ................................................] 1200ms
+     [checkout ............................................] 1150ms
+       [pricing .....]  80ms
+         [cache ..]      8ms
+       [inventory ....]  95ms
+       [payments .......................................]  900ms
+         [bank-api ....................................]  870ms   <- the latency lives here
+```
+
+The topology graph and the waterfall are the same data drawn two ways: the graph shows who calls whom, the waterfall shows where the time went. The "aha" of tracing is seeing that the 870ms bar nested four levels deep answers "why is checkout slow," and that no amount of staring at the gateway's metrics would ever have pointed there.
+
+## Context propagation is the entire trick, and it is two headers
+
+If spans are emitted flat and joined by `trace_id`, the only hard problem is making sure every service in the path knows the trace id and its own parent. That is **context propagation**, and despite the reputation, it is mechanically two HTTP headers carried across each hop.
+
+The standard is **W3C Trace Context**, a W3C Recommendation since November 2021, and the header that does the work is `traceparent`:
+
+```
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             ──  ────────────────────────────────  ────────────────  ──
+            version       trace-id (16 bytes)      parent-id (8 bytes) flags
+```
+
+Four fields, each precisely sized:
+
+- **version** is `00`, two hex characters.
+- **trace-id** is a 16-byte id, 32 hex characters, constant for the entire trace. All-zeroes is invalid by spec. This is the join key.
+- **parent-id** is an 8-byte id, 16 hex characters: the caller's span id. All-zeroes is invalid. This is the field that mutates at every hop.
+- **trace-flags** is one byte whose bit 0 is the **sampled bit**. Here it is `01`, set, which the spec describes as "the caller may have recorded trace data." This single bit carries the edge's sampling decision to every downstream service, so they all agree.
+
+The relay is simple, and it is the whole of it. A service receives a request, **extracts** the `traceparent`, and reads the trace id and the caller's span id. It starts a child span with a fresh span id of its own and sets that child's parent to the id it just read. Then, on every outbound call, it **injects** a new `traceparent` with the same trace id and `parent-id` rewritten to its own span id. The next service does the same. Service A injects `parent-id=a1`; B extracts it, starts span `b1`, and injects `parent-id=b1`; C extracts that. The trace id rides unchanged end to end; the parent-id is overwritten at each step, which is exactly why "parent-id" always means "the span that called me" and never accumulates history.
+
+OpenTelemetry, the CNCF standard that won this space, formalizes the relay as the **Propagators API**: a `TextMapPropagator` with `inject` and `extract`, defaulting to W3C Trace Context. The reason a standard matters here, and not just a convention, is interoperability. A Go service, a Java service, and a third-party agent that share no code can still hand a trace between them because they all speak the same header format. That cross-vendor agreement is exactly what the Dapper era lacked, when every tracing system had its own proprietary wire format and a trace died at the boundary of one company's stack. The arc from Dapper through Zipkin and Jaeger to OpenTelemetry is, in large part, the arc toward that one shared header.
+
+A companion header, `tracestate`, carries vendor-specific key-value data alongside `traceparent`. And **baggage** carries arbitrary application key-value pairs propagated the same way, useful for pushing something like a tenant id down the whole call path. Two facts keep it honest: it rides in headers on every hop, so it is real network cost visible on the wire, and it is not auto-attached to your spans, so you must copy it onto attributes to query by it. High-cardinality baggage is a self-inflicted wound, paid on every request.
+
+## Where context silently dies
+
+The relay above assumes a synchronous request with headers. The moment your request leaves that model, propagation breaks unless you do extra work, and this is where most real traces go dark.
+
+Trace context lives in thread-local storage, so it does not survive a hop into a message broker, where there is no HTTP request to carry a header. Publish to Kafka or SQS and the consumer, by default, starts a brand-new trace with no link to the producer. The fix is to inject `traceparent` into the message itself, as a header or attribute on the payload, and extract it on the consuming side. For async workers, queues, or an event backbone, this is the difference between a trace that ends at the publish call and one that follows the work to completion. (If you are weighing a log against a queue for that backbone, [Kafka vs queues](/blog/kafka-vs-queues) is the companion on that tradeoff, and tracing is one more reason the choice has teeth.)
+
+Two more places context leaks. Traces often start at the load balancer, so the **client hop** from the user's device to your edge is simply absent, and the most user-visible latency frequently lives in exactly the hop your tracing cannot see. And the **service mesh** is a half-truth: Envoy and Istio can propagate context and emit spans fleet-wide without you touching application code, but the mesh only sees network hops. The in-process work, the database query, the cache lookup, the CPU-bound serialization, is invisible to it. Mesh tracing alone gives you a coarse tree of service-to-service calls with the interesting interiors hollowed out. You still need application instrumentation to see inside a process, and pretending otherwise produces traces that confidently point at the wrong service.
+
+## Why sampling is mandatory at scale
+
+Now the decision that actually defines a tracing system. You cannot keep every trace, and the reason runs deeper than cost discipline: it is physics plus arithmetic, and Dapper proved it with numbers worth carrying in your head.
+
+First, the overhead of generating spans. Dapper measured the latency and throughput cost at various sampling rates, and the table is the single most clarifying exhibit in the field:
+
+| Sampling rate | Latency change | Throughput change |
+| --- | --- | --- |
+| 1/1 (trace everything) | **+16.3%** | -1.48% |
+| 1/2 | +9.40% | -0.73% |
+| 1/4 | +6.38% | -0.30% |
+| 1/16 | **+2.12%** | -0.08% |
+| 1/1024 | -0.20% (noise) | -0.06% |
+
+Read the top and bottom rows together. Tracing 100% of requests costs you 16% of your latency budget. At 1 in 16 it drops to 2%. At production rates it vanishes into measurement noise. The individual span is cheap, around 200 nanoseconds to create a root span, but multiply a few hundred nanoseconds across every call in a hot path and the tax is real at the top of the curve. Instrumentation alone argues for sampling before you have stored a single byte.
+
+Then the storage arithmetic, which is more decisive. A Dapper span on disk averaged 426 bytes. On a modest system, 20 services at 10,000 requests per second with roughly 50 spans per request is half a million spans per second, which at 426 bytes apiece is about 18 terabytes per day of raw spans before any overhead. (That figure is derived from the per-span size rather than measured directly; treat it as an order of magnitude.) That is one mid-sized service. Dapper, at Google scale, sampled aggressively and still emitted more than a terabyte of trace data per day. Slack's modern numbers say the same from the other end: roughly 310 million traces and 8.5 billion spans per day, about 2 terabytes, at 1% sampling.
+
+So Dapper's conclusion is the load-bearing sentence: "a sample of just one out of thousands of requests provides sufficient information." Production Dapper averaged one sampled trace per 1,024 events, often as low as 0.01% for the highest-traffic services. The skill is capturing the right fraction, which means a hard truth worth saying out loud: you will throw most of your traces away, and the entire engineering problem is deciding what to drop without dropping the evidence you will later need. A tracing system is a system for discarding traces well.
+
+## Head versus tail, the genuine tradeoff
+
+There are two places to make the keep-or-drop decision, and the choice between them is a genuine tradeoff with costs on both sides.
+
+**Head sampling** decides at the birth of the trace, from a hash of the trace id, before any spans exist. Its virtues are what you want from an edge decision. It is stateless and cheap, it can be made anywhere in the pipeline, and crucially it is **consistent**: the same trace id hashes to the same decision in every service, so you keep a whole trace or none of it. You never get the half-trace failure where some services sampled in, others sampled out, and the waterfall has holes. OpenTelemetry's `TraceIdRatioBased` sampler is this, and its default `ParentBased(root=AlwaysOn)` sampler propagates one root decision coherently down the tree: honor the parent's choice if there is a parent, otherwise apply the root sampler. That `ParentBased` default is the unglamorous reason your trace does not get its sampling re-rolled at every hop.
+
+Head sampling has one fatal blindness, which OpenTelemetry states directly: "it is not possible to make a sampling decision based on data in the entire trace." You decide before the request runs, so you cannot decide based on how it turned out. And the traces you most want, the errors and the p99 outliers, are well under 1% of traffic. Random head sampling at 1% will, with brutal reliability, throw away precisely the rare bad request you opened the trace UI to find. You went looking for the needle and your sampler optimized for hay.
+
+**Tail sampling** inverts the timing. It buffers spans and waits until the trace is mostly complete, then applies policies over the finished trace: keep anything with an error, keep anything over a latency threshold, keep a baseline percentage of the boring ones for context. Now you keep the traces that matter because you can see that they mattered. The cost is everything "wait until complete" implies. You hold every span in memory until the decision, so memory scales with traffic times trace duration. You route all spans of a trace to the same collector instance, because a decision over the entire trace needs one place that sees the entire trace, which means a load-balancing exporter that shards by trace id. And you need a `decision_wait` window (the collector default is 30 seconds); a straggler that arrives past it produces a fragmented trace. OpenTelemetry is candid that tail sampling "can be difficult to operate" and "often ends up as vendor-specific." Turning it on is committing to run and capacity-plan a stateful distributed system with backpressure, memory ceilings, and partial-failure drop behavior. (Sharding spans by trace id across a fleet of collectors is the same move as [consistent hashing](/blog/consistent-hashing) for routing keys to nodes, and inherits the same rebalancing headaches.)
+
+So how does a senior actually decide? Not by picking one. The honest answer, which OpenTelemetry explicitly endorses, is the **two-tier pipeline**. Run cheap, consistent head sampling at the edge to protect the application from the 16% tax, keeping enough traffic to be useful, say 1 in 16. Then run tail sampling in the collector tier to protect the backend from the storage flood and to rescue the rare error and slow trace that head sampling would have kept only by luck.
+
+```
+   App (head sample ~1/16)
+        │  emits spans
+        ▼
+   Collector w/ load-balancing exporter (shard by trace_id)
+        │  routes all spans of a trace to one instance
+        ▼
+   Tail-sampling collector (keep: all errors + p99 latency + 25% baseline)
+        │
+        ▼
+   Storage backend (Jaeger / Tempo / vendor)
+```
+
+Where to sample is itself a capacity-and-consistency tradeoff, which is why it shows up in interviews and why the [system design interview framework](/blog/system-design-interview-framework) treats "how do you sample" as a signal of seniority rather than a footnote.
+
+## Consistency, reweighting, and the DAG that is not a tree
+
+A few nuances separate someone who read the docs from someone who has run this in anger.
+
+**Sampling distorts your counts, and there is a fix.** Tail-sample, keeping all errors but only 1% of successes, and naively counting spans gives a wildly inflated error rate. OpenTelemetry's consistent probability sampling records the sampling probability in `tracestate` so the backend can reweight sampled counts back to population estimates. Without that p-value, sampled spans cannot become accurate rates, and you will mislead yourself with your own data right up until you notice the "error rate" graph is off by two orders of magnitude.
+
+**The tree is really a DAG.** A strict tree gives each span one parent, fine until a single Kafka consumer processes a batch of N messages, each from a different upstream trace. That span has N causes, and the model handles it with **span links**: cross-trace references expressing "this was caused by all of these." Fan-in, batch jobs, and async aggregation all need links, and the moment you have them you no longer have a tree. Slack went further and modeled their tracing as a directed graph, allowing zero-duration spans and empty ids because client apps and shell scripts do not fit the request-response shape the tree assumes. The clean tree is a teaching model; production is a DAG.
+
+**The UI lies about freshness.** Dapper's span collection latency had a median under 15 seconds but a bimodal 98th percentile: usually under two minutes, occasionally many hours. Trace UIs are not real-time, and a trace you cannot find yet may simply not have landed, which has cost more than one engineer an afternoon chasing a propagation bug that did not exist.
+
+**Clock skew is not corruption.** Every span stamps its timestamps from its own host's clock, and two hosts disagree by milliseconds even with NTP, so the waterfall will occasionally render a child starting before its parent. The causal structure in `parent_span_id` is still exactly right; only the rendered timeline is off, because it is built from clocks that do not agree. The timing wobbles; the parentage holds. (This rhymes with the consistency tradeoffs in [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) and the staleness windows in [replication](/blog/replication-strategies): the absence of a single global clock is the tax you pay for being distributed at all.)
+
+## How three pillars become one debuggable picture
+
+The slogan "metrics, logs, and traces" only earns its keep when one id stitches all three into a single click-path. The workflow: **metrics** say something is wrong (an alert fires on a histogram), **traces** say where (which span owns the seconds), **logs** say why (the exact error on that span). The connective tissue is the **trace id**, and it travels two ways. It is stamped into every log line, so once a trace points you at a service and a time, you pull that span's logs by trace id instead of grepping blind. And it is attached to metrics as **exemplars**: an OpenMetrics histogram bucket can carry a representative trace id alongside the count, like this:
+
+```
+http_request_duration_seconds_bucket{le="1.0"} 11 # {trace_id="KOO5S4vxi0o"} 0.67
+```
+
+That `# {trace_id=...}` suffix turns a metric data point into a clickable jump to one real, representative slow trace. The spike on the histogram is no longer an anonymous number; it is a doorway to the exact request that produced it. (One caveat: typically one exemplar per bucket per scrape, so a later slow request overwrites the earlier one's pointer.)
+
+That single thread, metrics spike to exemplar to trace waterfall to the slow span's logs, is what makes the three pillars more than three dashboards you tab between. It is one investigation with a shared key, and the trace id is the key.
+
+I leaned on exactly this discipline building [Aladeen](/case-study/aladeen), where observing an agent CLI was really a failure-classification problem: turning a wall of opaque tool calls into a structured, queryable causal graph where you can ask which step failed and why, instead of scrolling output. The same instinct runs through the event-heavy backend on [NomadCrew](/case-study/nomadcrew), the document pipeline in [IntelliFill](/case-study/intellifill), and the processing chain in [Audex](/case-study/audex): the moment a request crosses a process boundary, a shared correlation id is the cheapest insurance you will ever buy and the most painful to retrofit after the incident.
+
+## The honest landing
+
+Tracing is the only one of the three pillars that reconstructs a single request as a connected whole, and it does it with a trick simpler than its reputation: flat spans tagged with two ids, a header that carries your current position from hop to hop, and a join at the backend that recovers the tree you never actually sent. The `trace_id` stays constant, the `parent-id` is rewritten at every step, and the sampled bit carries one decision down the line so the trace is whole or absent, never half.
+
+The decision that defines your system is where you sample, because you will discard most traces and the craft is discarding them well. Head sampling is cheap, consistent, and blind; tail sampling sees the whole trace and costs you a stateful pipeline to run; the grown-up answer is both, in series. The unglamorous bits, the `ParentBased` default, the trace-id load balancer, the reweighting p-value, are what separate a tracing system that survives production from one that demos beautifully and lies to you during the incident.
+
+Get those right and the 2 a.m. page changes character. Checkout is slow, you open the trace, the 870ms bar four levels deep names the service, and its logs name the error. The crime, the room, the suspect, in three clicks. Skip them and you are back where you started: a pile of disconnected evidence and no way to prove anyone was ever in the same room.
+
+## FAQ
+
+<FAQ />

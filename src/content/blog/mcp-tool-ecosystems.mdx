@@ -1,0 +1,213 @@
+export const meta = {
+  slug: 'mcp-tool-ecosystems',
+  title: 'MCP: How AI Agents Get Hands (the Model Context Protocol)',
+  description:
+    'The Model Context Protocol gives AI agents a standard way to reach tools and data. How it works, why it won, and why each tool you connect is an attack surface.',
+  headline: 'MCP: How AI Agents Get Hands (the Model Context Protocol)',
+  deck: 'A tool the model can call is an action it can be tricked into taking, and MCP makes connecting those tools the easy part while trusting them stays hard.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['mcp', 'ai-agents', 'tool-calling', 'llm', 'security', 'system-design'],
+  faq: [
+    {
+      q: 'What is the Model Context Protocol in one sentence?',
+      a: 'MCP is an open standard for connecting AI applications to external systems, so one server that exposes a tool or a data source works across any host that speaks the protocol. It defines a JSON-RPC 2.0 message format, a connection lifecycle, and a small set of primitives (tools, resources, prompts) that an agent discovers at runtime. The official analogy is a USB-C port for AI applications: a single connector standard instead of a different cable for every device.',
+    },
+    {
+      q: 'How is MCP different from a model provider\'s function calling?',
+      a: 'Function calling is a per-vendor, in-process feature: the model emits a structured call and your own code runs it. MCP standardizes the wire protocol, the discovery handshake, and the lifecycle, so the same server runs across Claude, ChatGPT, Cursor, and a custom agent without rewriting the integration per vendor. It also adds resources (read-only context the host injects) and prompts (user-invoked templates), and it lets a server hot-reload its tool list mid-session. Function calling answers how one model invokes a tool; MCP answers how any host discovers and connects to any tool.',
+    },
+    {
+      q: 'Is MCP a Claude-only or Anthropic-only thing?',
+      a: 'No. Anthropic created MCP and announced it in November 2024, but it was donated to the Linux Foundation in December 2025 under the Agentic AI Foundation, alongside Block\'s goose and OpenAI\'s AGENTS.md. OpenAI, Google DeepMind, and Microsoft all adopted it during 2025, and servers are model-agnostic by design. A server never bundles a model SDK, because the sampling primitive lets it borrow the host\'s model when it needs a completion.',
+    },
+    {
+      q: 'What is the lethal trifecta, and why does MCP make it worse?',
+      a: 'The lethal trifecta, named by Simon Willison, is the combination of access to private data, exposure to untrusted content, and the ability to communicate externally. Any two of those are survivable; all three together let an attacker exfiltrate your data through an action the agent takes on its behalf. MCP makes assembling all three trivial, because connecting several servers mixes their trust domains: one server reads your private data, another carries an injected instruction, a third can send. The strongest defense is to remove one leg, for example by exposing a read-only server with no outbound path at all.',
+    },
+    {
+      q: 'Does readOnlyHint make an MCP tool safe?',
+      a: 'No. Tool annotations like readOnlyHint, destructiveHint, and idempotentHint are advisory hints that help a host build its approval UX, not enforced guarantees. A malicious server can label a destructive tool readOnlyHint: true and the host has no way to verify it. Real safety is structural: the server must actually expose no write path or exfiltration channel, so that even a perfectly executed prompt injection has nowhere to send anything. Annotations are honest documentation when the server is honest, and worthless when it is not.',
+    },
+  ],
+}
+
+An LLM by itself can do exactly one thing: produce text. It cannot read your calendar, query your database, open a pull request, or send a message. It is a brain in a jar, fluent and reasoning and sealed off from the world it reasons about. [How LLMs work](/blog/how-llms-work) is the story of that sealed brain. This is the story of how it grows hands.
+
+The hands are tools, and the moment you give a model tools you have changed what it is. A model that can call `send_message` is no longer answering a question. It is taking an action. That shift is the whole subject of [agentic workflows](/blog/agentic-workflows), and the mechanism underneath it is [tool calling](/blog/tool-calling). MCP asks a narrower, more structural question: once every serious AI application wants to reach the same dozens of tools, how do you connect them without rebuilding the wiring for every app and every tool by hand?
+
+That question has a combinatorial answer, and the answer is most of why MCP exists.
+
+## The integration matrix nobody wants to maintain
+
+Before a standard, every AI application that wants to talk to GitHub writes its own GitHub connector, then a Postgres connector, a Slack connector, a Sentry connector. A second application appears and writes all four again, in its own tool format. The work does not add up. It multiplies. Anthropic stated this plainly when it launched MCP in November 2024: every new data source requires its own custom implementation, which makes truly connected systems hard to scale.
+
+The shape of the cost is N times M. With N applications and M tools, each pairing needing bespoke glue, you are on the hook for N times M integrations, every one maintained, versioned, and broken independently. Four hosts, Cursor, Claude Desktop, ChatGPT, and a custom agent, each needing four connectors, GitHub, Postgres, Slack, Sentry, is sixteen integrations, and the fifth tool you add multiplies against all four hosts.
+
+A protocol collapses that multiplication into addition. If every tool and every host speaks one protocol, you build N clients (one inside each host) plus M servers (one per tool). The matrix flattens to N plus M. Those sixteen integrations become eight components, and now the fifth tool ships exactly one server and instantly works in every host that already speaks MCP. You build it once, every client gets it for free.
+
+This is not a new trick. It is the move that made the [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) work: before LSP, every editor times every language was a custom plugin, and after it, a language ships one server and every editor lights up. ODBC did it for applications against databases. Standards win when they turn a combinatorial integration problem into a linear one, and then a second force takes over. Every new server is worth more because every existing client can use it, and every new client is worth more because every existing server already works. That feedback loop, where the value of joining grows with how many have already joined, is the network effect, and it is the real reason a protocol becomes infrastructure instead of a nice idea. The math gets you started. The network effect makes it inevitable.
+
+## What MCP actually is
+
+The official one-line definition is deliberately small: MCP is an open standard for connecting AI applications to external systems. The analogy the docs reach for, and it is the official framing rather than a blogger's embellishment, is a USB-C port for AI applications. One connector instead of a drawer full of incompatible cables; one way to connect instead of a bespoke connector per integration.
+
+Hold onto that analogy, because later it will cut the other way and tell you something uncomfortable.
+
+The architecture is client-server with a strict topology and exactly three roles.
+
+The **host** is the AI application that coordinates everything: Claude Desktop, VS Code, Cursor. It is what the user opens.
+
+The **client** lives inside the host and maintains a connection to one server. The rule that matters is one client per server, always, a dedicated connection each. A host talking to four servers runs four clients.
+
+The **server** is a program that exposes context and actions. It runs either locally, as a subprocess on your own machine, or remotely, as a service many clients connect to.
+
+Underneath, MCP splits into two layers, and the split is load-bearing. The **data layer** is a JSON-RPC 2.0 protocol defining the lifecycle and the primitives, the semantics of what a tool call means and how discovery works. The **transport layer** defines how bytes move: connection setup, message framing, authorization. They are separated because the same JSON-RPC 2.0 messages ride over any transport unchanged. Transport is swappable. Meaning is not. Move a server from local to remote and the conversation it has with the host is byte-for-byte identical.
+
+There are two transports in practice. **stdio** runs the server as a local subprocess speaking JSON-RPC over standard input and output, no network in the loop, one client to one subprocess. **Streamable HTTP** is the remote case: HTTP POST for client-to-server messages, optional Server-Sent Events for streaming responses back, bearer tokens or OAuth for auth. (It replaced an older HTTP-plus-SSE transport, so a 2024 tutorial calling SSE "the remote transport" is out of date.)
+
+One more property decides how everything behaves: MCP is stateful. A connection opens with an `initialize` handshake where the client declares its protocol version and capabilities, the server replies with its own, and the client confirms with an `initialized` notification. If the two cannot agree on a compatible version, the connection is supposed to terminate rather than limp along. That negotiation is why a host can connect to servers it has never seen and still know exactly what each one supports.
+
+Here is the handshake in the wire format it actually uses:
+
+```json
+// client -> server
+{ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+  "params": { "protocolVersion": "2025-06-18",
+              "capabilities": { "elicitation": {} },
+              "clientInfo": { "name": "example-client", "version": "1.0.0" } } }
+
+// server -> client
+{ "jsonrpc": "2.0", "id": 1,
+  "result": { "protocolVersion": "2025-06-18",
+              "capabilities": { "tools": { "listChanged": true }, "resources": {} },
+              "serverInfo": { "name": "example-server", "version": "1.0.0" } } }
+
+// client -> server (no id, so it is a notification and expects no reply)
+{ "jsonrpc": "2.0", "method": "notifications/initialized" }
+```
+
+That last detail, a message with no `id`, is JSON-RPC's way of saying "this is a notification, do not reply." It is how `notifications/tools/list_changed` works later: a server tells the client its tools changed and the client refetches, no request-response round trip.
+
+## The three primitives, and the one thing most write-ups miss
+
+A server exposes capability through three primitives. Every shallow treatment lists them as tools, resources, and prompts and moves on. That list is correct and tells you almost nothing, because it skips the only distinction that matters: who decides when each one fires.
+
+| Primitive | What it is | Who controls it | Methods |
+| --- | --- | --- | --- |
+| **Tools** | Functions the model can actively call, and it decides when. Can write databases, call APIs, modify files, trigger logic. | **Model** | `tools/list`, `tools/call` |
+| **Resources** | Passive, read-only data sources that supply context. File contents, schemas, docs. | **Application** | `resources/list`, `resources/read`, `resources/subscribe` |
+| **Prompts** | Pre-built instruction templates that tell the model how to use specific tools and resources. | **User** | `prompts/list`, `prompts/get` |
+
+Read the middle column, not the first. Tools are **model-controlled**: the agent looks at what is available and autonomously decides to call one. Resources are **application-controlled**: the host decides what context to inject, the model does not reach for them on a whim. Prompts are **user-controlled**: a person explicitly invokes them, often as a slash command. The primitives are not three flavors of one thing. They are three answers to "who pulls the trigger," and that boundary is the entire design. Conflating resources with tools, treating both as "stuff the model can use," is the clearest tell that someone read the headline and not the spec.
+
+Resources are addressed by URI, like `file:///path/to/file` or `calendar://events/2024`, and support templates with parameters, so `travel://activities/{city}/{category}` becomes a family of resources the host fills in. Resources are the MCP-native way a host pulls retrieved context into the model in [RAG systems](/blog/rag-system), and the retrieval itself often sits on a [vector database](/blog/vector-databases) behind the server.
+
+There is a second set of primitives almost nobody mentions, because they run the other direction, from server to client:
+
+- **Sampling** (`sampling/createMessage`) lets a server ask the host's LLM for a completion. This is why servers stay model-agnostic. A server that needs to summarize something does not bundle its own model SDK and API key. It asks the host to run its model. Remove sampling and "MCP is not a Claude thing" stops being true.
+- **Elicitation** (`elicitation/create`, added in the 2025-06-18 revision) lets a server pause and ask the user for more information or a confirmation mid-run, instead of failing or guessing.
+- **Roots** let the client tell the server which filesystem or URI boundaries it is allowed to operate within, a scoping primitive that quietly limits blast radius.
+- **Logging** lets a server emit diagnostics to the client.
+
+Those four are where MCP stops being a one-way "expose your tools" pipe and becomes a real conversation. Most treatments omit them entirely.
+
+## A server you can trust, by construction
+
+The cleanest way to understand the primitives is to build the most boring possible server: one that exposes data and read queries and absolutely nothing else. [Aladeen](/case-study/aladeen), which is observability for agent CLIs, ships its own MCP server exactly this way, and the design choice is the whole point. Here is the shape, in the official Python SDK's decorator style:
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("aladeen-mcp")
+
+# RESOURCE: application-controlled, read-only context, addressed by URI
+@mcp.resource("aladeen://schema/{entity}")
+def schema(entity: str) -> str:
+    """Return the public schema for an entity (read-only)."""
+    return load_public_schema(entity)
+
+# TOOL: model-controlled, but read-only BY CONSTRUCTION. No write path exists.
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
+def search_records(query: str, limit: int = 20) -> list[dict]:
+    """Search the public, read-only dataset. Cannot mutate state."""
+    return run_readonly_query(query, limit)
+```
+
+The teaching point is the gap between what the annotation says and what the code guarantees. `readOnlyHint: True` documents intent. It enforces nothing, and a host cannot verify it. The actual guarantee is that `run_readonly_query` is the only data path the server has: no `delete`, no `send`, no outbound write anywhere in the process. That structural fact, not the label, is what makes the server safe to hand to an agent you do not control, and in a moment we will see why "no outbound write" is the single most valuable property a server can have.
+
+## A tool the model can call is an action it can be tricked into taking
+
+This is the sentence that should keep you up at night, and it is not hyperbole. It is a direct consequence of how tool descriptions reach the model.
+
+When a host shows you a connected tool, you see its name and a short summary: "search_records: search the dataset." The model sees the entire tool description, the full parameter schema, every word the server author wrote. And a model follows instructions wherever it finds them, because it cannot tell a developer's documentation from an attacker's payload sitting in the same field. As Simon Willison put it, LLMs will trust anything that can send them convincing-sounding tokens, which makes them extremely vulnerable to confused-deputy attacks.
+
+The foundational framing is what Willison named the **lethal trifecta**. Danger appears when a system combines three things: access to private data, exposure to untrusted content, and the ability to communicate externally. Any two, you survive. A tool that reads your private email and can send messages, but only sees your own trusted input, is fine. A tool that ingests untrusted web content and can send, but touches no private data, leaks nothing worth having. Assemble all three and you have built an exfiltration machine: untrusted content carries an instruction, the instruction reads your private data, the send capability ships it out.
+
+MCP makes assembling that trifecta trivially easy, and this should reshape how you think about connecting servers. Each server drags its own trust domain into the agent. Connect a server that reads your files, one that fetches arbitrary URLs, and one that can post to Slack, and you did not add three conveniences. You assembled all three legs of the trifecta. The danger is not in any one server. It is in the composition, and composition is exactly what MCP is for.
+
+The named attack classes are worth knowing by their real shapes, because they are not interchangeable:
+
+| Attack | Mechanism |
+| --- | --- |
+| **Tool poisoning** | Malicious instructions hidden in the tool description, schema, or return value. Invisible to the user, authoritative to the model. |
+| **Rug pull** | A tool's definition mutates *after* you approved it. Safe on day one, rerouting your API keys by day seven. |
+| **Tool shadowing** | One malicious server's description manipulates how the agent uses a *different*, trusted server's tools. |
+| **Confused deputy** | The server acts with *its own* broad privileges instead of yours. One OAuth misconfiguration and it is a one-line bug. |
+
+Tool poisoning is the one to see concretely, because it is so much simpler than it sounds. Invariant Labs demonstrated a server with an innocent `add(a, b)` tool whose description quietly instructed the model to first read `~/.cursor/mcp.json` and pass its contents along, with the kicker: do not mention that you need to read the file, this could even upset the user. The host displayed "add: adds two numbers." The model read the whole thing and complied. The user approved a calculator and handed over their config.
+
+Now look back at the Aladeen server. It cannot be weaponized this way, and not because its author is careful. Even if an attacker poisoned its tool descriptions, even if a prompt injection executed flawlessly, the agent reaches for an exfiltration channel and finds none, because the server ships none. Read-only by construction removes the third leg of the trifecta for every tool that server exposes. The injection can still try. It has nowhere to send. That is why, when you expose a product to arbitrary third-party agents you will never audit, read-only is not a limitation. It collapses your attack surface down to "disclosure of data that was already public," and lets you ship into the ecosystem now without betting the company on agent trustworthiness.
+
+OWASP's MCP cheat sheet enumerates eleven threats in this family: the four above plus over-scoped tokens, supply-chain risk, message tampering, SSRF through parameterized URLs, and more. The pattern across all of it is the same. The connection is easy and the trust is hard.
+
+## The defenses that are real, and the one that is only an opinion
+
+The mitigations that matter map directly onto the spec, and a few are recent enough that older deployments do not have them.
+
+**Human-in-the-loop with the full parameters shown.** The spec lets tools require user consent, and good hosts show an approval dialog with the actual arguments before execution, plus an activity log after. Show the parameters, not just the name, or the approval is theater that a tool benign-by-name and malicious-by-argument walks right through.
+
+**Least privilege and per-server scoped tokens.** Give each server the narrowest credential that works, and prefer short-lived tokens over long-lived personal access tokens that, once leaked through a poisoned tool, unlock everything.
+
+**RFC 8707 Resource Indicators**, made mandatory in 2025-06-18, bind a token to the specific server it was issued for, so a token meant for server A cannot be replayed against server B. This is the spec-level fix for the confused-deputy problem, and the date matters: a pre-2025-06-18 deployment does not have it, and it does not solve privilege scoping *within* a server, so it is necessary and not sufficient.
+
+**Treat every tool return value as untrusted input.** The data a tool hands back re-enters the model's context, and an attacker who controls that data controls a fresh injection surface. Sanitize before it flows back in, the same way you would never trust a webhook body without verifying it, a discipline I have written about in [idempotency and the exactly-once lie](/blog/idempotency-exactly-once).
+
+**Pin and hash tool definitions, and alert on change.** This is the rug-pull control. The live-discovery feature that powers hot-reload via `notifications/tools/list_changed` is the exact channel a rug pull travels: the feature and the vulnerability are one mechanism seen from two sides.
+
+**Sandbox local servers, and read-only by construction.** A stdio server is a subprocess on your machine; run it in a container with a restricted filesystem and no network unless it needs one. Stronger than all of the above combined, when you can afford it, is the read-only server we already met, because it removes a trifecta leg instead of guarding it.
+
+One control deserves a flag, because conflating it with the spec is the mistake a staff reviewer catches. OWASP recommends signing every message with ECDSA, nonces, and timestamps. That is sound defense-in-depth, and it is OWASP's opinion, not an MCP requirement. Present it as a hardening option, never as "how MCP works," or you will have quietly fabricated a requirement.
+
+Tool **annotations** (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) are the same kind of trap: a trust *vocabulary*, not a trust *mechanism*. The official guidance is blunt that they are informational signals, not enforceable guarantees; they exist so a host can auto-approve reads and gate destructive calls, and a malicious server is free to lie in every one. The gap between what a server *declares* and what it *does* is the soft underbelly of the whole model.
+
+## The questions a staff engineer asks next
+
+A few tensions are worth naming, each its own piece.
+
+**Stateful protocol, stateless infrastructure.** MCP is stateful by design, handshake, capability negotiation, subscriptions, yet most remote servers want to scale horizontally behind a load balancer where any instance can serve any request. The spec notes that a subset of MCP can run statelessly over Streamable HTTP, which papers over a real operational question: where do the session and the SSE stream live when there are ten instances? Session affinity stops being a nicety. This is the same family of concern you would reason through in [a system design interview](/blog/system-design-interview-framework), where "it is stateful" and "it must scale out" collide and someone has to own the seam.
+
+**Tool-count economics.** Every connected server dumps its entire `tools/list` into the context window. A dozen servers is hundreds of tool schemas, which is token bloat and, worse, degraded selection, because a model choosing among two hundred tools chooses worse than one choosing among ten. There is active work on running tools through code execution to keep them out of the prompt until needed. More connected servers is not strictly better, and the context window is the budget you spend.
+
+**Observability and the audit trail.** Once an agent acts through tools you did not write, "what did it actually do" becomes a production question, not a debugging one. You want the request, the chosen tool, the parameters, and the result captured and queryable, which is the agent-CLI version of [observability across the three pillars](/blog/observability-three-pillars), and precisely the gap a tool like Aladeen fills.
+
+**MCP is not A2A.** MCP is the vertical axis, agent to tool. Agent-to-agent protocols are the horizontal axis. Different layers, different problems, and conflating them is a common interview stumble; one sentence of disambiguation buys a lot of credibility.
+
+For the layer just below this one, [tool calling](/blog/tool-calling) covers how a single model decides to invoke a function and how the schema is wired, and what the agent remembers between calls is its own subject in agent memory. MCP sits on top of tool calling and standardizes the wire; the [IntelliFill](/case-study/intellifill) pipeline, a multi-agent LLM extraction system built on LangGraph, and [NomadCrew](/case-study/nomadcrew) are where these patterns stop being protocol diagrams and start being products that move real data.
+
+## Why this is settled, not speculative
+
+It would be fair, in early 2025, to ask whether MCP was just Anthropic's house protocol. That question is now closed, and the way it closed is the strongest evidence that the standard won.
+
+The spec is versioned and moving, which is what maturity looks like: the 2024-11-05 launch, a 2025-03-26 revision that added tool annotations and the first OAuth story, 2025-06-18 with structured output, elicitation, and the RFC 8707 resource indicators that fixed token replay, then a 2025-11-25 revision. Citing a dated revision rather than "the spec" is not pedantry; it is the only way a claim about MCP ages gracefully, because the spec under that name keeps changing.
+
+The adoption is cross-vendor and real. OpenAI adopted MCP in March 2025 for ChatGPT desktop, Google DeepMind in April 2025, Microsoft across Semantic Kernel and Azure through the year. By Anthropic's own December 2025 numbers, the ecosystem ran over 97 million monthly SDK downloads and more than 10,000 active servers, with first-class client support across ChatGPT, Claude, Cursor, Gemini, Microsoft Copilot, and VS Code.
+
+Then the governance inflection that settles it. On December 9, 2025, Anthropic donated MCP to the **Agentic AI Foundation** under the **Linux Foundation**, alongside Block's goose and OpenAI's AGENTS.md, with Google, Microsoft, AWS, Cloudflare, and Bloomberg in support, and MCP keeping its technical autonomy. That is the moment a protocol stops being one company's project and becomes neutral infrastructure competitors can build on without asking permission. A standard owned by a vendor is a bet on that vendor. A standard owned by a foundation is a coordination point everyone can trust.
+
+Now circle back to the USB-C analogy, because it finally pays off, and it pays off as a warning. Standardizing the connector is exactly what made BadUSB possible, a malicious device in a trusted port. MCP standardized the connector for AI, and tool poisoning is its BadUSB. The analogy was never a promise of safety. It only promised that connecting would be easy, and that promise is kept. Everything hard, every question worth a senior engineer's attention, lives on the other side of the connection, in whether you can trust what you just plugged in. The protocol gives your agent hands. Deciding what those hands are allowed to touch is still your job, and it always will be.
+
+## FAQ
+
+<FAQ />

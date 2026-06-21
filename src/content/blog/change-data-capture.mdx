@@ -1,0 +1,180 @@
+export const meta = {
+  slug: 'change-data-capture',
+  title: 'Change Data Capture: Turning Your Database Into an Event Stream',
+  description:
+    'Dual writes corrupt data silently, even without a crash. CDC tails the commit log your database already writes, so the event and the commit are the same atomic act.',
+  headline: 'Change Data Capture: Turning Your Database Into an Event Stream',
+  deck: 'Stop publishing events next to your database writes and start reading the commit decision the database already made.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['cdc', 'change-data-capture', 'kafka', 'postgresql', 'debezium', 'distributed-systems', 'event-driven', 'system-design'],
+  faq: [
+    {
+      q: 'What is change data capture, in one sentence?',
+      a: "Change data capture is reading the committed row-level changes from a database's own replication log and emitting them as an ordered stream of events. Instead of asking your application to write to the database and then publish an event as two separate steps, CDC tails the log the database already writes for crash recovery, so every insert, update, and delete becomes an event with no extra write on the hot path and no window where the two can disagree.",
+    },
+    {
+      q: 'Why are dual writes a bad idea if I never crash?',
+      a: "Because the corruption does not need a crash. Two clients update the same row; the database lands them in one order and the search index, reached over a separate network call, lands them in the reverse order. Now the two stores disagree permanently, with no error raised and nothing eventually reconciling them. Dual writes are a concurrency bug, not just a crash bug, which is why catching the crash with retries does not fix them.",
+    },
+    {
+      q: 'Does log-based CDC give me exactly-once delivery?',
+      a: "No. Debezium and tools like it are at-least-once by default, because the source offset is committed after the event is emitted, so a crash in that window re-emits. Kafka Connect has opt-in exactly-once source support, but most sinks (Elasticsearch, caches, warehouses) live outside the Kafka transaction boundary anyway. The safe design is at-least-once delivery plus idempotent consumers that dedupe on the log position (LSN) or a primary key with a monotonic version.",
+    },
+    {
+      q: 'When should I use the outbox pattern instead of capturing the table directly?',
+      a: "Capture the table directly when consumers want raw row changes: replication into a warehouse, search indexing, cache invalidation. Use an outbox when consumers want well-shaped domain events with a stable contract, as in event-driven microservices. With the outbox you write the business row and an outbox row in one transaction, then let CDC tail the outbox, so you publish a clean OrderPlaced event instead of leaking your internal column names as a public API. They compose; CDC is the cleanest way to drain an outbox.",
+    },
+    {
+      q: 'What is the most dangerous operational failure mode in Postgres CDC?',
+      a: "A replication slot whose consumer has stalled or died. The slot guarantees WAL is retained until it is consumed, so an inactive slot pins the write-ahead log and the disk fills until the primary goes down. On RDS an idle database still emits a heartbeat write every five minutes, and a documented incident saw a 200 GiB disk consumed in under two weeks by an unconsumed slot. Monitor retained WAL per slot and set max_slot_wal_keep_size as a safety valve, understanding that exceeding it invalidates the slot and forces a full re-snapshot.",
+    },
+  ],
+}
+
+Every backend eventually grows a second copy of its data. The orders live in Postgres, but search needs them in Elasticsearch, the dashboard needs them in a warehouse, the cache needs them in Redis, and the recommendations service needs to know the moment an order is placed. So the application picks up a second job. After it writes the row, it publishes an event. Write to the database, then publish to Kafka. Two lines, right next to each other.
+
+Those two lines are where the data starts to rot.
+
+This piece is about a different way to get the same outcome, one that does not ask your application to keep two systems in agreement by hand. The idea is to stop publishing events beside your writes and start reading the commit decision the database already made. That is change data capture, and the reason it matters is not that it is faster or fancier. It is that it closes a hole the obvious approach can never close.
+
+## The dual write that corrupts without a crash
+
+Start with the failure everyone half-remembers: the application writes the row, then crashes before it publishes the event. The database has the order, Kafka never hears about it, and the recommendation service is permanently behind. Real, but it gets filed under "add a retry" and forgotten, because it only bites when a process dies at the wrong instant.
+
+The version that should keep you up at night needs no crash at all.
+
+Two clients update the same customer record. Client one sets the email to A, client two sets it to B. At the database, the writes serialize in the order A then B, so the row ends up B. The application dutifully publishes both changes to the search index. But the index is reached over a separate network call, and the network reorders them: the index receives B then A, so it ends up A.
+
+```
+Client 1: SET email = A          Client 2: SET email = B
+Database receives:  A, then B   ->  Database  = B   (last writer = B)
+Index receives:     B, then A   ->  Index     = A   (last writer = A)
+Result: the database and the search index disagree, permanently. No error was raised.
+```
+
+Nobody crashed. No exception was thrown. The two stores now hold different values for the same field, forever, and nothing in the system is even aware. This is the insight that reframes the whole topic, and it comes straight from [Kleppmann's argument that dual writes are broken by design](https://www.confluent.io/blog/using-logs-to-build-a-solid-data-infrastructure-or-why-dual-writes-are-a-bad-idea/): the problem is not durability, it is that two independent writes have no shared order. A retry cannot save you, because there is nothing to retry. The only way to detect the drift is a separate reconciliation job whose entire purpose is to find the lies your event pipeline told.
+
+The fix is not a better retry. It is to stop having two writes. If there is one ordered log, and every downstream store consumes that one log in sequence, the reordering cannot happen, because the consumers all see the records in the same order the log recorded them. The question becomes: where do you get a single, authoritative, totally-ordered log of every change? And the answer is that your database has been keeping one all along.
+
+## The commit and the event are the same write
+
+Open the Postgres manual to the chapter on reliability and you find the rule the entire storage engine is built around: a data file page may be written to disk only after the write-ahead log record describing that change has been durably flushed. Write-ahead means exactly that. The log entry comes first, the table mutation second, and crash recovery replays the log to reconstruct any table change that did not make it to disk.
+
+Sit with the consequence. **The commit is the log append.** There is no moment where a row is committed but missing from the log, because the log entry is what makes the commit durable in the first place. That is precisely the atomicity the dual write lacked. When you publish an event next to your write, you are bolting a second system onto a transaction it cannot join. When you tail the write-ahead log, you are reading the same decision the database used to define the commit. The event and the commit are no longer two things that can disagree. They are one thing, read twice.
+
+This is what people mean by [turning the database inside-out](https://martin.kleppmann.com/2015/03/04/turning-the-database-inside-out.html). Internally, a database is already a machine for turning imperative statements into a stream of immutable change events and then folding that stream into tables and indexes. CDC does not invent that stream. It takes the stream the database keeps for itself and makes it a first-class interface that other systems can subscribe to. The cache, the search index, the warehouse, and the downstream service stop being things your application has to remember to update. They become consumers of one log, each one a derived view that can be torn down and rebuilt by replaying the log from the start. That reframe, the log as the source of truth and everything else as a rebuildable projection, is the same mental model behind [replication](/blog/replication-strategies): CDC is really just making your database the leader of a replication stream whose followers are systems Postgres has never heard of.
+
+If you are placing this in the larger map of stateful systems, it sits right next to the other engine-level ideas in [the database mindmap](/blog/database-mindmap), and the log-structured storage in [LSM-tree vs B-tree](/blog/lsm-tree-vs-btree) is the same "append an immutable record, derive everything else from it" instinct applied one layer down.
+
+## Log-based versus polling, and what polling silently loses
+
+Before log-based CDC, the common move was to poll. Add an `updated_at` column, and every few seconds run `SELECT * FROM orders WHERE updated_at > $last_seen`. It works in a demo. It fails in ways that do not show up until production data does something the demo never did.
+
+Polling loses deletes. A deleted row has no `updated_at` to find, because the row is gone, so a poller is structurally blind to deletions unless you contort the schema into soft deletes with tombstone columns and never actually remove anything. Polling also loses intermediate states. If a row changes five times between two polls, you see the final value and the four in between vanish, which is fine for syncing current state and silently wrong for anything that reacts to transitions. And polling taxes the source: every poll is a range scan, and the cost climbs with both table size and poll frequency, so the freshness you want and the load you can afford pull in opposite directions.
+
+Log-based CDC inverts every one of those. Here is the comparison that should drive the decision:
+
+| Dimension | Query-based polling | Log-based CDC |
+| --- | --- | --- |
+| Deletes | Invisible. A deleted row has no row to scan. | Captured natively, with the `before` image of the deleted row. |
+| Intermediate states | Missed. Five changes between polls collapse to one. | Every committed change emitted, in order. |
+| Source load | Repeated range scans; cost scales with poll rate. | Reads a log the database writes anyway for recovery. |
+| Latency | Bounded by the poll interval, seconds to minutes. | Near real-time, emitted shortly after commit. |
+| Schema intrusion | Needs an indexed `updated_at` or version on every table. | None. No change to your data model. |
+| Ordering | No total order; concurrent updates race. | Per-row commit order preserved by the log offset. |
+
+The line that matters most is the load row. Polling adds work the database would not otherwise do. Log-based CDC reads a log the database already writes for crash recovery, so the marginal cost of capture is reading bytes that exist regardless. The Netflix DBLog paper frames this as "minimum impact on the source," and that is the whole game: the cheapest way to observe every change is to read the record the database was already forced to keep.
+
+A senior engineer still reaches for polling sometimes. If the source is a legacy database where you cannot enable logical replication, or a third-party system that only exposes a REST API, polling against a monotonic cursor may be the only door available, and then the right move is to accept the missed-delete problem explicitly and design soft deletes around it. The point is to choose it knowing what it costs, not to reach for it because it looks simpler.
+
+## How it actually works in Postgres
+
+Concretely, in Postgres, the path is logical decoding. You set `wal_level = logical`, which tells Postgres to write enough information into the WAL to reconstruct row-level changes, not just the physical page edits it needs for its own recovery. A connector like Debezium then creates a replication slot, which is a server-side cursor that remembers how far the consumer has read and, critically, guarantees the WAL is retained until the consumer catches up. An output plugin decodes the raw WAL into a usable shape: `pgoutput` is built in and binary, `wal2json` emits JSON, `decoderbufs` emits Protobuf, and the tradeoff is the usual one between native simplicity and a format your tooling already speaks.
+
+A decoded change event carries everything a consumer needs:
+
+```jsonc
+{
+  "op": "u",                       // c=create, u=update, d=delete, r=read(snapshot)
+  "ts_ms": 1486500577691,
+  "before": { "id": 1, "email": "old@x.com" },   // null for inserts
+  "after":  { "id": 1, "email": "new@x.com" },   // null for deletes
+  "source": {                      // provenance: your ordering and idempotency key lives here
+    "db": "inventory", "table": "customers",
+    "lsn": 24023128,               // log sequence number; the monotonic position in the WAL
+    "txId": 565
+  }
+}
+```
+
+The `op` code tells you what happened, the `before` and `after` images tell you the transition, and the `source.lsn` is the load-bearing field most tutorials skim past. The log sequence number is a monotonically increasing position in the WAL, which makes it both the natural ordering key and the natural idempotency key. MySQL gives you the same thing under a different name, the binlog file plus position; MongoDB calls its log the oplog. The mechanism differs, the shape does not: tail the log, decode each committed change, emit it with enough provenance to order and deduplicate downstream.
+
+From there the events flow into a topic per table, keyed by the row's primary key, and sink connectors fan them out to Elasticsearch, a warehouse, or a cache. If you want the deeper reasoning about why a partitioned, ordered, replayable log is the right backbone for this and a plain work queue is not, that is the entire argument in [Kafka vs queues](/blog/kafka-vs-queues): CDC needs the log's retention and replay, which a queue that deletes on consume cannot give you.
+
+## The snapshot is the hard part
+
+Here is the problem the marketing pages skip. The WAL has finite retention. Postgres is not keeping every change since the beginning of time; old segments get recycled. So the log alone cannot reconstruct the full current state of a table, which means every CDC pipeline has to solve a bootstrapping problem: load the rows that already exist, then switch to streaming the changes that come after, without losing or duplicating anything across the seam.
+
+The naive answers are both bad. `LOCK TABLE`, snapshot everything, then start streaming, and you have blocked every writer for the duration of a full-table read, which on a large table is an outage. Or snapshot first without locking and then start streaming, and you have opened a window where a change that lands during the snapshot is either missed or applied in the wrong order relative to the rows you read.
+
+The most elegant published solution to this is the watermark algorithm in [Netflix's DBLog paper](https://arxiv.org/abs/2010.12597), and it is worth understanding because it shows what staff-level care looks like on this exact seam. To snapshot a chunk of rows while the log streams live, without locks:
+
+```
+1. pause log-event processing
+2. write a LOW watermark   (update a dedicated watermark table with a unique UUID)
+3. SELECT the next chunk of rows, ordered by primary key, size N
+4. write a HIGH watermark  (update the watermark table again)
+5. resume log processing; watch the stream for the LOW then HIGH markers
+6. for any primary key that appears in the log BETWEEN the two watermarks,
+   drop that key from the in-memory chunk  (the log entry is newer, so it wins)
+7. on seeing HIGH, emit the surviving chunk rows, in order
+```
+
+The cleverness is that you never need to know the exact log position of your `SELECT`. The two watermark writes bracket it inside the log itself, and any row that was concurrently modified inside that bracket is deferred to its own log event, which is guaranteed to be the newer value. The snapshot can never clobber a fresher change, and no lock is ever taken. This has run in production at Netflix since 2018, across tens of microservices sitting in front of a data layer doing trillions of operations a day. Debezium solves the same seam differently, by taking a consistent snapshot and recording the exact WAL position to resume from, and modern versions support incremental, resumable snapshots for tables too large to read in one pass. Either way, the snapshot-to-stream handoff is the part you must get right, and it is where most CDC outages are actually born.
+
+## The replication slot is the most dangerous object in the system
+
+Now the operational reality that turns a clean architecture into a 2 a.m. page.
+
+The replication slot guarantees WAL retention until the consumer reads it. That guarantee is exactly what makes it dangerous. If your CDC consumer stalls, falls behind, or dies, the slot keeps doing its job: it pins the WAL so nothing is lost. The WAL stops being recycled. It grows. It keeps growing until the disk fills and the primary database goes down, taking your actual application with it, all because a downstream consumer of a convenience feature went quiet.
+
+[Gunnar Morling, who led Debezium, documented how vicious this is](https://www.morling.dev/blog/insatiable-postgres-replication-slot/). On RDS, an idle database is not actually idle: it emits a heartbeat write every five minutes, and with 64 MB WAL segments that forces roughly 18 GB of WAL retention per day behind an inactive slot, on a database where nothing is happening. One documented incident consumed a 200 GiB disk in under two weeks from a single unconsumed slot. The defense is monitoring, not hope:
+
+```sql
+SELECT slot_name,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal,
+       active
+FROM pg_replication_slots;
+```
+
+Alert on `retained_wal` long before the disk has an opinion. Postgres 13 added `max_slot_wal_keep_size` as a safety valve, a cap on how much WAL a slot may pin, and here is the tradeoff a staff engineer states out loud before turning it on: when retained WAL exceeds the cap, Postgres invalidates the slot, and an invalidated slot means your CDC pipeline has lost its place and must re-snapshot every table from scratch, which on a large dataset is hours of heavy I/O. So the cap is a choice between two bad days. Lose the slot and pay for a re-snapshot, or lose the database. You want to be alerting so loudly that you never reach either. And failover makes it worse: a standard replication slot did not survive a failover to a replica before Postgres 16's failover slots, so an unplanned promotion can orphan the whole pipeline and force exactly that re-snapshot. The observability story for all of this, which signals to watch and how to wire them up, is the same discipline as [metrics, logs, and traces](/blog/observability-three-pillars); the slot's retained WAL is simply the single most important gauge you will ever put on a CDC system.
+
+## Outbox versus capturing the table, and why they compose
+
+A question that trips people up: is the transactional outbox an alternative to CDC, or a partner? It is a partner, and seeing why clarifies when to use each.
+
+The outbox solves atomicity at the source. In one local transaction you write the business row and an `outbox` row describing the event you want to emit. Both commit or both roll back, so the event's existence is now atomic with the state change that justified it. But the outbox row still has to get to Kafka somehow, and if a background process polls the outbox table, you have reintroduced polling latency and scan load to drain it. This is where CDC closes the loop: point a CDC connector at the outbox table, and the inserts become events with no polling at all. Debezium even ships an Outbox Event Router for exactly this.
+
+So the choice is not outbox or CDC, it is what you capture. Capture the table directly when consumers want raw row changes, as in warehouse replication, search indexing, or cache invalidation, where the row is the thing. Capture an outbox when consumers want a clean domain event with a stable contract, as in event-driven microservices, because the outbox row's payload is a deliberate `OrderPlaced` event you designed, instead of your raw `orders` columns leaking out as a de facto public API that breaks every consumer the day you rename a column. The deeper "how do services agree on state changes without synchronous coupling" question lives in [distributed transactions and sagas](/blog/distributed-transactions-sagas), and CDC-on-an-outbox is frequently the transport that carries the events a saga is built from.
+
+## The guarantees you actually get
+
+Three properties that bite if you assume the wrong thing.
+
+First, delivery is at-least-once. Debezium and tools like it commit the source log offset after emitting the event, so a crash in that window re-emits on restart. Kafka Connect now offers opt-in exactly-once source support, but it is not the default and it does not save you, because most of your sinks, Elasticsearch, the cache, the warehouse, live outside the Kafka transaction boundary entirely. The real design is at-least-once delivery and idempotent consumers, which is the same discipline as [idempotency and the exactly-once lie](/blog/idempotency-exactly-once): dedupe on the `source.lsn`, or on the primary key plus a monotonic version, so a replayed event is a no-op. "Just turn on exactly-once" is no substitute for an idempotent sink.
+
+Second, ordering is per-partition. Kafka preserves order within a partition, and the default key is the row's primary key, which gives you per-row order: every change to customer 42 arrives in commit order. It does not give you a global total order across all rows, and it does not deliver multi-row transactions atomically downstream, because consumers see individual row events that can interleave with other transactions. Choosing the partition key is therefore a correctness decision, not a performance tuning knob. Key on the entity whose order you must preserve.
+
+Third, schema changes are not in the stream. Postgres logical decoding does not emit DDL, so an `ALTER TABLE` does not flow through as an event, and schema evolution becomes a separate, genuinely hard concern that the DBLog paper itself sets aside as out of scope. There is also a subtle timing caveat worth knowing: Postgres publishes changes during commit rather than strictly after it, so a consumer can occasionally be notified of a row a concurrent transaction cannot yet read. Rare, real, and the kind of thing you only discover at the worst time if nobody told you it was possible.
+
+## The honest landing
+
+Change data capture does not give you a new superpower. It removes a lie you were telling without meaning to. The dual write, the application writing the row and then publishing the event as two separate acts, looks like the obvious design and is quietly broken, because two independent writes have no shared order and will drift apart under plain concurrency with no error and no crash to alert you. CDC fixes it by refusing to have two writes at all. It reads the commit decision the database already made, the same write-ahead log record that defines durability, so the event and the commit are one thing instead of two that can disagree.
+
+The cost is honest too. You inherit a snapshot-to-stream seam that you must get right, a replication slot that will fill your disk if you stop watching it, at-least-once delivery that demands idempotent consumers, and ordering that holds per row and not across your whole dataset. None of those is a reason to avoid CDC. They are the reason to run it like an adult: monitor the slot's retained WAL above all else, make every consumer idempotent on the log position, key your topics on the entity whose order is sacred, and decide deliberately between capturing the raw table and capturing a shaped outbox. Do that, and your database stops being a thing you copy out of by hand and becomes what it secretly already was, a stream of every change that ever happened, finally pointed outward.
+
+## FAQ
+
+<FAQ />

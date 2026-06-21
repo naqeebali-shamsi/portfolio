@@ -1,0 +1,115 @@
+export const meta = {
+  slug: 'secondary-indexes',
+  title: 'Secondary Indexes: How Databases Find a Row Without Scanning Every One',
+  description:
+    "A secondary index is a separate sorted structure that turns a full table scan into a lookup. The catch every junior misses: you pay for the read on every write.",
+  headline: 'Secondary Indexes: How Databases Find a Row Without Scanning Every One',
+  deck: 'An index makes reads fast because it makes writes do more work, and that trade is the whole story.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['databases', 'indexes', 'storage-engines', 'postgresql', 'mysql', 'dynamodb', 'system-design'],
+  faq: [
+    {
+      q: 'What is a secondary index, in one sentence?',
+      a: "A separate sorted structure that maps a non-key column to the rows that contain each value, so a query on that column becomes a lookup instead of a full table scan. Unlike a primary key, the indexed values do not have to be unique, so one entry can point at many rows. It is a denormalized, eagerly-maintained copy of one column ordered for search, which is why it speeds up reads and slows down writes at the same time.",
+    },
+    {
+      q: 'Why not just index every column?',
+      a: "Because every secondary index has to be updated on every write to the table, and that maintenance, not disk space, is the real cost. Inserting one row into a table with N indexes performs one base write plus N index insertions, each of which may split a B-tree page or feed a background compaction. The number of indexes is the single most dominant factor in insert performance. Five just-in-case indexes mean paying the write cost roughly six times over, forever, even for the indexes nothing ever reads.",
+    },
+    {
+      q: 'What is a covering index and when does it actually help?',
+      a: "A covering index contains every column a query needs, so the query is answered from the index alone without fetching the row. In InnoDB it collapses two B-tree traversals into one. In PostgreSQL it enables an index-only scan, but only when the heap pages are marked all-visible in the visibility map. On a write-hot table those bits get cleared constantly, so the scan still visits the heap to check MVCC visibility and the covering columns bought you nothing but extra write maintenance. Measure before adding payload columns.",
+    },
+    {
+      q: 'What is the difference between a local and a global secondary index?',
+      a: "A local (document-partitioned) index lives next to the data: each partition indexes only its own rows. Writes are cheap because the index update is co-located, but a query has to scatter across every partition and gather the results, so read latency tracks the slowest shard. A global (term-partitioned) index is partitioned by the indexed value itself, so a read hits one partition, but a single write can touch many index partitions and is usually applied asynchronously. DynamoDB global secondary indexes are the canonical global index, and they are eventually consistent.",
+    },
+    {
+      q: 'Why is my index being ignored when I filter on the second column?',
+      a: "The leftmost-prefix rule. A composite index on (a, b, c) can serve queries that constrain a, or a and b, or all three, but it cannot serve a query that filters on b alone or c alone. The index is sorted by a first, then b within each a, so without a value for a the engine has no contiguous range to scan. Order the columns equality-first, then your one range column, and stop at three columns because more rarely earns its maintenance cost.",
+    },
+  ],
+}
+
+A database table is a pile of rows in no particular order. That is the honest starting point, and everything about indexing follows. When you run `SELECT * FROM users WHERE email = 'ada@example.com'`, the engine has no idea where that row sits in the pile, so unless you have given it a shortcut it does the only thing it can: read every row, top to bottom, and check each one. Ten rows, fine. Ten million, and your one-line query is a disk-bound table scan that pins a core and times out the request.
+
+The shortcut is a secondary index. The thing nobody tells you when you first reach for it is that the shortcut is not free, not even mostly free, and the price is paid somewhere you are not looking: on every write you make to that table. This piece is about what a secondary index actually is, why it speeds up reads by making writes do more work, and the handful of judgments that separate "add an index, the query got faster" from knowing what you just signed up for.
+
+## What an index actually is
+
+Start with the primary key, the part most people already understand. It is the unique identifier for a row, and the database keeps an index on it so that "find the row with id 1234" is a few pointer hops instead of a scan. One key, one fast lookup, the easy case every tutorial shows you. A secondary index is the same idea pointed at a column that is not the identifier. You query users by email constantly, so you build an index on `email`: a separate sorted structure, stored on disk alongside the table, that maps each email value to the location of the rows that hold it. The planner walks that structure to your value, and it points exactly where to go. The scan is avoided.
+
+Two details make the secondary case genuinely different. First, the indexed values do not have to be unique. Two users can share a city, a status, a signup date, so where a primary key index assumes one row per key, a secondary index has to handle many: it stores a list of row references under each entry, or appends the row identifier to the value so every key is unique again. Either way, one entry can fan out to thousands of rows, the first hint that not every column is worth indexing. Second, where does the entry point? In the classic design the rows live in a heap file: storage that holds rows in no particular order, with the index holding references into it. The heap is what lets you keep several secondary indexes on one table without duplicating the row five times, the index on `email`, on `city`, on `status` all point into the one heap. Hold that picture, because it is the core mental model, and where the index itself physically lives, the same [LSM-tree vs B-tree](/blog/lsm-tree-vs-btree) spectrum that governs storage engines, decides how the write cost behaves.
+
+## The spectrum from pointer to row
+
+"The index holds a reference to the row" is the starting point, not the whole story, because there is a spectrum of how much of the row the index keeps. At one end is the nonclustered index: it stores only a reference, the row lives elsewhere in the heap, and every lookup is two steps. At the other end is the clustered index: the leaf of the index *is* the row. There is no separate heap; the data is physically stored inside the index, ordered by the indexed key, and you get one per table because the data can only be laid out one way at a time. In MySQL's InnoDB this is not optional. The docs are blunt: "Each InnoDB table has a special index called the clustered index that stores row data. Typically, the clustered index is synonymous with the primary key." Your primary key *is* the physical layout of the table.
+
+That single fact reshapes how every InnoDB secondary index works. Because the row lives in the clustered index keyed by the primary key, a secondary index cannot point straight at the row's disk location. It points at the primary key instead: "each record in a secondary index contains the primary key columns for the row, as well as the columns specified for the secondary index," and InnoDB "uses this primary key value to search for the row in the clustered index." So an InnoDB secondary-index lookup is two B-tree traversals, not one: descend the secondary index to find the primary key, then descend the clustered index to find the row. The index did not take you to the data, it took you to a second index that takes you to the data.
+
+And a corollary nobody mentions until it bites: every secondary index silently carries a full copy of the primary key, because "If the primary key is long, the secondary indexes use more space, so it is advantageous to have a short primary key." Choose a 36-byte UUID and you have bloated every secondary index with a 36-byte tax per entry, versus 8 bytes for a bigint. That is a real reason to weigh the key type before the API ergonomics.
+
+The middle of the spectrum is where the interesting move lives, and it gets its own section.
+
+## The covering index, and the trick that collapses the double-hop
+
+Sitting between "store a pointer" and "store the whole row" is the covering index: store *some* extra columns, the ones a common query needs, so that query is answered from the index alone without ever fetching the row.
+
+Table `orders(id PK, user_id, status, total)`, with a plain index on `user_id`, and you run `SELECT total FROM orders WHERE user_id = 42` constantly. In InnoDB that is the double-hop: descend the `user_id` index to find the primary keys of user 42's orders, then for each one descend the clustered index to read `total`. If user 42 has 500 orders that is 500 trips into the clustered index. Now cover the query with index `(user_id, total)`. The `total` value now lives in the secondary index's leaf, so the engine descends once, reads both columns out of the leaf, and never touches the clustered index. The second hop disappears. (InnoDB secondary records already carry the primary key columns, so this just adds `total` to a structure already two-thirds of the way there.)
+
+PostgreSQL has its own name and mechanism for the same payoff. It calls the execution an index-only scan, one that "can answer queries from an index alone without any heap access." And the `INCLUDE` clause attaches payload columns without making them part of the search key, so `user_id` stays the searchable key and `total` is along for the ride purely to cover the query:
+
+```text
+CREATE INDEX idx_user_inc ON orders (user_id) INCLUDE (total);
+SELECT total FROM orders WHERE user_id = 42;
+```
+
+Here is where the junior treatment stops, because in PostgreSQL the covering index does *not* reliably skip the row fetch, and the reason is [MVCC](/blog/mvcc-isolation-levels). An index entry does not record whether its row is visible to your transaction; that lives only with the row. As the docs put it, "Visibility information is not stored in index entries, only in heap entries; so at first glance it would seem that every row retrieval would require a heap access anyway." What rescues the index-only scan is the visibility map: a per-page bitmap where a set bit means every row on that heap page is visible to all transactions. The scan checks the bit for its page, and if it is set, "the data can be returned with no further work." If it is not set, the scan fetches the row to check visibility, and quietly became an ordinary index scan.
+
+So the covering index is conditional, and the condition is "the table changes slowly enough that its pages stay marked all-visible." On a write-hot table, every write clears the all-visible bit for its page until the next vacuum re-sets it. The Postgres docs are refreshingly honest: "there is little point in including payload columns in an index unless the table changes slowly enough that an index-only scan is likely to not need to access the heap."
+
+So a covering index on a cold reporting table is a clean win. On your hottest write path it is often theater: autovacuum cannot keep the all-visible bits set under the load, so the scan visits the row anyway and you paid the extra maintenance for nothing. Look for "Index Only Scan" versus "Index Scan" in the plan before you assume it fired.
+
+## The write tax, which is the actual reason you don't index everything
+
+Ask a junior why you should not index every column and you will hear "it uses disk space." True, and the least interesting reason. The real one is the write tax.
+
+An index is a sorted structure, and a new entry belongs in a specific place to keep the order. So when you insert a row, the database does not just write the row. It walks to the correct leaf in *every* index on that table and inserts the entry there, in order, splitting a page if the leaf is full. As Kleppmann puts it, "any kind of index usually slows down writes, because the index also needs to be updated every time data is written."
+
+Markus Winand pins down which factor dominates, and the answer surprises people: "The number of indexes on a table is the most dominant factor for insert performance." Not row size, not column types, the count of indexes. His microbenchmark found that going from zero indexes to one raised insert time by roughly a factor of a hundred, with each further index adding more on top. Treat the 100x as illustrative from a controlled insert-only setup, not a production SLA, but the shape is real. Cost an insert honestly: one row into a table with N secondary indexes is one base write plus N index insertions, each potentially splitting a page, 1 + N structural operations on every insert, forever. Five "might need it someday" indexes mean every insert pays roughly six times over, and the indexes nothing reads cost exactly as much to maintain as the ones you query hourly.
+
+The *form* the tax takes depends on the storage engine. A B-tree engine pays in in-place page mutation, page splits, and write-ahead logging. On an [LSM-tree](/blog/lsm-tree-vs-btree) engine each secondary index is its own LSM tree, so the write fans out into more memtable writes that get rewritten repeatedly by background compaction. The mechanism is write amplification, the physical bytes written per logical write, and there is a temptation to quote a tidy number, LSM is 10 to 20 times, B-tree is 3 to 5 times. Resist it. The peer-reviewed work (the FAST '22 paper on closing the B+-tree versus LSM-tree write-amplification gap) shows the gap "depends strongly on runtime workload characteristics" and can be closed or even inverted with large caches, large records, or compression. The reliable claim is directional: more indexes mean more write amplification on either engine, and you reason about which from the engine.
+
+## The distributed twist, where the choice actually decides scale
+
+Everything so far assumes one machine. The moment your data is [partitioned across many](/blog/partitioning-sharding), the secondary index splits into two fundamentally different designs, and choosing between them is one of the genuinely consequential decisions in a distributed system. The trade is a mirror image.
+
+The first is the local, or document-partitioned, index. Each partition keeps a secondary index over only its own rows, so writes are cheap: write a row to partition 7, update partition 7's index in the same place, no coordination with anyone else. But the matching rows for a query could be on any partition, because the data was partitioned by something else, so the query has to "search through all the partitions, and then combine all the results." That is scatter/gather, and it "can make read queries on secondary indexes quite expensive." Elasticsearch, Cassandra, Riak, and MongoDB all work this way.
+
+The killer with scatter/gather is not average latency, it is tail latency. Fan out to 100 partitions in parallel and your response is not ready until the *slowest* of the 100 replies, and with enough partitions one is always having a bad moment, a GC pause, a hot neighbor, a slow disk. So p99 tracks the worst shard, and adding partitions to scale makes the tail worse, not better. This tail-latency amplification is why "just add a secondary index" stops scaling on a document-partitioned store, and why Cassandra steers high-cardinality lookups toward a hand-built query table.
+
+The second is the global, or term-partitioned, index. You build one logical index and partition it by the indexed value itself, so `status = active` lives on a specific index partition no matter which data partition the rows sit on. Now a read hits exactly one partition, "reads are more efficient, since we don't need to scatter/gather." The cost moved to the write side: a single write to one row "may now affect multiple partitions of the index," because its different indexed columns route to different index partitions. Writes become "slower and more complicated," so almost everyone reaches for the same escape hatch, "Updates to global secondary indexes are often asynchronous."
+
+That asynchrony is not a footnote, it is a correctness boundary. A global index is an eagerly-maintained denormalization that has stopped being eager: write a row, immediately query through the index, and you may not see your own write yet. If a flow depends on read-your-writes you need a fallback, query the base table directly, or use a strongly-consistent read where the system offers one. It is the same [consistency-spectrum](/blog/cap-pacelc-consistency-spectrum) trade-off you make everywhere else.
+
+DynamoDB makes all of this concrete and billable. A DynamoDB global secondary index is exactly a term-partitioned global index, and AWS documents the predicted pain. The write cost: a write to the base table also consumes capacity on every affected GSI, so the total is the base-table units plus the units for each index. The consistency: GSIs are updated "asynchronously using an eventually consistent model." And the failure mode that catches teams off guard, GSI back-pressure: "If a GSI doesn't have sufficient capacity to handle these updates, DynamoDB throttles writes to the base table." Even with ample base-table capacity, "writes will be throttled if any associated GSI cannot handle the update volume." Index a low-cardinality column like `status` and that GSI develops hot partitions even when your base-table writes are perfectly spread, so the abstract "writes touch multiple partitions" becomes a 4xx on a base table nowhere near its own limit, because of an index you forgot you added.
+
+I felt the lighter version of this building [NomadCrew](/case-study/nomadcrew), where live location and presence flow over a WebSocket hub. The instinct is to index the hot, low-cardinality fields, who is online, which trip is active, exactly the columns where an index helps least and an asynchronous global index would lie to you most. What held up was the move Cassandra pushes you toward: model the read you actually serve rather than bolting a secondary index onto a column with three distinct values and hoping. Model the access pattern first, the through-line of the [database mindmap](/blog/database-mindmap).
+
+## The judgments a senior actually makes
+
+The mechanisms are the easy part. Here is the decision layer tutorials skip.
+
+Order composite-index columns deliberately, for the leftmost-prefix rule. An index on `(a, b, c)` can serve queries constraining `a`, or `a` and `b`, or all three, but it is useless for a query filtering on `b` alone or `c` alone, the structure is sorted by `a` first, so without `a` there is no contiguous range to scan. The Postgres docs put it as "the index is most efficient when there are constraints on the leading (leftmost) columns." Put equality columns first, then a single range column, and stop around three: "use multicolumn indexes sparingly," and beyond three an index is "unlikely to help."
+
+Do not index low-cardinality columns. A boolean or a three-value status flag has so few distinct values that any one still matches a huge fraction of the table, and the planner correctly decides a sequential scan beats bouncing through an index to visit most of the pages anyway. The right tool is a partial index, built only over the rows matching a predicate, so you index the rare value and skip the common one. `CREATE INDEX ... (user_id) INCLUDE (total) WHERE status = 'open'` indexes only open orders, covers the query, and stays cheap, partial and covering compose cleanly as long as the planner can prove your query's predicate implies the index's.
+
+Treat dropping an index as a first-class, unglamorous operation. An index nothing reads is pure write tax and storage with zero benefit, and the signal is in the catalog: `idx_scan = 0` in `pg_stat_user_indexes` over a representative window means nothing has used it, drop it. Auditing indexes is maintenance, not premature optimization, and on a write-heavy table one of the cheapest wins you have.
+
+And the one-line tell of seniority, the question that reframes every "should we add this index?" The junior asks "will it make this query faster?" The answer is almost always yes, which is exactly why it is the wrong question. The senior asks instead: "what does this cost on the write path, and is this column even selective enough to beat a sequential scan?" An index is a write-path change wearing a read-optimization costume. It is reversible, but never free, and the bill arrives on every insert for as long as it exists. That framing, every component has a read cost and a write cost that trade against each other, is the same muscle you use across [the system design interview framework](/blog/system-design-interview-framework), and it is worth more than memorizing any single index type.
+
+## FAQ
+
+<FAQ />

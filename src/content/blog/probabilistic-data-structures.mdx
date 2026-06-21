@@ -1,0 +1,127 @@
+export const meta = {
+  slug: 'probabilistic-data-structures',
+  title: 'Bloom Filters, HyperLogLog, and Count-Min Sketch: Being Wrong on Purpose to Save Memory',
+  description:
+    'Three data structures that lie to save memory: a Bloom filter, HyperLogLog, and Count-Min Sketch. Each makes one bounded, tunable error and refuses the others.',
+  headline: 'Bloom Filters, HyperLogLog, and Count-Min Sketch: Being Wrong on Purpose to Save Memory',
+  deck: 'The skill is not knowing these structures save memory; it is knowing exactly which lie each one buys you.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '13 min',
+  tags: ['data-structures', 'algorithms', 'bloom-filter', 'hyperloglog', 'count-min-sketch', 'system-design'],
+  faq: [
+    {
+      q: 'Can a Bloom filter give a false negative?',
+      a: "No, and that guarantee is the whole reason it is useful. A Bloom filter sets bits when you insert and never clears them, so a real member always finds all of its bits set and passes the check. The only error it can make is a false positive: it can say maybe present for something never inserted, because that item happened to hash onto bits other insertions had already set. This is why a Bloom filter is safe as a negative cache. A no is the truth. The moment you support deletion by clearing bits, you break the no-false-negatives property and need a counting Bloom filter or a cuckoo filter instead.",
+    },
+    {
+      q: 'How much memory does HyperLogLog actually use?',
+      a: "Redis caps a HyperLogLog at 12 KB per key and gives a standard error of 0.81 percent while counting up to 2^64 distinct items, whether you have ten distinct items or ten billion. The 12 KB is the dense form: 16384 registers at 6 bits each. Modern implementations following the HLL++ paper use a sparse representation at low cardinality that is both smaller than 12 KB and more accurate, promoting to the dense form only when that becomes cheaper. So a near-empty HyperLogLog does not actually cost 12 KB. The flat ceiling is the headline: exact distinct counting over a billion events costs gigabytes, and this costs kilobytes.",
+    },
+    {
+      q: 'Does Count-Min Sketch ever underestimate a count?',
+      a: "Not for insert-only streams, which is the case almost everyone is in. Count-Min Sketch increments one counter per row and answers a query by taking the minimum across those rows. Collisions only ever add mass to a counter, so the minimum is the least-polluted estimate and can only sit at or above the true count. That one-sided overestimate is guaranteed only in the cash-register model where counts never decrease. If you allow decrements (the turnstile model), the minimum is no longer a safe overestimate and you switch to a median-based estimator. The error is also scaled by the total stream mass, not by the item's own count, which is why the sketch is excellent for heavy hitters and unreliable for rare items.",
+    },
+    {
+      q: 'When should I not use a probabilistic data structure?',
+      a: "When an exact structure fits comfortably in memory. If the set of distinct items is small enough that a HashSet or HashMap costs megabytes rather than gigabytes, the exact structure is simpler, faster, and has zero error. Sketches earn their place only when exactness costs you real money in RAM or a COUNT DISTINCT that may never finish. Reaching for a Bloom filter to dedupe a few thousand IDs is solving a problem you do not have, and you pay for it with a false-positive rate you then have to reason about forever.",
+    },
+    {
+      q: 'Do these structures need cryptographically strong hash functions?',
+      a: "No, and assuming they do leads people to over-engineer them. A Bloom filter needs a well-distributed hash, and you do not even need k independent ones: the Kirsch-Mitzenmacher result shows you can simulate k hashes from two base hashes (h_i = h1 + i*h2) with the same asymptotic false-positive rate. Count-Min Sketch provably needs only pairwise-independent hashing, which is cheap and hardware-friendly. HyperLogLog needs good uniformity in the output bits, not independence across many functions. The one place hashing strength matters is adversarial: if an attacker can guess your hash, they can craft inputs that inflate a Bloom filter's false-positive rate or poison a Count-Min heavy-hitter list, and the fix is a keyed hash with a secret seed.",
+    },
+  ],
+}
+
+Here is a question that sounds trivial and is not: how many unique visitors did the site get last month?
+
+Answer it exactly and you have to remember every visitor you have seen this month, so you can tell whether the next one is new. A billion events means a billion IDs in memory, plus a `COUNT(DISTINCT)` that may grind for minutes or never finish. HyperLogLog answers the same question in about 12 kilobytes with under one percent error, and it does not slow down whether you have ten distinct visitors or ten billion. The price is that the answer is slightly wrong, in a specific and bounded way you can write down in advance.
+
+This piece is about three structures that all make the same bargain. A Bloom filter answers "is this thing in the set?" A HyperLogLog answers "how many distinct things have I seen?" A Count-Min Sketch answers "how many times did this thing appear?" Each hashes its input into a small fixed-size structure and accepts exactly one kind of error in exchange for fitting the problem in cache. The shallow version of this knowledge is "they save memory." The senior version, the one that shows up when you decide what to put behind a hot path in [the system design interview framework](/blog/system-design-interview-framework), is knowing precisely which lie each structure is allowed to tell, and which it is incapable of telling.
+
+## The one idea underneath all three
+
+Strip away the names and there is a single move: hash the input into a small fixed structure, and accept a characterized error so memory drops from O(n) to O(1) or O(log log n). The word carrying the weight is *characterized*: the error is a knob you set in advance, with a formula attached. And the property that separates these from "approximate is fine, ship it" is that each makes exactly one shape of error and is structurally incapable of the others.
+
+| Structure | Question it answers | Error it can make | Error it cannot make | Memory |
+| --- | --- | --- | --- | --- |
+| Bloom filter | Is x in the set? | False positive (says maybe when absent) | False negative (never misses a real member) | ~9.6 bits/item at 1% FP |
+| HyperLogLog | How many distinct items? | Two-sided, but unbiased with tight standard error | Cannot tell you which items, or membership | ~12 KB at any cardinality |
+| Count-Min Sketch | How often did x appear? | Overestimate only (insert-only streams) | Underestimate (never reports below truth) | O(1/ε · log 1/δ) counters |
+
+The asymmetry is the whole game, and it dictates where each is safe. A Bloom filter is safe as a negative cache because a "no" is always the truth. A Count-Min Sketch is safe for "is this at least this frequent?" because it only ever errs upward. HyperLogLog is the odd one: two-sided error, but with a standard deviation you dial in and, with modern bias correction, essentially no systematic skew. Memorize the columns and you can pick the right structure before writing a line of code.
+
+## Bloom filter: a yes that means maybe, a no that means no
+
+Burton Bloom published this in 1970 under a title that says the thesis out loud: space and time trade-offs with allowable errors. You have a bit array of `m` bits, all zero. To insert, compute `k` hash functions and set those `k` bits to 1. To check, compute the same `k` hashes and look. If any bit is 0, the item is definitely absent, because an inserted item would have set it. If all `k` are 1, the item is probably present. Probably, because those bits could have been set by other insertions that collided.
+
+That collision is the false positive, and it is the only error the structure can produce. No false negative is possible for one reason that everything downstream rests on: bits are only ever set, never cleared, so a real member that set its `k` bits at insert time always finds them set and passes.
+
+That same fact tells you why a plain Bloom filter cannot delete. To delete you would clear bits, but those bits may be shared with an item still present, and clearing them makes that other item report a false negative. If you need deletion, move to a counting Bloom filter (counters instead of bits, roughly four times the space) or a cuckoo filter (better locality, often less space at low false-positive rates).
+
+### Sizing it
+
+Three relationships turn "use a Bloom filter" into "use one of exactly this size," from the Broder and Mitzenmacher survey. The probability a bit is still 0 after `n` insertions is `e^(-kn/m)`, so the false-positive rate is `f = (1 - e^(-kn/m))^k`. The optimal hash count that minimizes that rate is `k = (m/n) · ln 2`. Plug it back in and the optimal rate is `f = (1/2)^k ≈ 0.6185^(m/n)`. Note that the hash count is a true optimum, not a "more is safer" dial: this is a U-curve, and past the peak each extra hash sets more bits, fills the array faster, and *raises* the false-positive rate. That last form is the one to internalize, because it becomes a sizing table, cross-checked here against Redis's measured bits-per-item:
+
+| Target false-positive rate | Bits per item (m/n) | Optimal hash count k | Redis measured bits/item |
+| --- | --- | --- | --- |
+| 1% | ~9.6 | ~7 | 9.585 |
+| 0.1% | ~14.4 | ~10 | 14.378 |
+| 0.01% | ~19.2 | ~14 | 19.170 |
+
+The headline trade: roughly 9.6 bits per element buys a 1 percent false-positive rate, independent of how big each element actually is. Store a billion 16-byte keys exactly and you spend about 16 GB; a 1 percent Bloom filter over the same keys costs about 1.2 GB. The element size dropped out, because you store a fixed number of bits per item rather than the item. The rule of thumb from `f ≈ 0.6185^(m/n)`: every additional ~4.8 bits per element divides the false-positive rate by ten. One failure mode rides along with this. The filter is sized at creation against an assumed `n`, with `m` and `k` baked in, so under-provision the `n` and the false-positive rate quietly climbs past target as the array fills, with no way to resize short of rebuilding. Redis works around it by stacking a new sub-filter at capacity, which keeps inserts O(k) but makes existence checks O(k · number of sub-filters).
+
+### Where the maybe earns its keep
+
+The classic objection is that a "maybe" is useless. It is the opposite, and the clearest example lives in an [LSM-tree](/blog/lsm-tree-vs-btree), which spreads data across many immutable SSTable files on disk. A lookup for an absent key would naively check every file, each check a disk read. So each SSTable carries a Bloom filter over its keys, and before touching disk you ask the filter. A "definitely not in this file" skips the disk read entirely, eliminating most files with no I/O. The rare false positive costs one wasted read that finds nothing; the common true negative saves an I/O. That trade, a cheap occasional waste for a frequent expensive saving, is the whole reason the structure exists. The same shape guards [a distributed cache](/blog/distributed-cache): a Bloom filter in front absorbs lookups for keys that were never cached, so a known-absent key never becomes a request to the slow backing store.
+
+## HyperLogLog: counting distinct things you refuse to remember
+
+HyperLogLog, from Flajolet and three coauthors in 2007, counts *distinct* elements without storing the elements. Exact distinct counting is expensive precisely because knowing whether the next item is new means remembering everything seen. HyperLogLog gets the count in constant memory by leaning on a fact about random bit patterns.
+
+Hash each item to a uniform binary string. Use the first `p` bits to choose one of `m = 2^p` registers, splitting the stream into `m` independent substreams (stochastic averaging, the trick that tames variance). In the remaining bits, find the position of the leftmost 1, which is one plus the number of leading zeros. Each register remembers the maximum such position it has seen. The intuition: a hashed value starting with `ρ` zeros is about a `2^(-ρ)` event, the way flipping `ρ` heads in a row is, so the largest run of leading zeros estimates `log2` of how many distinct values you have hashed. One register is far too noisy, which is why you spread across `m` and combine them with a *harmonic mean*. That is the innovation the name marks: the earlier LogLog used an arithmetic-style mean that outlier registers wrecked, and the harmonic mean's resistance to large values is what buys the accuracy.
+
+### The guarantee, in numbers
+
+The paper states the accuracy cleanly: the relative standard error is about `1.04/√m`, and it becomes possible to estimate cardinalities well beyond 10^9 with a typical accuracy of 2 percent using only 1.5 kilobytes. That formula is your sizing tool:
+
+- To hit roughly 2 percent error you need `m ≈ (1.04/0.02)² ≈ 2704` registers. The paper's 1.5 KB example uses `m = 2048` registers at about 6 bits each, which is `1.04/√2048 ≈ 2.3 percent`. A senior reads the round "2 percent" headline as the typical figure it is, not a tight worst-case bound.
+- Redis chooses `m = 16384` registers, giving `1.04/√16384 = 0.81 percent`, using up to 12 KB per key (16384 registers × 6 bits ≈ 98 kilobits), able to estimate up to 2^64 distinct items, with `PFADD` to insert (O(1)) and `PFCOUNT` to read the estimate.
+
+### What production actually runs
+
+The 2007 paper is the idea; the 2013 follow-up from Google, HLL++, is what real systems implement, and it fixes three edge cases. A 32-bit hash collides near the birthday bound around 2^32 (about 4.3 billion), capping you below the billions you wanted, so HLL++ uses a 64-bit hash. At low cardinality, a sparse list of the registers you actually touched costs far less than the dense array and is *more* accurate, so the implementation keeps the sparse form until dense would be cheaper. This is the concrete reason "it always costs 12 KB" is false: a near-empty HyperLogLog is small. And the original constant correction is biased at small and medium cardinalities, so HLL++ interpolates over empirically measured bias to remove the skew.
+
+The property that makes HyperLogLog dominate large-scale analytics is mergeability, which is what `PFMERGE` does: sketches combine by taking the element-wise maximum of their registers, with no loss beyond the inherent error. Shard a stream across a hundred machines, keep a HyperLogLog on each, and merge at query time as if you had counted on one machine, or keep a sketch per day and union seven for a weekly unique count without rescanning an event. The same trait sits behind unique-reach metrics in [retrieval-augmented systems](/blog/rag-system) and analytics over [recommendation systems](/blog/recommendation-systems), where you count distinct users or documents across shards without a central tally. One thing it emphatically does not do: store items. You cannot query membership or enumerate. It is a cardinality estimator, and treating it like a set is a category error.
+
+## Count-Min Sketch: frequencies, with the error pointed one way
+
+Count-Min Sketch, from Cormode and Muthukrishnan in 2005, answers "how many times did x appear?" over a stream too large for an exact counter per item. The structure is a 2-D array of counters, `d` rows by `w` columns, all zero, with `d` hash functions (one per row), each mapping an item to a column. To record an item, go to each row, hash to a column, and increment that counter, touching exactly `d` of them. To query, hash into each row and return the *minimum* of the `d` counters you land on.
+
+Taking the minimum is the clever part: a counter is only ever inflated by collisions where some other item hashed to the same cell, so across the `d` cells an item lands in, the least-collided gives the tightest overestimate, and the minimum picks it.
+
+The paper tells you how to size it: set `w = ⌈e/ε⌉` and `d = ⌈ln(1/δ)⌉`. With those, Theorem 1 guarantees the estimate is never below the true count, and with probability at least `1 - δ` it overshoots by at most `ε · ‖a‖₁`, where `‖a‖₁` is the total stream mass. The scaling is the whole story: the overshoot is `ε` times the *total volume of the stream*, not `ε` times the item's own count. That makes the sketch superb for heavy hitters, whose true value dwarfs the error term, and shaky for rare items, whose true count can be smaller than the error term itself. This is why Redis says to treat any count below `error × total_count` as effectively zero: below that line the sketch cannot tell a real small count from collision spillover. To ground the sizing: `ε = 0.001` and `δ = 0.001` give `w = 2719` and `d = 7`, about 19,000 counters and a few tens of kilobytes, estimating the frequency of any item out of billions while overshooting by at most 0.1 percent of total stream mass, 99.9 percent of the time.
+
+The one-sided "never underestimates" property holds only for non-negative streams, the cash-register model where counts only rise. Allow decrements (the turnstile model, items removed) and the minimum can be pulled below the true count, so you switch to a median-based estimator that is unbiased but two-sided. Knowing that the choice between `min` and `median` is driven by whether your stream has deletions is exactly what separates a real answer from a memorized one. And the `‖a‖₁` scaling is a feature for the heavy-tailed, Zipfian distributions real traffic follows (request counts, search terms, trending detection): the items you care about are the heavy hitters the error barely touches. The sketch is engineered for skew, which is convenient, because skew is what production data looks like.
+
+## How a senior actually decides
+
+The decision is not "should I use a probabilistic structure," it is "which question am I answering, and is exact genuinely too expensive." If the distinct set or item universe is small enough that a `HashSet` or `HashMap` fits without strain, use the exact structure: simpler, faster, zero error. Reaching for a sketch to dedupe a few thousand IDs just saddles you with a false-positive rate you now reason about forever. Sketches earn their place when exactness costs gigabytes or a query that may never return.
+
+When exact is too expensive, the question picks the structure and the error model tells you whether it is safe:
+
+- "Is x present, and can I afford an occasional false yes if I never get a false no?" Bloom filter. Negative caches, SSTable skip checks, the "is this short code already taken" check that sits in front of the database in [a URL shortener](/blog/url-shortener).
+- "How many distinct, across a stream or many shards, where I never need the items themselves?" HyperLogLog. Unique visitors, distinct-key estimation, `COUNT(DISTINCT)` at a scale where exact will not finish.
+- "How frequent is x, where I mostly care about the frequent ones?" Count-Min Sketch. Trending detection, heavy hitters, frequency-based rate limiting over skewed traffic.
+
+Two cross-cutting properties decide the harder cases. Mergeability is why all three dominate distributed and streaming systems: HyperLogLog registers merge by max, Count-Min counters by add, Bloom filters union by bitwise OR (identical `m` and `k`), so each shard keeps its own sketch and you combine at query time with no loss beyond inherent error. The second is adversarial robustness, the assumption everyone forgets: all three assume inputs are not chosen to defeat them. An attacker who can guess your hash can craft inputs that inflate a Bloom filter's false-positive rate or poison a Count-Min heavy-hitter list, and the cheap mitigation is a keyed hash with a secret seed.
+
+The shape here is the same one running under the sibling pieces on [embeddings](/blog/embeddings) and [vector databases](/blog/vector-databases). Approximate nearest-neighbor search makes this exact bargain: accept a bounded, tunable miss rate to turn an O(n) scan into something sublinear, the same way [model routing](/blog/model-routing) accepts an occasional misroute to avoid paying for the largest model on every request, and [quantization](/blog/llm-quantization) accepts a small precision loss to fit a model in memory it otherwise could not. The recurring senior move is identical: name the error, bound it, tune it, and verify it never crosses the line where it would actually hurt. Across the systems work behind [IntelliFill](/case-study/intellifill), [Aladeen](/case-study/aladeen), and [Audex](/case-study/audex), the structures that survived production were the ones whose failure was characterized rather than discovered, which is the same instinct you apply to adversarial inputs in [the way modern LLMs work](/blog/how-llms-work) or the integrity of a serving path in [LLM inference serving](/blog/llm-inference-serving).
+
+## The honest landing
+
+You do not get exactness for free at scale. Exact membership, exact distinct counts, and exact frequencies all cost memory that grows with your data, and past a certain size that cost is the difference between a query that returns and one that does not. These three structures buy you out of it by lying in a controlled way. A Bloom filter tells you maybe when it means no idea, but never no when it means yes. HyperLogLog is off by a percent you chose in advance, in either direction, with no systematic bias. Count-Min Sketch rounds your frequent items up by a hair and tells you nothing trustworthy about your rare ones. None of that is a flaw to tolerate; it is the deal, with a formula attached, and the engineer who reaches for one of these knows the exact shape of the wrongness they bought. That is the whole skill: being able to say, before you ship, precisely which lie is now running on your hot path.
+
+## FAQ
+
+<FAQ />

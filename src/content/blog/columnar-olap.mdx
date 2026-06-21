@@ -1,0 +1,204 @@
+export const meta = {
+  slug: 'columnar-olap',
+  title: 'Row vs Columnar Storage: Why Analytics Databases Are Built Differently',
+  description:
+    "How one byte-layout decision splits databases into OLTP and OLAP. Row stores fetch whole records cheaply; column stores scan billions of values fast in bulk.",
+  headline: 'Row vs Columnar Storage: Why Analytics Databases Are Built Differently',
+  deck: 'One choice about how a table is laid out on disk decides everything downstream, from compression to CPU execution to which queries are fast.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['columnar', 'olap', 'databases', 'parquet', 'clickhouse', 'snowflake', 'system-design'],
+  faq: [
+    {
+      q: 'What is the actual difference between row and columnar storage?',
+      a: "A row store keeps all the fields of one record next to each other on disk, so reading or updating a whole record is one contiguous operation. A columnar store keeps all the values of one column next to each other instead, so scanning a few columns over many rows only touches those columns. The first wins for fetch-and-update-one-record work (OLTP); the second wins for scan-and-aggregate-over-billions work (OLAP). Everything else, compression and execution speed included, follows from that one layout choice.",
+    },
+    {
+      q: 'Can you just configure a row store to act like a column store?',
+      a: "Not effectively, and this is measured rather than theoretical. In the Abadi 2008 Star Schema Benchmark, a real column store answered queries in about 4 seconds; a row store faking columns by vertical partitioning took 79.9 seconds, and an index-only plan took 221 seconds, both far worse than the row store running normally. Each emulated column value has to carry tuple-header overhead and a record id so its siblings can be rejoined, which inflates storage and forces expensive position joins. The advantage is architectural, not a setting you flip.",
+    },
+    {
+      q: 'Why does columnar storage compress so much better?',
+      a: "A column is values of one type with similar neighbors: all the country codes together, all the timestamps together. That low value-diversity makes run-length, dictionary, and delta encodings effective in a way they never are on a row, which interleaves an int, a string, a float, and a timestamp. The payoff is not only smaller files. The executor can compute directly over the encoded form (counting a run-length run in one step, comparing dictionary codes instead of strings), which saves CPU and cache traffic, not just disk.",
+    },
+    {
+      q: 'If columnar is so much faster, why do databases still use rows?',
+      a: "Because writing one record into a columnar table means touching every column file, which is N scattered writes instead of one. That makes columnar hostile to the high-frequency single-record mutation that transactional systems live on, so checkout and payments paths stay on row stores like Postgres and MySQL. There is also a read crossover: once a query reads dozens of columns or does point lookups and SELECT *, the cost of reassembling rows from many separate columns can make a row store faster.",
+    },
+    {
+      q: 'How do columnar databases handle updates if writing one row is expensive?',
+      a: "They defer and batch instead of writing in place. A write-optimized store (in memory or row-shaped) absorbs incoming changes cheaply, and a background process periodically folds them into the compressed columnar store. C-Store called this the Writable Store and Read-optimized Store with a Tuple Mover; Vertica shipped it as WOS/ROS; ClickHouse does it as small parts plus background merges. It is structurally the same idea as an LSM tree. Columnar systems are write-deferring, not write-incapable.",
+    },
+  ],
+}
+
+A database makes one decision before it stores a single byte, and that decision quietly determines almost everything you will ever feel about its performance. The decision sounds dumb: when you lay a table on disk, do you write one record at a time, fields together, or one column at a time, with all of a field's values together?
+
+That is the whole fork. One path leads to PostgreSQL and the order you just placed. The other leads to Snowflake and the dashboard counting a billion orders. The difference has nothing to do with taste. That first byte-layout choice forces compression, CPU execution, and write cost in opposite directions, and once they diverge you have two database species that cannot trade places.
+
+This piece is about why that one choice cascades, and why "analytics database" turned out to mean "the table is stored sideways." If you have read [the database mindmap](/blog/database-mindmap), this is the OLTP-versus-OLAP split seen from the storage layer, where the split actually comes from.
+
+## The one picture that explains the whole thing
+
+Take a fact table: orders, with columns `order_id, customer_id, date, country, amount`. Five columns here, but hold the number loosely, because real fact tables have fifty.
+
+A **row store** writes record one in full, then record two in full, contiguously:
+
+```
+[1, 42, 2026-01-01, US, 19.99][2, 17, 2026-01-01, CA, 4.50][3, 42, 2026-01-02, US, 99.00]...
+```
+
+A **column store** writes all the `order_id` values together, then all the `customer_id` values together, each column in its own file:
+
+```
+order_id:  [1, 2, 3, ...]
+customer:  [42, 17, 42, ...]
+date:      [2026-01-01, 2026-01-01, 2026-01-02, ...]
+country:   [US, CA, US, ...]
+amount:    [19.99, 4.50, 99.00, ...]
+```
+
+Now run the query an analyst actually runs: `SELECT AVG(amount)`.
+
+The row store has a problem it cannot avoid. `amount` is interleaved with four other fields on every record, so to read 4 bytes of amount it drags the whole record past the CPU. On a 50-column table, you read fifty columns to use one. The column store reads the `amount` file and nothing else.
+
+That is the entire intuition, and it is worth stating as a ratio because the ratio scales: the work a column store saves is proportional to *(columns in the table) / (columns in the query)*. Fifty-column table, three-column query, and you have cut bytes-read by about 16x before anyone says the word compression. This is the same I/O-proportionality reasoning behind capacity math in [the system design interview framework](/blog/system-design-interview-framework); here it underwrites an entire product category.
+
+Put numbers on it. Fifty columns, a billion rows, roughly 4 bytes each, so about 200 GB. At the throughput Abadi's group measured on a four-disk array (160 to 200 MB/s aggregate), scanning all 200 GB is on the order of a thousand seconds of raw I/O. Scanning just the 4 GB `amount` column is about twenty. The layout alone bought a 50x cut before a single value gets compressed, and the next two sections widen it.
+
+## Compression is not a feature you add. It is what the layout makes possible.
+
+Here is the part the "columns compress better" one-liner gets right and then fails to explain.
+
+A row is hostile to compress. It interleaves an integer, a string, a float, and a timestamp, four types with nothing in common sitting byte-adjacent. A general compressor squeezes it a little, but there is no structure to exploit.
+
+A column is the opposite: values of one type, usually resembling their neighbors. All the `country` codes, all the `amount` floats, all the `date` timestamps, lined up. That property has a name worth keeping, value locality, and it unlocks a family of encodings that simply do not apply to rows:
+
+- **Run-length encoding.** A sorted `country` column with ten thousand consecutive `US` values stores as one triple, `(US, start_position, 10000)`. The canonical small example from the literature is `1,1,1,2,2` becoming `(1x3, 2x2)`.
+- **Dictionary encoding.** Map distinct values to small integer codes, store the codes plus one dictionary. A low-cardinality string column collapses to a stream of tiny ints.
+- **Delta / frame-of-reference.** Store each value as the difference from the previous one. Murder on a row; ideal for a sorted timestamp or an incrementing id.
+
+Abadi's 2008 paper puts the effect bluntly: compression on columns "has been shown to improve query performance by up to an order of magnitude." But read that sentence twice, because the interesting word is *performance*, not *size*.
+
+The shallow story is that compression saves disk. Disk is cheap; if that were the whole payoff, nobody would build an architecture around it. The real payoff is that you **compute directly on the compressed form**. Counting that run of ten thousand `US` values is one operation against the run-length triple, not ten thousand comparisons. Filtering a dictionary-encoded column compares small integer codes, not strings. You skip the decompress step entirely for a large class of operations. The savings are in I/O *and* instructions retired *and* cache traffic, the trifecta that actually moves wall-clock time.
+
+This is also why **sort order is a real physical-design decision** in a column store. Run-length encoding only pays when identical values are adjacent, so the order you store a column in directly sets how compressible it is. It is the seed of the projections idea we will hit later: store the same table sorted several ways, so different queries each meet a copy that compresses well for them.
+
+And there is a third consequence, the one that separates a fast column store from a merely small one. Because a column arrives as a tightly packed, fixed-width array of one type, the engine can run a whole **block** of values through a tight CPU loop, vectorized and block-at-a-time, instead of the classic Volcano model that pulls one tuple at a time and pays per-tuple overhead on every value. The dependency is causal and it is the spine of the topic:
+
+```
+single-type column  ->  high value locality  ->  cheap RLE / dict / delta
+                    ->  dense fixed-width arrays  ->  SIMD-friendly vectorized loops
+```
+
+No vectorized execution without the dense arrays, no dense arrays without the single-type column. Storage and execution are co-designed, which is why you cannot reach analytics-grade speed by sprinkling SIMD onto a row engine: the data never arrives in the shape the fast loop wants. The layout is upstream of everything.
+
+## The bill comes due on writes, and that is why OLTP stays on rows
+
+Everything above sounds like columnar should win unconditionally. It does not, and the reason is the mirror image of the read win.
+
+Inserting or updating **one logical record** means writing to **every column file**. On a 50-column table, that is fifty scattered writes instead of one contiguous record write:
+
+- **Row store**, update `amount` on one order: locate the record, rewrite in place. One write.
+- **Column store**, same update: fifty separate writes, one per column file.
+
+That single fact is why nobody runs their checkout on Snowflake, and why the warehouse is fed by batch loads rather than the application's live transaction stream. Columnar is hostile to high-frequency single-record mutation by the same construction that makes it friendly to wide scans. The trait that makes reads cheap makes writes expensive, and you do not get to keep one and drop the other.
+
+So the OLTP-versus-OLAP divide is forced, not a naming convention somebody imposed. Transactional work is a flood of small read-modify-write operations on individual records, exactly what the row layout is cheap at. Analytical work is a trickle of enormous scans across few columns, exactly the reverse. Two workloads with opposite write-to-scan ratios get two storage layouts, and the layout, not the SQL dialect, makes each one fit. The axis is also orthogonal to SQL-versus-NoSQL; plenty of NoSQL engines reuse columnar and log-structured techniques wholesale.
+
+## The misconception worth killing: you cannot just fake it
+
+Here is the move every clever engineer reaches for once. "Fine, I keep my row store and just split each column into its own narrow table, vertically partition it, and now I have columns." Reasonable hypothesis. Also measured, and measured to fail.
+
+Abadi, Madden, and Hachem ran exactly this in their 2008 SIGMOD paper, on the Star Schema Benchmark at scale factor 10, a 60-million-row `lineorder` fact table. The results convert the argument into a number:
+
+| Configuration | Avg query time |
+| --- | --- |
+| Real column store (C-Store) | ~4 s |
+| Row store, base | ~25.7 s |
+| Row store, best-case hand-tuned materialized views | 10.2 s |
+| Row store faking columns via vertical partitioning | 79.9 s |
+| Row store, index-only plans | 221.2 s |
+
+Read the bottom two rows again. The two strategies for emulating a column store inside a row store did not land near the real thing. They landed *worse than the row store just running normally*. Faking columns made an analytics query roughly twenty times slower than doing it properly, and the index-only attempt was over fifty times slower.
+
+Why does the emulation collapse? Tuple overhead. To split a column out and later rejoin it to its siblings, every value has to travel with a record id. The storage numbers from the same benchmark show the damage: a single integer column in the true column store is 240 MB, four bytes times sixty million rows, the payload and nothing else. The same column emulated by vertical partitioning is 0.7 to 1.1 GB, because each four-byte value now drags roughly twelve bytes of bookkeeping (tuple header plus record id) alongside it. You have tripled the bytes before reading one, then you pay again to position-join the columns back into rows at query time.
+
+The one sentence to take from this section: **the advantage is architectural, not configurable.** A column store is a different machine from the storage format up through the execution engine, and you cannot reach it by tuning a row store. Same lesson as [LSM-tree vs B-tree](/blog/lsm-tree-vs-btree): the on-disk structure is the design, and you cannot bolt one engine's structure onto the other and inherit its behavior.
+
+And reading fewer columns is only the first win. The real column store at 4 seconds beat even the row store's hand-tuned materialized views at 10.2 seconds, and those views read the *same minimal columns*. The extra 2.5x came from compression-operated-on-directly and vectorized execution, the CPU and cache effects, not the I/O.
+
+## How columnar actually ingests: the two-store trick
+
+If writing one record means fifty scattered writes, how does any column store accept data at a reasonable rate? It does not write in place. It defers.
+
+The pattern keeps getting reinvented under new names because it keeps being right. A **write-optimized store** (in memory, or row-shaped, cheap to append to) absorbs incoming writes. A **read-optimized store** holds the big compressed columnar data. A background process periodically folds the write store into the read store, doing the expensive columnar encoding in bulk, off the hot path. You have seen this shape before:
+
+- **C-Store (2005)** named it the Writable Store, the Read-optimized Store, and a Tuple Mover between them.
+- **Vertica**, C-Store's commercial descendant, shipped it as WOS and ROS plus a Tuple Mover, and made all the maintenance online.
+- **ClickHouse** does it as MergeTree: each insert becomes a small immutable part, and background merges compact parts into larger, better-compressed ones.
+
+If that progression feels familiar, it should. It is structurally an LSM tree: buffer writes cheaply, flush in batches, compact in the background. The same idea sits under write-heavy [replication](/blog/replication-strategies) pipelines and under the log-structured engines in [LSM-tree vs B-tree](/blog/lsm-tree-vs-btree). The reusable line: **columnar systems are write-deferring, not write-incapable.** Updates work; they are batched and slightly behind, which is the right trade for a system whose job is analytics rather than serving a checkout in 40 milliseconds.
+
+## The modern reality is hybrid, not pure
+
+Pure row versus pure column is a teaching abstraction. Ship a real warehouse and you land in the middle, on purpose.
+
+Storing one column as a single colossal file (the classic C-Store mental model) makes whole-table operations awkward and parallelism coarse. So real systems chunk first: split the table into large blocks of rows, then store columnar *within* each block. This is the **PAX** layout, Partition Attributes Across, and once you see it you see it everywhere:
+
+- **Apache Parquet**, the open on-disk format under most lakehouses, is file -> row groups -> one column chunk per column per row group -> pages, where the page is the unit of encoding and compression (`PLAIN`, `RLE`, `DELTA_BINARY_PACKED`, `RLE_DICTIONARY`; Snappy/ZSTD/LZ4 codecs). Note what it is not: a *file format*, not an engine. It supplies the layout; Spark, DuckDB, Trino, and ClickHouse supply the vectorized execution.
+- **Snowflake** stores data in micro-partitions of 50 to 500 MB uncompressed, columnar inside each one.
+- **ClickHouse** keeps one `.bin` file per column with LZ4, and a *sparse* primary index with one entry per 8192-row granule rather than per row.
+- **Redshift** uses 1 MB column blocks.
+
+Hybrid blocking matters because of one optimization that pays for itself before any clever encoding does: **min/max pruning**, also called zone maps or data skipping. Stash the min and max value of each block in cheap metadata, and a query with `WHERE date >= '2026-06-01'` reads the metadata first and skips every block whose max date is in May without touching a byte of them. Snowflake prunes whole micro-partitions this way, Redshift uses zone maps, ClickHouse skips granules via its sparse index, Parquet carries per-column-chunk statistics. Same idea, four products.
+
+This is also why **clustering keys exist**. Pruning only helps when the values you filter on are physically clustered, because a block with a wide min/max range cannot be skipped. So sort order does double duty, making data both more compressible and more skippable. The cheap 80% of analytics performance is reading less data, and pruning is how you read less without indexing every row.
+
+## The frontier that ate JSON: columnar for nested data
+
+Flat relational columns were solved by 2005. Google's data was not flat; it was deeply nested Protocol Buffers, records with repeated and optional fields several levels deep. Lay a nested record into flat columns naively and you lose the structure: which values belonged to which sub-record, which optional fields were present versus absent.
+
+Dremel (Google, VLDB 2010) solved it with two small integers stored next to each leaf value, a **repetition level** and a **definition level**, that losslessly encode where in the nested structure a value sat, so a tree-shaped record can be shredded into flat columns and reassembled perfectly. That encoding is exactly what **Parquet inherited** as its `r` and `d` levels. It is the bridge from columnar relational tables to columnar JSON.
+
+The Dremel numbers show the two wins stacking. Same word-count query over a table with 85 billion rows and 87 TB:
+
+- MapReduce reading it **record-oriented**: about 87 TB scanned, runs in *hours*.
+- MapReduce reading it **columnar**: about 0.5 TB scanned, runs in *minutes*. An order of magnitude from the layout change alone.
+- **Dremel** (columnar plus a multi-level serving tree): *seconds*. Another order of magnitude, this time from the execution model.
+
+Hours to minutes from storage, minutes to seconds from execution, with 99% of Dremel's tablets finishing in under a second each. That is storage-and-engine co-design at petabyte scale. The lineage to remember is C-Store (flat columnar) -> Dremel (nested columnar) -> Parquet (nested columnar on disk) -> Arrow (nested columnar in memory, so engines hand each other vectorized batches with no serialization). That four-step chain is most of the last twenty years of analytical storage.
+
+## The honest caveats, because columnar is not magic
+
+A senior treatment names where this stops working, or it is just enthusiasm.
+
+**There is a read crossover.** Columnar wins because it reads few columns, so read many and the advantage inverts: reassembling a row from separate column files costs more the more columns you touch. Dremel measured the crossover at roughly dozens of fields; past that, row-wise overtakes columnar. `SELECT *`, point lookups by primary key, and anything needing the whole wide row all favor rows. Columnar is a bet that your queries are narrow, which most analytical queries are, but it is not a bet that holds for every query.
+
+**Compression and late materialization do most of the heavy lifting, and you can lose them.** When Abadi's group removed each optimization from C-Store one at a time, the damage was uneven: compression worth up to an order of magnitude (much less on unsorted or high-cardinality data), **late materialization** about 3x, block iteration and the invisible join roughly 1.5x each. The blunt finding: a column store stripped of compression and late materialization "does not dramatically outperform a well-optimized row store." The optimizations the layout *enables* are where the speed lives, and a naive implementation forfeits them. Late materialization, staying in compressed column-land as deep into the query plan as possible and gluing rows back together only at the end, is a real dial you can get wrong; materialize early and you throw away compression and vectorization mid-query.
+
+**Denormalization stops being the reflex.** In a row-store warehouse the standard move is to pre-join everything into one wide denormalized table because joins are expensive. Column stores have a native technique, the **invisible join**, that rewrites star-schema joins into predicates over the fact table's foreign-key columns plus position lookups, executing the join while staying columnar. It performs as well as or better than reading a pre-denormalized table, so the cost and complexity of denormalizing largely evaporates. Vertica made a related correction: it inherited C-Store's join indexes and then *dropped* them, because "the costs of using join indices far outweighed their benefits," requiring instead a super-projection containing every column. Research-to-production rarely survives intact.
+
+**HTAP is an open tradeoff, not a solved problem.** The wish is one system great at both `UPDATE one order` and `AVG over a billion orders`. No single layout is optimal for both, so hybrid transactional-analytical systems *manage* the tension rather than dissolving it: keep a row-shaped delta store for writes and a columnar base for scans, and you pay double on storage and write work and inherit a consistency problem between them. HTAP is choosing which costs to carry, not a free lunch where the conflict disappears. It is the same shape as the consistency tradeoffs in [distributed transactions and sagas](/blog/distributed-transactions-sagas): you decide which guarantee to relax, not escape the need to choose.
+
+## Where each engine lives, and why its layout is the right call
+
+The map falls out of everything above. Each system sits where its workload's write-to-scan ratio puts it.
+
+| System | Layout | Why it sits there |
+| --- | --- | --- |
+| PostgreSQL, MySQL/InnoDB | Row (NSM) | Heaps and B-trees of whole records, built to fetch and update one order cheaply. Write-cheap, point-lookup-cheap. |
+| Amazon Redshift | Column (MPP) | 1 MB column blocks plus zone maps; mainstreamed columnar MPP warehousing. |
+| Snowflake | Column (hybrid/PAX) | 50 to 500 MB columnar micro-partitions plus pruning and auto-clustering, storage separated from compute. |
+| ClickHouse | Column (MergeTree) | One `.bin` per column, LZ4, a sparse 8192-row-granule index, background merges. Real-time OLAP. |
+| Apache Parquet | Column (file format) | Open on-disk columnar layout under the lakehouse. Not an engine; it supplies the format, others bring the execution. |
+| Vertica | Column (projections) | The direct C-Store commercialization: WOS/ROS, projections, the super-projection requirement. |
+
+There is no winner in this table, only a workload axis and a layout that is correct for each point on it. A transactional database in column-major would be slow and wrong; an analytics warehouse in row-major would be slow and wrong. The discipline is reading the write-to-scan ratio first and letting it pick the layout, rather than reaching for whichever database is fashionable. The same instinct shows up in [Kafka vs queues](/blog/kafka-vs-queues) for moving data into these systems, in making a write idempotent so a batch load can retry safely ([idempotency and the exactly-once lie](/blog/idempotency-exactly-once)), and in deciding what to measure once the warehouse is live ([Metrics, Logs and Traces](/blog/observability-three-pillars)). A feed like [Design Twitter](/blog/design-twitter-feed) leans on row-shaped point lookups for the same reason a dashboard leans on columnar scans, and the analytical side of products I have built (the document pipeline in [IntelliFill](/case-study/intellifill), the reporting surfaces in [Audex](/case-study/audex), the usage analytics behind [NomadCrew](/case-study/nomadcrew) and [Aladeen](/case-study/aladeen)) all eventually meet this exact fork.
+
+So the next time someone calls a database an "analytics database," you can translate it precisely. The table is stored one column at a time, which means it compresses hard, executes in vectorized blocks, prunes whole partitions it never reads, and pays for all of it by being slow to update one record at a time. That is a single decision about byte order, followed all the way to its conclusions.
+
+## FAQ
+
+<FAQ />

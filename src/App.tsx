@@ -6,7 +6,7 @@ import { Navbar } from '@/components/Navbar/Navbar';
 import { Hero } from '@/components/Hero/Hero';
 import { Skills } from '@/sections/Skills';
 import { Experience } from '@/sections/Experience';
-import { CaseStudyTeaser } from '@/sections/CaseStudyTeaser';
+import { CaseStudies } from '@/sections/CaseStudies';
 import Projects from '@/sections/Projects';
 import Blogs from '@/sections/Blogs';
 import { Contact } from '@/sections/Contact';
@@ -25,7 +25,7 @@ export default function App() {
         <Hero />
         <Experience />
         <Skills />
-        <CaseStudyTeaser />
+        <CaseStudies />
         <Projects />
         <Blogs blogData={blogSection} />
         <Contact />

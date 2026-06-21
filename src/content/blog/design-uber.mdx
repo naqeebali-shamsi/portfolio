@@ -1,0 +1,128 @@
+export const meta = {
+  slug: 'design-uber',
+  title: 'Design Uber: Dispatch, Geospatial Indexing, and ETA',
+  description:
+    'Matching riders to drivers at city scale: why a B-tree on lat/long fails, how hexagonal indexing fixes it, why dispatch ranks on road ETA, and where the writes go.',
+  headline: 'Design Uber: Dispatch, Geospatial Indexing, and ETA',
+  deck: 'Finding the nearest driver is a geometry problem hiding a database problem hiding a streaming problem, and the naive answer is wrong at all three layers.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['system-design', 'geospatial', 'h3', 'uber', 'distributed-systems', 'real-time'],
+  faq: [
+    {
+      q: 'Why can\'t you just store driver locations in Postgres with an index on (latitude, longitude)?',
+      a: 'A B-tree index imposes a total order on one dimension at a time. A composite index on (latitude, longitude) orders rows by latitude first, so a "within 2 km of me" query becomes a range scan on latitude and a full scan on longitude inside that band. It cannot prune both axes at once. PostGIS handles geo queries because it uses a GiST/R-tree, a bounding-box structure, not the B-tree. The standard fixes map 2-D space to a 1-D key that preserves locality (geohash, S2, H3) so a sorted structure can serve the query.',
+    },
+    {
+      q: 'Why does Uber use hexagons (H3) instead of squares?',
+      a: 'A hexagon has only one distance between its center and any neighbor, versus two distances for squares and three for triangles. That single neighbor distance makes "all cells within k steps" a clean circular approximation, which is exactly the "drivers near me" primitive. Hexagons also minimize the quantization error of cars moving continuously across a city. The cost is that hexagons cannot perfectly nest, so H3\'s hierarchy is approximate, and tiling a sphere forces exactly 12 pentagons, placed over ocean.',
+    },
+    {
+      q: 'Why rank candidate drivers by ETA instead of straight-line distance?',
+      a: 'Straight-line (haversine) distance ignores the road network. A driver 300 metres away across a river with no bridge has a large ETA despite being physically close. Matching ranks on road-network ETA so the offer reflects real arrival time. Production systems go further and consider drivers about to finish a nearby trip, because a soon-to-be-free driver can beat an idle but distant one on total wait.',
+    },
+    {
+      q: 'Does dispatch need strong consistency?',
+      a: 'No. Dispatch is deliberately an AP system. A driver location that is a few seconds stale is acceptable, but blocking the whole city to agree on exact state is not. Uber\'s sharding layer used SWIM gossip membership over a consistent hash ring, which is an availability-and-partition-tolerance choice. The hard consistency requirement is narrower: do not offer the same car to two riders, which is enforced by routing each cell to a single owner rather than by locking a global database.',
+    },
+    {
+      q: 'Where do the high-frequency driver location updates actually live?',
+      a: 'Not in the durable trip database. Drivers report position on a short cadence (Uber\'s 2015 design used every 4 seconds), which at city scale is a write firehose targeting roughly a million writes per second. Those live positions belong in an in-memory geo-index sharded by cell ID, such as Redis GEO or a custom equivalent, with the durable trip record kept as a separate, much lower-frequency write.',
+    },
+  ],
+}
+
+Open the Uber app, tap a pin on the map, and within a second a car you have never met is driving toward you. The interface makes it look like a lookup. It is not a lookup. Somewhere a system just answered "which of the cars moving around this city right now can reach this exact point soonest," and it answered while thousands of those cars were reporting new positions and thousands of other riders were asking the same question about overlapping patches of the same streets.
+
+That question is the whole problem, and it fractures into three as soon as you push on it. There is a geometry problem: efficiently finding points near a point. There is a database problem: absorbing a firehose of location writes without melting. And there is a modeling problem: "nearest" is the wrong target, because the thing a rider actually cares about is time, not distance. Get any one of the three wrong and the demo still works, because in a demo there is one rider and one car. Production is where the assumptions go to die.
+
+This piece walks the three layers in order, then assembles them. If you want the interview scaffolding that sits underneath any of these, [the system design interview framework](/blog/system-design-interview-framework) and [capacity estimation](/blog/capacity-estimation) are the prerequisites; here we go deep on the parts specific to moving cars.
+
+## The query that breaks the obvious index
+
+Start with the storage instinct everyone has: drivers are rows, each row has a latitude and a longitude, put an index on them and query a box around the rider. Reach for a B-tree and you will find it cannot do the job, and the reason is worth holding onto because it is the seed every spatial index grows from.
+
+A B-tree imposes a total order on one thing. A composite index on `(latitude, longitude)` sorts rows by latitude first, then breaks ties on longitude. So a query for "everything within 2 km of me" becomes a tidy range scan on latitude, and then, inside that latitude band, a full scan on longitude, because the index gives you no way to jump to the right longitudes within the band. You pruned one axis and walked the other. In the worst case, a thin latitude band stretching across a continent, that walk is most of the table.
+
+This is why "just use Postgres with a lat/long index" is the answer that gets a follow-up question in an interview. Postgres can absolutely do geo, but only because PostGIS swaps the B-tree for a GiST index, which is an R-tree underneath: a tree of nested bounding boxes that prunes both dimensions at once. The lesson generalizes past Postgres. Either your index understands two dimensions natively (R-tree, quadtree), or you change the data so a one-dimensional index can win.
+
+That second path is the clever one, and it powers most of what follows. Take 2-D space and map it to a single number such that points close together on the map usually get numbers close together. Now a plain sorted structure, a B-tree, a Redis sorted set, can serve "near me" as a range query, because the 1-D key smuggles 2-D proximity inside it. The trick has a name, a space-filling curve, and it is the hinge the entire field turns on.
+
+## Four ways to flatten a map
+
+There are four index families an interviewer expects you to be able to separate, and the differences are about which workload they were built to survive.
+
+**Geohash** interleaves the bits of latitude and longitude and Base32-encodes the result, so a shared prefix means spatial proximity: two points in the same rough area share a leading string. A 6-character geohash is about a 1.2 km by 0.6 km cell; 7 characters tightens it to roughly 150 m square. It is dead simple and trivially shardable, which is why it shows up in real systems. Redis encodes each longitude/latitude pair as a 52-bit geohash integer and stores it as the score in a sorted set, which is exactly how `GEOADD` and `GEOSEARCH` work under the hood. The catch is the boundary problem, which I will come back to, and cells that distort near the poles.
+
+**Quadtree** recursively splits space into four quadrants, and crucially it only subdivides where there is data, so dense areas grow a deeper tree and empty ocean stays shallow. That density-adaptivity is its whole pitch: it bends to skewed distributions, which is why Twitter historically used quadtrees for "near this point" queries. The cost is that it is a tree you have to maintain and rebalance, and a tree is harder to shard cleanly than a flat string.
+
+**S2**, from Google, projects the sphere onto a cube and runs a Hilbert space-filling curve over the faces, assigning every cell a 64-bit ID. The often-quoted line is that every square centimetre on earth fits in an int64. A `level` parameter sets granularity. This matters here directly: Uber's 2015 dispatch system, as presented by its then chief systems architect, sharded on S2 level-12 cells, each covering roughly 3.31 to 6.38 km².
+
+**H3**, Uber's own grid, is hexagonal and hierarchical, and it is the answer Uber moved to for marketplace work. Sixteen resolutions (0 through 15), 122 base cells, a 64-bit index, and an aperture of 7, meaning each finer resolution cell is about one-seventh the area of its parent. Resolution 7 is roughly a neighborhood, with an edge near 1.4 km; resolution 9 is roughly a city block, edge near 200 m. Those two are the natural granularities for "drivers near me" and for surge zones, which is not a coincidence.
+
+The unglamorous truth is that mixing resolutions inside one system is normal, not a smell. Pickup search might run at resolution 8 or 9, surge geofences at 7 or 8, cross-city analytics at 5 or 6. Resolution is a tuning knob you turn per use case, not a constant you pick once.
+
+## Why Uber bet on hexagons
+
+The single most-quoted sentence from the H3 announcement is the one to memorize, because it justifies the whole shape: hexagons have only one distance between a center point and its neighbors, compared to two distances for squares and three for triangles. A square has edge-neighbors that are closer than its corner-neighbors; a hexagon's six neighbors are all equidistant.
+
+Why does a senior engineer care about a geometry trivia fact? Because it makes the core query honest. "Drivers near me" becomes "all cells within grid distance k of my cell," H3's `kRing` (or grid disk) primitive, and with one uniform neighbor distance that ring of cells is a clean approximation of an actual circle. With squares your k-ring is a blocky diamond that over- or under-covers the radius depending on direction. There is a second payoff for this specific domain: cars move continuously, and snapping a continuously-moving point to a discrete cell introduces quantization error. Hexagons minimize that error and tile the globe with less area distortion than squares, which is the difference between a clean surge map and one with seams.
+
+Nothing is free. Hexagons cannot perfectly nest, so a child hexagon is not fully contained inside one parent, and H3's hierarchy is therefore approximate rather than exact. And you cannot tile a sphere with hexagons alone; the underlying icosahedron forces exactly 12 pentagons at every resolution. Those pentagons are the distortion scars, and Uber's answer is pragmatic: place them over ocean where almost nothing is ever indexed. A staff-grade point worth making out loud is that H3 is a bucketing and analysis layer, not a key-value store. H3 tells you which bucket a point falls in; you still need an actual store, in-memory and sharded by that bucket, to hold the points. Confusing the index with the database is the most common H3 mistake.
+
+## The boundary problem, and the query that fixes it
+
+Here is the failure that catches a shallow implementation. "Shared prefix means nearby" is true in the average case and false exactly where it hurts: at cell boundaries. Two points one metre apart, sitting on opposite sides of a cell edge, can share zero prefix and land in completely different cells. If your "drivers near me" query only looks inside the rider's containing cell, you will miss the closest driver in the world because they are parked just across the line.
+
+Every correct implementation queries the cell plus its neighbors, not the cell alone. This is the standard geohash "1 plus 8" query, the center cell and its eight surrounding cells, and it is exactly what Redis `GEOSEARCH` does: it computes the bounding box, checks the center cell and its eight neighbors, and discards any candidate outside the true radius. In H3 the same idea is the `kRing`: pull cells within grid distance k, gather every driver in them, then filter by precise distance or ETA. The neighbor query is not an optimization. It is the difference between a correct answer and a confidently wrong one.
+
+## Absorbing the location firehose
+
+Now the database problem, which is the one people under-weight. A driver reports position on a short cadence. Uber's 2015 design used every 4 seconds. Multiply that by the number of drivers in a large market, then across markets, and you are staring at a stated design target of a million writes per second of nothing but "I am here now" updates. Those numbers come from a 2015 talk, so treat them as the shape of the problem rather than today's internal figure, but the shape is the point: this is a write firehose, and it dwarfs the read side.
+
+You do not point a firehose at a disk-backed relational table. Live positions go in an in-memory geo-index, and the cell ID is the shard key. Writes for a given cell route to the process that owns that cell, with read replicas behind it, spread across hundreds of processes. This is the architectural shape Redis GEO gives you out of the box: a sorted set keyed by geohash, `O(log N)` per add or search. The "what would you actually build" answer at city scale is Redis GEO or PostGIS; the custom in-memory ring is what you graduate to when one node can no longer hold a hot market.
+
+The instinct to resist is storing live positions in the same durable database as trips. The 4-second firehose and the durable trip record have nothing in common except the word "driver." One is a high-frequency, lossy, in-memory stream where a stale value is fine; the other is a low-frequency, must-not-lose row. Conflating them means sizing your system of record for a write rate it has no business absorbing.
+
+Sharding by geography is what makes the read cheap, and it is where this connects to the broader toolkit. Routing a cell ID to a node is a [consistent hashing](/blog/consistent-hashing) problem: you want to add and remove nodes without reshuffling the entire keyspace. Uber's library for this, Ringpop, combined a consistent hash ring with SWIM gossip membership so nodes discover each other and detect failures without a central coordinator. It is deliberately an AP system. A driver's position being briefly stale across two nodes is acceptable; halting dispatch city-wide to reach agreement is not. The same availability-over-consistency reasoning runs through any high-write geo system, and the [distributed cache](/blog/distributed-cache) piece covers the partitioning and replication mechanics in depth.
+
+There is one resilience trick here that signals real seniority if you can name it. Uber periodically pushes an encrypted digest of trip state down to the driver's phone. On a datacenter failover, reconnecting drivers replay that digest, and trip state is reconstructed from the devices themselves rather than from a single database that just went dark. It treats live location and trip state as soft, recoverable data, which is the whole philosophy of an AP system made concrete.
+
+## Matching is not "find the closest car"
+
+The geometry layer hands you a set of candidate drivers near the rider. The naive next step is to sort them by distance and offer the closest. That is the wrong model on two counts, and the gap between them is where dispatch quality lives.
+
+First, distance is the wrong metric; ETA is the right one. A driver 300 metres away as the crow flies but across a river with no nearby bridge is, in arrival terms, far. So the funnel runs coarse-to-fine: the geospatial filter narrows the city to a handful of candidates, then each candidate gets a road-network ETA, then you sort by ETA, then you offer. Haversine distance is only good enough to pick candidates, never to rank them.
+
+Second, "available now" is too narrow a definition of available. The idea that separates Uber's dispatch from a textbook nearest-neighbor query is looking into the future: a driver currently finishing another trip two blocks away may reach the rider sooner than an idle driver across town, once you account for their projected free time plus the short drive. Restrict matching to idle cars and you leave the best option on the table constantly. The right framing is a short, batched assignment over a window, closer to a min-cost bipartite matching than to per-request greedy selection. Greedy is locally fine and globally poor, because grabbing the nearest car for the first rider can strand a second rider who that car was about to serve far better.
+
+Batching buys correctness too. Process requests one at a time and two riders can be offered the same car in the gap between decisions. Doing assignment over a short window, plus the geographic sharding that gives each cell a single owner, is partly how the double-dispatch race is prevented: there is one referee deciding who gets that car, not two processes racing. That single-owner-per-key pattern is the same shape that makes a [rate limiter](/blog/rate-limiter) correct under concurrency, and it is the consistency boundary that matters in an otherwise AP system. The dispatch loop also has to absorb declines and timeouts: a driver who ignores the offer kicks the request back into the funnel, which is why "make everything retryable, make everything killable" was a stated design tenet.
+
+## ETA is a base estimate plus a learned apology
+
+Ranking by ETA is only as good as the ETA, and producing it well is its own subsystem with two distinct jobs.
+
+The first job is routing: a shortest-path search over the road graph with live traffic as edge weights. The instinct is to precompute everything with contraction hierarchies, the technique that makes OSRM fast. Uber tried it and walked away, because preprocessing the world graph that way takes around 12 hours, and any change to an edge weight, which is to say any traffic update, means re-running it. Useless when traffic changes by the minute. Their routing engine instead partitions the graph into layers of small, largely independent cells, so a traffic change only forces a recompute of the affected cells rather than the planet. It uses A\* for short trips, which are the common case, and contracted graphs for long ones, and lands single-digit-millisecond responses at hundreds of thousands of ETA requests per second.
+
+The second job is admitting the router is systematically wrong. A pure graph search ignores real-world bias: it does not know this left turn is brutal at 5pm or that this pickup loop always takes longer than the map says. So Uber's DeepETA frames ETA as residual correction. The routing engine gives a base ETA; a neural network predicts the residual, the gap between real-world arrival and that base. The stated reason is telling: it is easier to absorb a new data source by updating the post-processing model than by refactoring the routing engine. The router stays a clean graph algorithm; the messy empirical corrections live in a model you can retrain.
+
+The constraint that shapes the model is latency. ETA sits in the hot path of every request, with a budget of a few milliseconds at most, which rules out a standard transformer whose self-attention costs O(K²d). Uber uses a linear transformer that approximates attention via the kernel trick at O(Kd²). The worked numbers from their own writeup make it concrete: with K=40 features and d=8, the quadratic form is 40²·8 = 12,800 operations and the linear form is 40·8² = 2,560. That gap is the difference between fitting the budget and blowing it. Two more details reward study. Continuous features are quantile-bucketized then embedded, because buckets beat raw continuous inputs here, and the loss is an asymmetric Huber loss, where one parameter deliberately makes underprediction more expensive than overprediction. That asymmetry is a business rule in disguise: telling a rider "2 minutes" when it is 6 erodes trust far more than saying "6" when it is 2, so the model is taught to rather overestimate than underestimate. Encoding "being late is worse than being early" directly into the loss function is the kind of decision that distinguishes a system that optimizes a metric from one that optimizes the product.
+
+## Surge is a streaming aggregation, not a lookup table
+
+The last piece closes the loop between supply and demand. Surge is not a static table of busy zones. It is a windowed streaming aggregation computed per hexagon: a pipeline reads rider and driver status and trip events, aggregates supply and demand inside each H3 cell over a time window, and emits a price multiplier per cell. Uber's real-time stack for this, described in their SIGMOD 2021 paper, is Kafka into Flink into Pinot, events to windowed compute to a serving store. H3 hexagons are the unit of measurement, which is why surge maps look like honeycombs.
+
+The economic job is to rebalance: raise the price in an under-supplied hexagon to pull nearby drivers toward it and to shed or defer the most price-sensitive demand, until the two sides come back into balance. The trap a staff engineer names is the feedback loop. Price on a raw real-time signal and you get oscillation: surge spikes, drivers swarm in, supply overshoots, surge collapses, drivers leave, surge spikes again. Damping it means time windows, smoothing, and forecasting against where demand is heading rather than only where it is now. The choice of streaming substrate underneath all this, log versus queue, is its own decision with real consequences, which [Kafka vs queues](/blog/kafka-vs-queues) unpacks; surge specifically wants the replayable, partition-ordered log so a recompute can re-read the window. The whole pipeline also leans on the same idempotency discipline as any event system, because trip events get redelivered, and [idempotency and the exactly-once lie](/blog/idempotency-exactly-once) is the reason a replayed event does not double-count supply.
+
+## Putting it together
+
+Trace one ride request through the assembled system and every layer earns its place. The rider's phone hits the API gateway, which asks the geo-index for candidates: convert the rider's location to a cell, pull the `kRing` of neighboring cells, gather every driver reporting from them. That set goes to dispatch, which scores each candidate by road-network ETA, folds in the soon-to-be-free drivers, runs a short batched assignment so no car is double-offered, and sends an offer. Behind all of it, the in-memory geo-index keeps absorbing 4-second position updates sharded by cell, the surge pipeline keeps recomputing per-hexagon multipliers off the event stream, and the trip, once accepted, becomes a durable record in a database that never had to touch the firehose.
+
+The through-line is that "nearest driver" was a trap at every layer. The index is not a B-tree because two dimensions will not prune in one order. The store is not your trip database because the write rate is a different universe. The ranking is not distance because riders buy time. And the price is not a lookup because supply and demand are a moving, self-influencing target. Each correct choice came from refusing the convenient default and asking which workload it actually had to survive.
+
+If real-time geography is the thread you want to pull, two more pieces sit close. [Design Twitter](/blog/design-twitter-feed) shares the fan-out-versus-fan-in tension that surge's read path echoes, and on the building side, [NomadCrew](/case-study/nomadcrew) is real-time location sharing for travel groups, which is the same "where is everyone, right now, cheaply" problem at a friendlier scale. The sibling builds [Audex](/case-study/audex) and [IntelliFill](/case-study/intellifill) lean on adjacent streaming and ML-serving ideas. And for the cross-cutting concern that quietly governs all of this, [latency and the tail](/blog/latency-throughput-tail) is the lens that explains why the ETA model fights for single-digit milliseconds in the first place.
+
+## FAQ
+
+<FAQ />

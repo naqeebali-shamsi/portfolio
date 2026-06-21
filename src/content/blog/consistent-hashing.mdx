@@ -1,0 +1,165 @@
+export const meta = {
+  slug: 'consistent-hashing',
+  title: 'Consistent Hashing and the Art of Rebalancing',
+  description:
+    'Adding one server to a hash-mod-N cluster moves almost every key. Consistent hashing moves a 1/n fraction. How the ring works, where it fails, and the fixes.',
+  headline: 'Consistent Hashing and the Art of Rebalancing',
+  deck: 'The ring is not the answer. It is the first move in a design space, and knowing what the ring still gets wrong is the whole skill.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '15 min',
+  tags: ['consistent-hashing', 'distributed-systems', 'sharding', 'load-balancing', 'dynamo', 'system-design'],
+  faq: [
+    {
+      q: 'Why does hash-mod-N break when you add a server?',
+      a: 'Because the bucket for a key is h(key) mod N, and changing N changes the modulus for every key at once. Going from N to N+1 servers, a key keeps its bucket only when h(key) mod N equals h(key) mod (N+1), which happens for roughly a 1/(N+1) fraction of keys. So about N/(N+1) of all keys move, which approaches 100 percent as the cluster grows. At 99 servers going to 100, about 99 percent of keys relocate, and each relocation is a network data movement between machines, not a cheap in-memory shuffle.',
+    },
+    {
+      q: 'How does consistent hashing reduce the number of keys that move?',
+      a: 'It hashes both keys and servers onto the same circular space, and a key is owned by the first server found walking clockwise. Adding a server only steals the one arc between it and its clockwise neighbor, so only a 1/n fraction of keys move and they come from a single neighbor, while everything else stays put. That 1/n is the information-theoretic optimum for a balanced remap, so consistent hashing is doing the least work any correct scheme could do.',
+    },
+    {
+      q: 'What problem do virtual nodes solve?',
+      a: 'Three problems at once. A single ring point per server gives uneven load, because random placement leaves the busiest server with on the order of log n times its fair share. Virtual nodes give each server many ring points, which tightens the spread toward even. They also let you give a bigger machine proportionally more points, so heterogeneous hardware works. And when a server dies, its load disperses across many machines instead of dumping entirely onto one clockwise neighbor.',
+    },
+    {
+      q: 'Does even keyspace distribution mean even load?',
+      a: 'No. The ring balances how the keyspace is split, not how requests or data actually land. One hot key, a celebrity account or a viral video chunk, saturates its owning server no matter how even the ring is, because every request for that key goes to one place. Fixing that needs a different tool, consistent hashing with bounded loads, which caps each server at (1+epsilon) times the average and spills overflow to the next server with room.',
+    },
+    {
+      q: 'When would you not use a hash ring?',
+      a: 'When your constraints point at a different point in the design space. If you need near-perfect balance and can tolerate connection resets, Maglev hashing with a prime-sized lookup table beats the ring on evenness. If your buckets are numbered 0 to n-1 and you never remove a specific named node, jump consistent hash gives you O(1) memory and no ring to maintain. If n is small and you mostly want the top-k replicas for a key, rendezvous hashing is simpler. The ring wins when you need arbitrary add and remove of named nodes, replication, and heterogeneous capacity together.',
+    },
+  ],
+}
+
+Add one server to a cluster and you can move almost nothing, or you can move almost everything. The difference is one design decision made years before the server arrives, and most systems get it wrong the first time because the wrong way works perfectly until the day you scale.
+
+Here is the day. You have four cache shards, you route each key with `hash(key) % 4`, and traffic has grown enough that you need a fifth. You add it, change the code to `% 5`, deploy, and your cache hit rate falls off a cliff. Not by a little. Roughly eighty percent of your keys are now looked up on the wrong shard, every one of those lookups misses, and the misses stampede your database all at once. Nothing in the routing logic was wrong. The assumption underneath it was: that the number of shards would never change.
+
+This piece is about why that assumption is so expensive, the construction that fixes it, and the more interesting part that bootcamp explanations skip: where the fix still fails, and what a senior engineer reaches for at each failure. If you want the broader scaffolding this sits inside, [the system design interview framework](/blog/system-design-interview-framework) puts sharding in context, and you will want [capacity estimation](/blog/capacity-estimation) to know how many shards you even need before any of this matters.
+
+## The mod-N stampede, with the actual number
+
+Start with exactly why `% N` is a trap, because the magnitude is worse than people expect and the magnitude is the whole argument.
+
+A key `x` lives on shard `h(x) mod N`. Change `N` and you change the modulus for every key at once. A key keeps its shard only in the lucky case where `h(x) mod N` and `h(x) mod (N+1)` land on the same number, which happens for a fraction of about `1/(N+1)`. So the fraction that *moves* is `N/(N+1)`, marching toward 1 as the cluster grows.
+
+Put numbers on it. Four shards to five: a key stays only when `h % 4 == h % 5`, true for about one in five, so about four in five move, the eighty percent from the opening. Ninety-nine shards to a hundred: ninety-nine percent of every key relocates to add a single machine. The bigger the cluster, the closer adding one node comes to rehashing everything.
+
+Compare that against the floor. Going from `N` to `N+1` shards and insisting the result stay balanced, you must move *at least* enough keys to fill the new shard to its fair `1/(N+1)` share. That is the information-theoretic minimum for any correct balanced remap. So hash-mod-N is off from optimal by a factor of about `N`. At a hundred shards it does a hundred times more work than the problem requires.
+
+```
+   h(x) % 4              h(x) % 5
+   --------              --------
+   key A  -> shard 1     key A  -> shard 3   moved
+   key B  -> shard 2     key B  -> shard 2   stayed
+   key C  -> shard 0     key C  -> shard 4   moved
+   key D  -> shard 3     key D  -> shard 1   moved
+   ...                   ...
+   ~1 in 5 keys stays.  ~4 in 5 move.
+```
+
+And here is the operational sting that makes the count matter: each "moved" key is not a cheap table resize inside one process. It is a network data movement between machines, and on a cold destination a guaranteed cache miss hammering the origin. A rehash that looks like an arithmetic change in code is a fleet-wide data migration, the difference between a scaling event you schedule and one that pages you.
+
+## The ring
+
+The fix is a small twist on the same hashing you already trust: stop hashing keys to a small range of bucket numbers, and start hashing both keys *and* servers onto one large circular space.
+
+Treat the hash output as a circle, `0` to `2^32 - 1`, where the largest value wraps back to the smallest. Hash every server's name to a point on that circle, and hash every key to a point on the same circle. A key is owned by the first server you hit walking clockwise from its position. That rule alone partitions the circle into arcs, one per server, each owning every key in the arc ending at its point.
+
+This is the mechanism Amazon's Dynamo paper describes, behind Cassandra's token ring, behind the ketama library memcached clients have used since 2007, and behind the consistent-hashing load balancers in front of large CDNs. The shape is battle-tested because two properties fall out of it for free.
+
+The first is even expected load: by symmetry, with `n` servers each owning a random arc, the expected share of any one is exactly `1/n` of the keys, just the geometry of random points on a circle.
+
+The second is what makes it worth it: minimal movement. Add the `n`-th server and it drops onto one point and carves out one new arc, stealing keys only from the single neighbor whose arc it split. Everything outside that arc stays put. The fraction that relocates is about `1/n`, the optimum, and it comes from one place instead of everywhere.
+
+```
+            key K
+              |
+   ...  [S2]------[S4]  ...      add S3 between K and S4
+              ^
+              |
+   ...  [S2]--[S3]--[S4]  ...    only keys in (S2, S3] move
+                               everything else is untouched
+```
+
+Removing a server is the mirror image: its arc folds into its clockwise successor, nothing else disturbed. Ten nodes, add an eleventh, and about one key in eleven moves, all from the two neighbors it lands between. That is the entire promise of consistent hashing, and the reason it sits under so much infrastructure.
+
+One detail the shallow version drops, and the one an interviewer is listening for: how do you find the clockwise successor? You do not scan the ring. You keep the server points sorted, a balanced BST or a sorted array, and the successor query is a binary search, so lookup is `O(log V)` over `V` ring points. Cheap per lookup, but not free to maintain: every membership change mutates that structure and propagates it to everyone, usually over a gossip protocol. Hold onto that cost. It comes back when virtual nodes multiply `V`.
+
+## What the ring still gets wrong, in order
+
+Here is where most explanations stop and the actual engineering starts. The ring above has four real weaknesses, and the mark of having run it in production is naming each one and the fix it demands. Take them in order, because the fixes stack.
+
+### Weakness one: even *expected* load is not even load
+
+"Each server owns `1/n` of the keys" is the average over all random placements, and any single placement is a lumpy roll of the dice. Drop `n` random points on a circle and the busiest arc is on the order of `log n / n`, not `1/n`. So with a single point per server, your most-loaded server can carry something like `O(log n)` times its fair share. At ten nodes that is roughly two to three times the average sitting on one machine, a hot server while its neighbors idle, baked in by the geometry with nothing wrong in your code.
+
+The fix is virtual nodes. Instead of one point per server, give each one many, say `k` points, by hashing `server#1` through `server#k`. Now `n` servers scatter `n·k` points around the circle, and the law of large numbers does its work: the more points each server has, the closer its total arc length converges to `1/n`. Set `k` on the order of `log n` and the worst-case imbalance collapses from `O(log n)` to a small constant. ketama uses 160 points per server. Cassandra historically used 256 tokens per node. The numbers differ; the principle is identical.
+
+### Weakness two: the ring is blind to your hardware
+
+The basic ring assumes every server is interchangeable. Real fleets are not, and equal arcs overload the 16 GB box while the 64 GB box coasts. Virtual nodes fix this almost for free: arc length is proportional to point count, so capacity becomes a dial. Give the big box four times as many virtual nodes and it owns four times the keyspace. Heterogeneous hardware stops being a special case and becomes a parameter, the one of Dynamo's three motivations people forget because it never bites until your fleet is mixed.
+
+### Weakness three: failure dumps onto one neighbor
+
+The third payoff is about what happens when a node dies, not when one joins. With a single point per server, a failed node's entire arc folds onto its one clockwise successor, which instantly inherits the dead node's full load on top of its own. The fastest way to turn one failure into two, the original 1997 hot-spot problem resurfacing as an availability bug.
+
+With virtual nodes, a dead server's many arcs are scattered around the ring, so its load disperses thinly across many survivors instead of crushing one. Failure becomes a gentle rise everywhere rather than a spike in one place. Three jobs from one trick, which is why calling virtual nodes "a balance trick" undersells them by two-thirds.
+
+There is a tradeoff a senior answer names rather than selling virtual nodes as pure upside. More points means a bigger ring to store and gossip, slower ring rebuilds on membership change, wider failure-domain coupling, and slower range scans because any contiguous key range is now smeared across more points. This is exactly why modern Cassandra moved *down* from 256 tokens toward 8 to 16 with a smarter allocation algorithm, trading a little imbalance for a far cheaper ring to operate. "More virtual nodes is strictly better" is the misconception; the sweet spot is workload-dependent.
+
+### Weakness four: replication quietly breaks on the ring
+
+Consistent hashing places the *primary* owner of a key. Real stores keep `N` replicas, and the natural move is to walk clockwise and put the key on the next `N` servers. Dynamo calls this ordered set the key's preference list; the coordinator that owns the key's arc drives replication to its successors.
+
+Now the bug virtual nodes introduce, one of the best interview nuances in the topic. Once each physical server has many ring points, the next `N` *points* clockwise are not guaranteed to be `N` *distinct physical machines*, because two virtual nodes of the same box can sit adjacent. So a naive "next N points" can place two of your three replicas on the same server, silently dropping your real replication factor from three to two with no error firing. One disk failure then takes out two replicas at once, and the fault tolerance you thought you had was fiction.
+
+Dynamo's fix is what you would hope: when building the preference list, skip ring positions belonging to a machine already in the list, so it always holds `N` distinct boxes. `N` on the ring must equal `N` real machines, and getting there means deliberately skipping duplicates. If you have read [event-driven RBAC](/blog/event-driven-rbac) you have seen the theme, that correctness lives in a detail the happy path never exercises. This is that, for replicas.
+
+## The hot key, where the ring can't help at all
+
+Everything above tightens how evenly the *keyspace* is divided. None of it touches the failure that takes down real systems most often: one key far hotter than the rest. The ring can be perfectly balanced, every server owning an identical slice, and a single celebrity account or one viral video segment still melts the server that owns it while the other seven idle. Keyspace balance, request balance, and data-size balance are three different distributions, and the ring only addresses the first. With `n` balls in `n` bins, even ideal consistent hashing leaves the hottest bin with about `log n / log log n` balls, and a genuinely hot key blows past that. Same tail story as [latency and the tail](/blog/latency-throughput-tail): the average looks fine while one outlier owns the pain.
+
+The tool is consistent hashing with bounded loads, the 2018 refinement out of Google, and the idea is direct. Give every server a hard capacity, `(1+epsilon)` times the current average load. Route each key the usual clockwise way, but if the server it lands on is already at capacity, do not pile on. Keep walking clockwise to the first server with room. Overflow spills to neighbors instead of crushing the owner.
+
+The guarantee that makes it practical: every insertion or removal moves only `O(1/epsilon^2)` other keys, independent of how many keys or servers exist. So the bounding is cheap in churn, and `epsilon` is the dial. Small `epsilon` means tight balance but more churn and more clockwise probing per request, since move cost scales as `1/epsilon^2`. Large `epsilon` means looser balance but barely any overhead; for capacity factors at or above 2 the extra movement drops to `1 + O(log c / c)`, essentially negligible. The senior call is choosing `epsilon` against your actual hotness: tighten it when load is spiky, loosen it when it is smooth.
+
+This is not theory. HAProxy ships it as `hash-balance-factor`, where 150 means no server may exceed 1.5 times the average, recommended range 125 to 200, docs citing the paper directly. Google runs it in Cloud Pub/Sub. Vimeo put it in HAProxy in front of roughly a billion video-segment requests a day and cut cache bandwidth by a factor of almost eight. That is what "the ring balances keyspace, not load" costs you when you ignore it.
+
+One honest caveat. Bounded loads needs a live read of each server's load and a way to tell whether it is "full." In a load balancer that signal is in-flight connections, clean and available; in a key-value store it is murkier, which is part of why CHWBL shows up in front of caches and proxies more than inside databases. It composes the way the dedup-plus-reconcile pattern does in [idempotent webhooks](/blog/idempotent-webhooks): each layer handles the failure the layer below cannot.
+
+## The ring is one point in a design space
+
+The last move separating a staff answer from a competent one is refusing to treat consistent hashing as a single algorithm. It is a *property*, minimal disruption plus reasonable balance, and the ring is one implementation. Knowing when *not* to reach for it is the real signal.
+
+**Rendezvous hashing**, also called highest random weight, predates the ring conceptually. For each key you compute `score(key, server)` for every server and send the key to the highest score; for replicas, take the top `k`. Minimal disruption, no ring to maintain, dead-simple replica selection, but lookup is `O(n)` because you score every server per key. Great when `n` is small, bad when lookups are hot and `n` is large.
+
+**Jump consistent hash**, from Lamping and Veach at Google, is a tiny marvel: `O(1)` memory, log-time, no ring at all. The catch is the shape of what it buckets. It maps keys to buckets `0` to `n-1` and only cleanly supports growing or shrinking that range from the end, so you cannot remove one named server from the middle. Perfect for "n interchangeable shards, scale by changing n," useless for "decommission server #7 while keeping the rest."
+
+**Maglev hashing**, Google's software load balancer, deliberately rejected the ring for the opposite priority. It builds a lookup table of prime size `M` (think 65537) where each backend fills slots using an `offset` and `skip` from its name, and backends take turns claiming open slots until every one is within a single slot of an equal share. The result is *near-perfect* balance, far better than the ring. The price: removing a backend disturbs at least `1/M` of the table, more connection churn than the ring causes. Google took that trade on purpose, because for their load balancer even distribution mattered more than perfect connection persistence. An explicit choice to give up the ring's best property for something they valued more.
+
+A senior decides by matching the tool to the binding constraint, not defaulting to the ring:
+
+| You need | Reach for | Why |
+| --- | --- | --- |
+| Arbitrary add/remove of named nodes, replication, heterogeneity | Ring plus virtual nodes | The only one that does all three together |
+| Near-perfect balance, can tolerate connection resets | Maglev | Beats the ring on evenness, accepts more churn |
+| `O(1)` memory, buckets are `0..n-1`, scale by changing `n` | Jump consistent hash | No ring to store, but cannot drop a named node |
+| Small `n`, mainly want top-k replicas, simplicity | Rendezvous / HRW | Trivial replica selection, `O(n)` lookup is fine when `n` is small |
+| Even keyspace but one hot key is melting a node | Bounded loads on top of the ring | Caps load per node, spills overflow clockwise |
+
+One note that ties back to the first section: every one of these depends on a hash that spreads *uniformly*, and cryptographic strength is beside the point. Dynamo used MD5, Cassandra uses Murmur3, and Cassandra abandoned its order-preserving partitioner precisely because ordered keys clustered into hot ranges. Distribution quality is the whole job, so pick one that scatters well and move on. For the consistency-model lens on how replica placement and failure behavior interact, [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) is the companion read, and the [NomadCrew](/case-study/nomadcrew), [Aladeen](/case-study/aladeen), [Mecanum](/case-study/mecanum), [Audex](/case-study/audex), and [IntelliFill](/case-study/intellifill) case studies show where these sharding choices landed in real services.
+
+This same ring is what lets a [distributed cache](/blog/distributed-cache) scale horizontally without a coordinator, which is why that post leans on everything here, and it sits quietly under a [URL shortener](/blog/url-shortener) sharding its key-to-URL map and a [distributed rate limiter](/blog/rate-limiter) pinning each client's counter to a stable node. Caching runs through all three.
+
+## The honest landing
+
+Consistent hashing does not make rebalancing free. It makes it *bounded*: one node's worth of keys move when one node changes, instead of all of them, and that single property is the difference between a scaling event you schedule on a Tuesday and one that wakes you at 2 a.m. with a cold-cache stampede.
+
+But the ring is the beginning, not the answer. On its own it gives uneven load, ignores your hardware, dumps failures onto one neighbor, and quietly under-replicates the moment you add virtual nodes. Virtual nodes fix the first three and create the fourth, which the preference-list skip resolves, and none of it touches a hot key, which is what bounded loads is for. The senior move is not memorizing the ring. It is holding the whole stack in your head, knowing which weakness bites in which workload, and reaching for the specific fix each one demands, right up to leaving the ring behind entirely when that is the call.
+
+## FAQ
+
+<FAQ />

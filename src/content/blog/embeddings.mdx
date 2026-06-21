@@ -1,0 +1,142 @@
+export const meta = {
+  slug: 'embeddings',
+  title: 'How Embeddings Work: Turning Meaning Into Vectors',
+  description:
+    "An embedding is a learned coordinate system with a contract: the inputs it was trained on, the distance it optimizes, and the operational debts you take on by depending on it.",
+  headline: 'How Embeddings Work: Turning Meaning Into Vectors',
+  deck: 'An embedding does not store meaning. It stores a geometry of trained similarity, and the difference is the whole engineering problem.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['embeddings', 'vector-search', 'machine-learning', 'rag', 'semantic-search', 'system-design'],
+  faq: [
+    {
+      q: 'What is an embedding, precisely?',
+      a: "An embedding is a learned function that maps an object (a word, a sentence, an image, a user, a product) to a vector of a few hundred to a few thousand floating-point numbers, trained so that distance in that space encodes a chosen notion of similarity. The key word is learned: nobody hand-designs the dimensions. The model is fit on pairs of things that should be close, and the geometry falls out of that training. There is no universal meaning baked in. The similarity is whatever the training pairs defined.",
+    },
+    {
+      q: 'Why is cosine similarity the default for comparing embeddings?',
+      a: "Because meaning lives in the direction a vector points, and magnitude is mostly a nuisance variable. Cosine similarity measures the angle between two vectors and ignores their length. Most production embeddings (OpenAI, Cohere) are normalized to length 1, and on unit-length vectors cosine similarity equals the plain dot product, which is faster, and cosine, dot product, and Euclidean distance all produce identical rankings. So the choice is about normalization convention and compute, not about which one finds better neighbors.",
+    },
+    {
+      q: 'Can I compare vectors produced by two different embedding models?',
+      a: "No. Each model defines its own learned coordinate system, so a cosine similarity computed between a vector from model A and a vector from model B is a perfectly valid number with no meaning behind it. The same hazard exists inside a single model: Cohere conditions encoding on an input_type tag, and mixing a search_query embedding with a search_document embedding from the wrong type maps them into different semantic spaces. If you change models or dimensions, you re-encode the entire corpus and rebuild the index. That is a migration, not a config flip.",
+    },
+    {
+      q: 'Does a higher-dimensional embedding mean a better embedding?',
+      a: "No. Quality comes from the training, not the width. Matryoshka Representation Learning packs information front-to-back so a vector can be truncated without retraining, and OpenAI's own numbers show a text-embedding-3-large vector shortened to 256 dimensions still beating the older ada-002 model at 1536. Extra dimensions cost memory and add latency to approximate-nearest-neighbor search. Pick the smallest width that holds your recall, then spend the savings on more candidates or a reranker.",
+    },
+    {
+      q: 'Does vector search return the exact nearest neighbors?',
+      a: "Almost never, by design. At any real scale you use an approximate-nearest-neighbor index such as HNSW, which trades a few points of recall for orders-of-magnitude speed. recall@k becomes a dial you tune against p99 latency and memory rather than a guarantee you are handed. Spotify's move from Annoy to a Voyager library built on hnswlib bought more than 10x the speed at equal recall and up to 4x less memory, which is exactly that tradeoff curve shifting. Treat recall as an SLO you choose.",
+    },
+  ],
+}
+
+A computer cannot compare two sentences. It can compare two numbers, and it can compare two lists of numbers very fast, but the sentences themselves are opaque to it. Everything interesting about working with language, images, or user behavior at scale comes down to one move: turning the thing you care about into a list of numbers where being close in the list means being similar in the world.
+
+That list of numbers is an embedding. The promise sounds almost too convenient, so it is worth saying the unglamorous version up front, because most of the engineering mistakes around embeddings come from believing the glamorous one.
+
+An embedding does not store the meaning of a sentence. It stores a position in a learned coordinate system, and that system was fit on examples of what should sit near what. Get the contract of that system wrong, the inputs it expects, the distance it was optimized for, the model version that produced it, and the geometry quietly stops meaning anything, while every line of your code keeps running without an error. This piece is about how the geometry gets built, why it works when it works, and the specific ways it fails silently when you depend on it without reading the contract.
+
+## What an embedding actually is
+
+Start with the cleanest authoritative definition. OpenAI's embeddings guide puts it plainly: an embedding is a vector, a list of floating-point numbers, and "the distance between two vectors measures their relatedness. Small distances suggest high relatedness and large distances suggest low relatedness." That is the entire interface. You hand an object to a model, you get back a point in some high-dimensional space, and proximity in that space is the only thing you are allowed to read off it.
+
+The dimension count is usually a few hundred to a few thousand. `text-embedding-3-small` returns 1536 numbers per input; `text-embedding-3-large` returns 3072. Cohere's `embed-english-v3.0` returns 1024, with a light variant at 384. None of those numbers are magic, and none of the individual dimensions are interpretable. Dimension 412 does not mean "formality" or "is about sports." The axes are an artifact of training, and meaning is distributed across all of them at once.
+
+The word doing all the work in the definition is **learned**. Nobody sits down and designs the function that turns "the bond market sold off" into 1536 specific floats. The function is fit, the same way any model is fit, on data. And the structure of that data determines what "close" ends up meaning. word2vec, the 2013 paper that made dense word vectors practical, learned its vectors purely from which words appear near which other words across a 1.6-billion-word corpus, in under a day of training. GloVe, the Stanford counterpoint a year later, factorized a giant word co-occurrence matrix and arrived at strikingly similar geometry from the opposite direction. Two different algorithms, one shared output contract: a dense vector whose neighbors are words that keep similar company.
+
+This is the first thing a shallow treatment hides. "Embeddings capture meaning" is a comforting sentence that leads you to trust the vector in situations it was never trained for. The honest version is narrower and far more useful: embeddings capture co-occurrence and whatever similarity the training pairs encoded, which is often an excellent proxy for meaning and occasionally a misleading one. Hold that distinction and the rest of the system-design decisions become obvious. Lose it and you will ship a search index that returns confident nonsense.
+
+## How the geometry gets built: the contrastive core
+
+If meaning is not designed into the dimensions, where does it come from? It comes from telling the model, millions of times, that two specific things should be near each other and two other things should be far apart. That training shape has a name, and understanding it is what separates "the model learns from lots of text" from actually knowing why your vectors behave the way they do.
+
+The shape is **contrastive learning**, and the cleanest way to picture it is a single training step. You have an anchor (a sentence, say). You have one positive, something that should be close to the anchor. And you have a pile of negatives, things that should be far from it. The model adjusts its weights to pull the anchor and the positive together and push the anchor and the negatives apart. Repeat across a huge number of anchors and the space organizes itself so that similar things cluster and dissimilar things spread out.
+
+The formal objective most modern embedding models train against is **InfoNCE**, introduced in the Contrastive Predictive Coding paper. Stated without ceremony: given an anchor and a set containing one positive plus many sampled negatives, maximize the score of the positive relative to all the negatives. It is derived from noise-contrastive estimation, and it has a clean information-theoretic reading, minimizing InfoNCE maximizes a lower bound on the mutual information between an anchor and its positive. The plain-English translation of that mouthful is worth keeping: the loss rewards the model for preserving exactly the information that distinguishes a related item from a random one, and throwing away the rest.
+
+You have already seen the earliest practical version of this idea even if you did not call it contrastive. word2vec's **negative sampling** works like this: for each real (word, context) pair that actually occurred in the corpus, sample a handful of fake contexts that did not, and train the model to tell the real pairing from the fakes. Same instinct, distinguish true neighbors from noise, just with a lighter objective suited to 2013 hardware.
+
+Two design choices inside this loop carry more weight than the loss function itself.
+
+The first is **how you construct the positive pair**, because that single decision defines what "similar" will mean in your finished space. Sentence-BERT, the 2019 paper that made sentence-level embeddings practical, used **siamese and triplet networks**: two identical encoders sharing one set of weights, trained so that paired sentences land near each other and can be "compared using cosine-similarity." SimCSE, the 2021 recipe that is almost suspiciously simple, makes a positive pair by feeding the same sentence through the encoder twice with different dropout masks, the model's own internal randomness becomes the augmentation, and everything else in the batch counts as a negative. For a recommender, the positive pair might be two items the same user clicked in one session. The mechanism is identical; only the definition of "should be close" changes, and that definition is your real design surface.
+
+The second is **hard negatives**, and this is where a senior treatment earns its keep. Random negatives are easy. Once the model can tell "the quarterly earnings beat estimates" from "the cat sat on the windowsill," random negatives teach it nothing more, because they are already far apart. The resolution of the space, its ability to make fine distinctions, comes from near-misses. Supervised SimCSE gets its gain by drawing positives and hard negatives from a natural-language-inference dataset: entailment pairs as positives, and crucially **contradiction pairs as hard negatives**, sentences that look topically similar but mean opposing things. Those force the model to draw sharp boundaries instead of lazy ones. The numbers make the point concrete: on the standard semantic-textual-similarity benchmark, BERT-base reaches 76.3 Spearman unsupervised and 81.6 supervised under SimCSE, and the jump is largely the hard negatives doing their work.
+
+## Anisotropy: why a raw language model gives bad vectors
+
+Here is a genuinely senior point that most write-ups skip, and it explains a failure you will eventually hit if you try to skip the contrastive step and embed text with a raw pretrained model.
+
+Take the token or sentence representations straight out of a pretrained language model, before any contrastive fine-tuning, and they are **anisotropic**. They collapse into a narrow cone in the vector space rather than spreading out across it. The practical consequence is brutal for similarity work: because every vector points in roughly the same general direction, almost everything looks similar to everything else. Cosine similarities are all crushed up near the high end, and the signal you need, this is closer than that, gets buried in a few decimal places of noise.
+
+Contrastive training is the fix, and SimCSE frames why through two properties a good space must have. **Alignment**: positives land close together. **Uniformity**: the vectors as a whole spread out evenly over the surface of the hypersphere instead of bunching in a cone. The push-and-pull objective pursues both at once, the pulling buys alignment, the pushing-apart of negatives buys uniformity, and the result is a space where cosine distance actually carries information. This is the real reason "just use a language model's hidden states as embeddings" disappoints in practice and a purpose-trained embedding model does not. The language model was never optimized to make its space uniform. The embedding model was.
+
+## Cosine, normalization, and the dot product
+
+Once you have a space, you have to measure distance in it, and the default measurement is **cosine similarity**: the cosine of the angle between two vectors, ranging from -1 to 1, where higher means more similar. The reason to prefer the angle over, say, raw Euclidean distance is the same insight from earlier. Meaning lives in direction. A vector's magnitude often reflects incidental things like text length or word frequency, and you usually want two passages that are about the same thing to count as similar even if one is three times longer. Comparing direction and ignoring length gives you exactly that.
+
+There is a piece of arithmetic here that pays for itself operationally. Cosine similarity is the dot product of two vectors divided by the product of their lengths. If both vectors are already normalized to length 1, the denominator is just 1, and cosine similarity collapses into a bare dot product, which is the single fastest operation a vector index can run. This is not a micro-optimization you reach for; it is built into the models. OpenAI normalizes its embeddings to length 1, and Cohere does the same, which is why both vendors note that on their vectors cosine similarity, dot product, and Euclidean distance all return identical rankings. The metric you pick changes the arithmetic and the compute, and changes nothing about which neighbors come back.
+
+That last fact kills a common confusion. People treat "should I use cosine or dot product or Euclidean" as a quality decision, agonizing over which finds better matches. On normalized vectors it is not a quality decision at all. It is a convention. Store unit vectors, let the index use a dot product, and move on to the decisions that actually matter.
+
+This is the layer where embeddings start to feel like systems work rather than machine learning, and it connects directly to [how LLMs work](/blog/how-llms-work) and the broader serving concerns in [LLM inference serving](/blog/llm-inference-serving). The vector is an artifact a model produces; everything downstream is storage, indexing, and retrieval engineering.
+
+## The number that justifies the entire pattern
+
+Why go to all this trouble instead of comparing text directly with a more powerful model? Because of a cost gap so large it is the whole business case.
+
+You could compare sentences with a BERT cross-encoder, a model that takes two pieces of text together and scores how related they are. It is accurate. It is also, for retrieval, ruinous. Sentence-BERT ran the math: to find the most similar pair among just 10,000 sentences with a cross-encoder requires about 50 million inferences, roughly 65 hours of compute. The cross-encoder has to look at every pair jointly, and the number of pairs explodes quadratically.
+
+Embeddings turn that quadratic problem into a linear one. Encode each of the 10,000 sentences once into a vector, an O(n) operation you do a single time, then compare vectors with cosine similarity. The same task drops from 65 hours to about 5 seconds. That is roughly a 46,000x gap, and it is the entire reason the embedding-plus-index pattern exists. You pay an upfront, parallelizable encoding cost so that every subsequent comparison is nearly free. A cross-encoder still wins on raw accuracy, which is why serious systems use embeddings to fetch a cheap shortlist and a cross-encoder to rerank it, but you could never run the cross-encoder over the whole corpus. The embedding is what makes the corpus reachable at all.
+
+## From vectors to a system: the retrieval stack
+
+A pile of vectors is not a search engine. The architecture that turns it into one looks like this. Encode your corpus once, offline, and load the resulting vectors into a **vector index**. When a query arrives, encode it the same way, then ask the index for the nearest vectors to the query vector. Those neighbors are your results.
+
+The catch hiding inside "ask the index for the nearest vectors" is that finding the exact nearest neighbors in high-dimensional space is itself expensive at scale. So production systems do not find the exact nearest neighbors. They use **approximate nearest neighbor** search, which trades a small, controllable amount of accuracy for enormous speed. The dominant index here is **HNSW**, a hierarchical navigable small-world graph that builds a multi-layer proximity graph, a sparse top layer for taking long hops across the space and dense lower layers for fine local search, so a query descends through the layers and reaches its neighborhood in sub-linear time. Its tradeoff knobs, the graph connectivity and the search-time effort, let you dial recall against latency and memory.
+
+The reframing that matters: **recall@k is a tunable, not a guarantee.** An approximate index might return 95 of the true top 100 neighbors, and whether that fifth-percentile miss matters is a decision you make against your latency budget, not a property handed to you. Spotify's engineering history is the cleanest production proof. They open-sourced Annoy, a tree-based index, back in 2013 and ran a decade of nearest-neighbor search in their recommender on it. When they moved to a new library, Voyager, built on hnswlib, they reported more than 10x the speed of Annoy at the same recall, up to 50% more accuracy at the same speed, and up to 4x less memory. Read that as the recall-latency-memory Pareto frontier moving, and notice that the index, not just the embedding model, decided whether their search was fast and cheap. The index is half the system, and it is the half a model card will never tell you about. This is exactly the territory of [vector databases](/blog/vector-databases), where the storage and indexing concerns get their own full treatment, much as [LSM-tree vs B-tree](/blog/lsm-tree-vs-btree) governs the read-write tradeoffs underneath a conventional store.
+
+## Query and document are not the same distribution
+
+A subtle decision sits at the boundary between query and corpus, and getting it wrong degrades recall without raising any alarm.
+
+When you search a knowledge base, you are usually matching a short query against long passages. A three-word question and a four-hundred-word document are not drawn from the same distribution, and pretending they are leaves accuracy on the table. This is **asymmetric search**, as opposed to symmetric search where the two sides are the same kind of thing (deduplicating one sentence against another, say). The fix is **task-conditioned encoding**. Cohere exposes an `input_type` parameter, `search_query`, `search_document`, `classification`, `clustering`, and it prepends different special tokens depending on which you pick, encoding a query and a passage differently on purpose so that the short thing and the long thing land in compatible places.
+
+That same parameter is also a trap, and it generalizes into the most important operational rule about embeddings. Cohere is explicit that if you embed a query and a document with mismatched input types, the vectors "will be mapped to different semantic spaces and become incompatible." Sit with that. A single model, used slightly wrong, produces vectors you cannot compare. The compatibility of two embeddings is not a property of the numbers. It is a property of the exact procedure that produced them.
+
+## The operational contract nobody reads
+
+Which brings us to the failures that do not look like failures, the ones that separate engineers who have run embeddings in production from those who have only called the API.
+
+**You cannot mix vectors from two different models.** Two models are two different learned coordinate systems. A cosine similarity between a vector from model A and a vector from model B is a real number that computes without error and means absolutely nothing. There is no shared origin, no shared axes, no shared notion of close. This is the number-one production gotcha, and it has teeth precisely because nothing throws. Your search just gets subtly worse and you spend a week blaming your data.
+
+**Re-embedding is a migration, not a config change.** The direct consequence of the above: the day you decide to upgrade your embedding model, or even change its dimension count, every vector you have already stored becomes incompatible with every new vector. You must re-encode the entire corpus and rebuild the index from scratch. For a large corpus that is a real project with real cost, scheduled and budgeted, sitting much closer to a database migration than to bumping a version string. Plan for it before you pick your first model, because you will eventually want a better one.
+
+**No single model is best, so benchmark on your data.** It is tempting to grab whatever sits on top of a leaderboard. But MTEB, the standard multi-task embedding benchmark, found that "no particular text embedding method dominates across all tasks." A model that tops retrieval can underperform on clustering, and either can crater on a specialized domain it never saw in training, legal text, medical notes, your internal jargon. When a model meets data unlike its training distribution, nothing errors. Recall just quietly degrades. The only defense is to evaluate candidate models on your own data and your own task, using the MTEB tooling as a starting point rather than reading the public ranking as gospel.
+
+**Dimension is an operational lever, not just a quality setting.** Here the news is good, because of **Matryoshka Representation Learning**. MRL trains the vector so that information is nested front-to-back, the first 256 numbers form a usable embedding on their own, the first 512 a better one, and so on out to the full width. OpenAI ships this through a `dimensions` parameter, and their own result is the headline: a `text-embedding-3-large` vector shortened to 256 dimensions still outperforms the older `ada-002` model at its full 1536. Read as an ops pattern rather than a compression trick, this lets you store the full vector once and serve a short prefix for cheap coarse recall, then pull the full-precision vector only to rerank the survivors. One model, a dial from accuracy to storage-and-speed, no retraining. It also disposes of the "more dimensions is better" instinct: a 256-dimensional learned space can beat a wider weaker one, because quality comes from the training, not the width.
+
+## What this unlocks
+
+Get the contract right and a short list of capabilities falls out, the six OpenAI names directly, search, clustering, recommendations, anomaly detection, diversity measurement, and classification, plus the two architectures that dominate current practice.
+
+**Retrieval-augmented generation.** A language model knows what was in its training data and nothing since, and it cannot cite a source it does not have. RAG, from the 2020 paper that named it, fixes this by pairing the model's parametric memory (its weights) with non-parametric memory (an embedding index of your documents). The query gets embedded, the index returns the most relevant chunks by vector similarity, and those chunks get fed to the generator so the answer is grounded in retrieved text rather than the model's fuzzy recollection. Embeddings are the retrieval half of that loop, and the full design pattern lives in [RAG systems](/blog/rag-system).
+
+**Recommendation candidate generation.** Represent every user and every item as a vector, and "find things this user might like" becomes "find items near this user's vector," an approximate-nearest-neighbor query. That is the retrieval layer feeding the kind of surfaces Spotify builds, with a ranking model downstream to order the shortlist. The full architecture, including how those embeddings get learned from interaction data, is the subject of [recommendation systems](/blog/recommendation-systems).
+
+The through-line in both is that the embedding does the cheap, wide, recall-oriented work, narrowing millions of candidates to a manageable few, and a heavier model does the expensive, narrow, precision-oriented work on what survives. That division of labor is a recurring shape in systems design, and it is worth recognizing as the same coarse-to-fine pattern you would draw in [the system design interview framework](/blog/system-design-interview-framework). When the cost of a deeper look scales badly, you put a cheap filter in front of it.
+
+## The honest landing
+
+The famous demo for embeddings is the vector arithmetic: take the vector for "king," subtract "man," add "woman," and the nearest vector is "queen." It is real and reproducible, a genuine linear regularity that word2vec surfaced, and it is the right intuition pump for the claim that direction in the space carries relational structure. It is also the single most overstated result in the field. It is brittle, it works cleanly on a curated handful of examples and wobbles on the rest, and it is not evidence that embeddings reason. Treat it as a picture of what the geometry can hold, never as a tool you would build on.
+
+And the same mechanism that makes that demo charming has a darker edge worth one honest paragraph. Because embeddings encode the co-occurrence statistics of a corpus, whatever social biases live in that corpus become geometry too. The exact arithmetic that lands "king minus man plus woman" on "queen" will, on other inputs, encode stereotypes that were latent in the text. There is no separate "bias dimension" to switch off. The bias is the same distributed structure as the meaning, learned the same way, and depending on embeddings means owning that.
+
+So here is the contract, plainly. An embedding is a learned coordinate system, not a vault of meaning. It has inputs it was trained for, a distance it was optimized for, and a model version that stamps it. Cosine on normalized vectors is the right default and a non-decision. The index, not just the model, decides whether your search is fast, and recall is a dial you own. You cannot mix vectors across models, re-embedding is a migration, dimension is a lever, and the only model worth trusting is the one you benchmarked on your own data. Hold the contract and embeddings are the highest-return primitive in applied machine learning, one cheap encode standing between you and a corpus you could never otherwise search. Forget that it is a contract, treat the vector as if it simply understood, and you will ship a system that fails without ever telling you it failed.
+
+## FAQ
+
+<FAQ />

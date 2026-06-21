@@ -1,0 +1,143 @@
+export const meta = {
+  slug: 'agentic-workflows',
+  title: 'How Agentic Workflows Are Designed: Plan, Act, Observe, and the Control Loop',
+  description:
+    'An agent is a control loop, not a magic box. How plan-act-observe is designed: edges, termination governors, persistence, and failures that decide reliability.',
+  headline: 'How Agentic Workflows Are Designed: Plan, Act, Observe, and the Control Loop',
+  deck: 'The model is one node inside a state machine, and the edges around it are where reliability is won or lost.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['agents', 'llm', 'langgraph', 'react', 'control-loop', 'system-design'],
+  faq: [
+    {
+      q: 'What is an agentic workflow, and how is it different from a normal LLM call?',
+      a: 'An agentic workflow is a control loop: the model proposes an action, the action runs against the real environment, the result feeds back, and a graph decides whether to continue or stop. A normal LLM call is one shot with no feedback. Anthropic draws the sharper line as workflows versus agents: workflows orchestrate LLMs through predefined code paths, while agents let the model dynamically direct its own process and tool usage. The design question is how much of that control you hand from the graph to the model.',
+    },
+    {
+      q: 'When should I use ReAct versus plan-and-execute versus reflection?',
+      a: 'They are points on a latency, cost, and horizon tradeoff curve, not interchangeable agent types. ReAct interleaves reason, act, observe and calls the model once per tool step, which is adaptive but myopic and expensive. Plan-and-execute front-loads a full plan, runs steps on cheaper executors, and replans only on failure, which wins on long-horizon coherence and cost. Reflection (Reflexion) is an outer retry loop that scores a trajectory, writes a verbal lesson into memory, and tries again, paid for with extra trials and a memory store. Reach for the least agentic pattern that the task allows.',
+    },
+    {
+      q: 'Why does my agent loop forever or burn through tokens?',
+      a: 'Usually because a termination condition is missing or a budget counter does not instrument every path through the loop. Hitting a recursion or step cap normally means the agent is stuck in a cycle with no progress, not that the task was hard. A real production runner ran a deterministic lint-fix-lint loop somewhere between 1,930 and 2,267 iterations under a budget cap, because the retry counter only incremented on the agentic path and the global governor never saw the deterministic loop. A governor that does not wrap the whole loop is not a governor.',
+    },
+    {
+      q: 'Does LangGraph checkpointing guarantee my agent resumes correctly after a crash?',
+      a: 'Checkpointing saves state. It does not guarantee completion or exactly-once side effects. A checkpointer reloads the last StateSnapshot keyed by thread_id and resumes at the next scheduled node, but if a node already called a paid API and the run replays it without deterministic replay and idempotency, you double-fire that call. True durable execution wants cached results for completed activities and exactly-once semantics. The honest framing is that the sync durability mode narrows the crash window but does not close the exactly-once gap.',
+    },
+    {
+      q: 'Can the model tell me when the task is done?',
+      a: 'Not reliably, and trusting it is the most dangerous assumption in the field. Hallucinated task completion is a named, measured failure mode: the agent emits the right format with the wrong content, or never commits the work at all. Termination has to be externally verifiable against ground truth, a checksum, a file diff, a check digit, an independent evaluator, rather than read from a success flag the model set. Verify completion, do not let the model self-certify it.',
+    },
+  ],
+}
+
+An agent is a control loop wearing a model for a face.
+
+Strip away the demos and the personality, and what you have is a small state machine: something proposes an action, the action runs against the real world, the result comes back, and a piece of code decides whether to go around again or stop. The model lives at exactly one node. Everything that decides whether the thing is reliable, the edges, the guards, the stopping conditions, the persistence, the budget, lives in the boring code around it. This is the inversion most people miss: they reach for a smarter model, when the fix is almost always in the loop.
+
+I learned this building two systems that are, underneath, the same shape. [IntelliFill](/case-study/intellifill) is a LangGraph extraction pipeline that writes passport numbers into legal forms, where a wrong digit bounces a real application. [Aladeen](/case-study/aladeen) is an observability layer for agent CLIs that, in its own dogfood runs, caught a loop spending tokens roughly two thousand times under a budget cap that should have stopped it at a handful. Both say the same thing: the quality of an agent is decided by what surrounds the model, and the surroundings are unglamorous on purpose.
+
+## The loop, defined honestly
+
+Anthropic's working definition is the one to internalize: an agent is **"LLMs using tools based on environmental feedback in a loop."** The model plans once the task is clear, then executes while **"gaining ground truth from the environment at each step (such as tool call results or code execution),"** pausing at checkpoints and stopping on a defined condition to keep control. That last clause does the heavy lifting. The loop earns no interest for repeating. It earns it for knowing when to stop.
+
+Underneath it is one atomic move, and the [ReAct paper](https://arxiv.org/abs/2210.03629) named it. The model interleaves a **Thought** (reason about the plan), an **Action** (call a tool), and an **Observation** (read the result back from the world). The paper's claim is that interleaving these **"overcomes issues of hallucination and error propagation prevalent in chain-of-thought reasoning,"** because every step is anchored to a real observation instead of the model's imagination. Reasoning tracks the plan; acting grounds it.
+
+Here is that on a real IntelliFill task, validating a passport.
+
+```
+Thought: I need the passport number; the MRZ encodes its own check digit.
+Action: validate_mrz(line2)                      # ACT
+Observation: check digit mismatch at index 9     # OBSERVE -> ground truth
+Thought: the visual field and the MRZ disagree; this needs a human.
+Action: flag_for_review(field="passport_number") # ACT
+```
+
+Read the last line. The loop does not terminate because the model declared victory. It terminates by **routing to a human**, because the ground truth, a check digit that does not match, said the cheerful answer was wrong. That distinction is the spine of everything below: termination is a decision made against reality, and it understands [how LLMs work](/blog/how-llms-work) well enough never to trust the model's own word for it.
+
+## The one axis that organizes the whole field
+
+Before patterns, place your system on a single axis. Anthropic draws it cleanly: **workflows** orchestrate "LLMs and tools through *predefined code paths*," while in **agents** "LLMs *dynamically direct their own processes* and tool usage."
+
+On the left, the graph holds control and the model just fills in steps; on the right, the model decides what happens next at runtime. Everything you build sits on this line, and the central design question of the whole topic is **how far right you are willing to go for a given task.**
+
+The default should embarrass you with how unagentic it is. Anthropic is blunt: **"optimizing single LLM calls with retrieval and in-context examples is usually enough,"** and agents "trade latency and cost for better task performance." More autonomy is a bill you pay in latency, money, and surface area for failure, and you only pay it when the task branches in ways you cannot predict at build time.
+
+Anthropic catalogs five workflow patterns in increasing autonomy, and most "agent" problems are one of them in disguise: **prompt chaining** (fixed sequence), **routing** (classify, then branch), **parallelization** (fan out and aggregate), **orchestrator-workers** (a central model decomposes and delegates subtasks *at runtime*, the first genuinely agentic pattern), and **evaluator-optimizer** (loop a generator against a critic, which is what Reflexion below extends with memory). The skill is recognizing which one your problem is, then refusing to climb past it.
+
+Aladeen makes the point directly: it **started life as an orchestrator** that drove agents, and got deliberately demoted to a read-only observer that never runs the agent at all. It walked *left* on the axis on purpose, because the orchestrator category was crowded and the observability the model needed did not require driving anything.
+
+## ReAct, plan-and-execute, reflection: three points on a tradeoff curve
+
+The most common junior mistake is listing these as interchangeable "agent types" off a menu. They are distinct points on a curve that trades latency, cost, and planning horizon, and a senior engineer chooses among them by naming which of those they are short on.
+
+**ReAct is reactive and myopic.** [LangChain's writeup](https://www.langchain.com/blog/planning-agents) states the two costs plainly: **"It requires an LLM call for each tool invocation,"** and **"the LLM only plans for 1 sub-problem at a time since it isn't forced to reason about the whole task."** So you pay a full model call per step, and the model never sees the shape of the journey. On a five-step research task, that is five-plus expensive calls, each short-sighted. What you buy for that price is adaptivity: ReAct shines when the plan genuinely cannot be known until you have seen the first few observations.
+
+**Plan-and-execute front-loads the reasoning.** A planner generates the full multi-step plan once, executors run the steps (often on a cheaper model), and a **replan** step decides whether to finish or revise. Same five-step task: one planner call, five steps on a cheap executor, a replan only on failure. You win on latency, cost, and long-horizon coherence, because the model committed to a whole plan instead of stumbling forward one observation at a time. You lose some adaptivity, which is why the replan node exists as the escape hatch.
+
+The variants tell you where the field is pushing: **LLMCompiler** streams a DAG of tasks for parallel scheduling (a claimed **3.6x** speedup), and **ReWOO** removes per-task model calls by substituting variables. Both stop spending a model call on coordination the graph can do for free.
+
+**Reflection is an outer loop, not a sibling.** [Reflexion](https://arxiv.org/abs/2303.11366) wraps either of the above in a retry-with-memory cycle: an **Actor** does the task, an **Evaluator** scores the trajectory, a **Self-Reflection** model writes a verbal lesson, the lesson lands in an **episodic memory buffer**, and the next trial reads that memory before it starts. The mechanism is the headline: reinforcement happens **"not by updating weights, but through linguistic feedback,"** and it works, 91% pass@1 on HumanEval against GPT-4's 80%. The cost is named: extra trials, plus a memory store that grows every trial and needs eviction or it becomes its own runaway-context bill. That memory layer is its own design problem, and [agent memory](/blog/agent-memory) treats it as one.
+
+So the decision rule is not "which agent type." Short on adaptivity, use ReAct; short on cost or horizon, plan-and-execute; need the system to learn from its own failed attempts within a session, layer reflection on top. The patterns compose; they do not compete.
+
+## State, persistence, and the resume that lies
+
+A loop that cannot survive a crash is a toy. The moment an agent does anything slow or expensive, its state needs to live somewhere durable, and "the model's context window" is not that place. The context window is ephemeral working memory; durable state lives in a checkpointer, and conflating the two is why people are surprised when "lost state on resume" happens.
+
+[LangGraph's persistence model](https://docs.langchain.com/oss/python/langgraph/persistence) is worth understanding even if you use something else. The graph runs in **super-steps**, one tick in which all scheduled nodes run, and at every boundary the runtime writes a **checkpoint**: a `StateSnapshot` carrying `values` (the state), `next` (the nodes scheduled to run, where an *empty tuple means the run is complete*), `config` (including the all-important `thread_id`), `metadata`, and `tasks`. The `thread_id` is the primary key of a conversation's durable state. Resume a thread, and the checkpointer reloads the last snapshot and continues at `next` instead of starting over.
+
+The part most people skip is that **durability is a dial, not a default.** LangGraph gives three modes: `exit` persists only at the end (fast, no mid-run recovery), `async` writes in the background ("a small risk it does not write checkpoints if the process crashes"), and `sync` writes before every step (safest, with overhead). A staff engineer picks one per workload, because this dial decides whether "lost state on resume" is even possible. Pick `exit` on a payment flow and a crash erases the run; pick `sync` on a chatty low-stakes loop and you pay for durability you did not need.
+
+Now the caveat that separates "it resumes" from "it resumes *correctly*," the sharpest nuance in this whole topic. **Checkpointing is not durable execution.** [Diagrid's writeup](https://www.diagrid.io/blog/checkpoints-are-not-durable-execution-why-langgraph-crewai-google-adk-and-others-fall-short-for-production-agent-workflows) puts the gap in one sentence: a checkpointer **"says: 'I saved your state. You take it from here.'"** It gives you no automatic failure detection, no automatic resumption, no distributed locking. So two processes can resume the same `thread_id` at once, both re-run the same node, and that node **duplicates its tool calls.** Picture the IntelliFill `extract` node crashing right after it called a paid vision API. The checkpointer reloads the snapshot and resumes, and without exactly-once semantics you call that paid API again. You double-bill. The state was saved perfectly. The *side effect* fired twice.
+
+True durable execution, the Temporal-style guarantee, wants **deterministic replay** (a completed activity returns its cached result) and **exactly-once semantics**. As Diagrid frames it: *"The gap is between saving state and guaranteeing completion."* LangGraph's `sync` mode narrows the crash window but does not close that gap.
+
+The direct mitigation is the same discipline that makes webhooks safe: put an **idempotency key on every side-effecting tool**, so a replayed action is a no-op downstream. IntelliFill does the spiritual version, tagging each job with a deterministic ID (`multiagent-<documentId>`) so the queue dedupes a re-enqueue. The resume problem here is the same lie in a different costume; [idempotency and the exactly-once lie](/blog/idempotency-exactly-once) is the deep dive. And since the agent's tool calls cross into other systems exactly the way [tool-calling](/blog/tool-calling) describes, every crossing needs the key, human approvals included: LangGraph notes that "interrupts are always re-triggered during replay," so a human-in-the-loop gate must be idempotent too, or a resumed run re-prompts for an approval already given.
+
+## Termination is four governors, and the model controls none of them
+
+Ask a junior how to stop an agent and you get "set max_steps." That is one governor out of four, and the weakest one. Mature systems wire **four orthogonal stop conditions**, because each catches a different way the loop goes wrong:
+
+1. **Goal-satisfied.** The work is verifiably done. This is the one you most want and least trust, for reasons in the next section.
+2. **Step / recursion cap.** A hard ceiling on iterations. LangGraph ships this as `recursion_limit`, **default 25**, raising `GraphRecursionError` when hit.
+3. **Wall-clock timeout.** A deadline regardless of step count. IntelliFill wraps the entire graph in a 5-minute `Promise.race`.
+4. **Budget / cost cap.** A ceiling on tokens or dollars, independent of steps or time.
+
+The model controls *none* of these. They are guards the graph enforces from the outside. And here is the insight buried in the [LangGraph recursion-limit docs](https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT): **"If you are not expecting your graph to go through many iterations, you likely have a cycle."** Hitting the step limit is almost never evidence the task was hard. It is a **symptom that the loop is stuck**, going around with no progress, and the cap is the only thing that noticed. So the cap is a backstop, and cranking it up does not help: **"you'll just be paying for 1,000 API calls instead of 25."** The real fix is to define **progress** and break the instant a step fails to make any. Aladeen does exactly this, inferring that a run `gave_up` when the trailing event stream ends on an unmatched tool call, reading the *shape* of what happened rather than waiting for a counter to expire.
+
+The one-line test for whether someone understands agent loops is whether they can explain *why hitting the step limit is usually a bug in the loop's progress logic, not proof the task was complex.* IntelliFill's answer is a termination condition that is not a counter at all. When QA fails, the graph routes to an `errorRecover` node that classifies the failure and decides whether to re-extract, re-classify, or escalate to a human, capped at `MAX_RETRIES = 3` and bounded by the timeout. The stated reason for choosing a graph over a hand-written async function *is* the article's thesis:
+
+> Error recovery has to route backward. Encoding that as graph edges (`routeAfterQA`, `routeAfterErrorRecovery`) keeps the control flow explicit and checkpointable. The rejected alternative, a hand-written async function with nested try/catch and manual retry counters, gets unwieldy and non-resumable the moment you need to retry back to a prior stage.
+
+That is plan, act, observe, *reflect* as an explicit state machine, with all four governors present: the retry cap, the timeout, the QA "needs a human" escalation, and the finalize success exit. Relying on any one alone is the gap the data says kills agents.
+
+## Why agents actually break: the data, not the vibes
+
+"Sometimes agents loop forever" is a shrug. There is a real distribution behind it, and it is uncomfortable for anyone who thinks the model is the bottleneck. The [MAST taxonomy](https://arxiv.org/abs/2503.13657) (Multi-Agent System failure Taxonomy) studied 200-plus tasks across 7 frameworks and sorted 14 failure modes into 3 categories, with strong inter-annotator agreement (Cohen's kappa of 0.88):
+
+- **Specification and system design: 41.8%.** The single largest category, where *missing termination conditions* and poorly specified tasks live.
+- **Inter-agent misalignment: 36.9%.** Coordination and communication breakdowns between agents.
+- **Verification: 21.3%.** Failures to check the work.
+
+Sit with the top number. The dominant failure surface is **the loop's specification and its exit logic**, not the model's intelligence. Agents fail because nobody specified clearly when the loop should stop, what "done" means, or how two agents hand off. There is a second-order lesson too: spec plus misalignment is over 78% of failures, and **both get worse when you add another agent with an ambiguous role.** Before you add a second agent, the staff question is whether one well-instrumented loop would do. Multi-agent inherits a coordination tax, and MAST is the receipt.
+
+Two production failures make it concrete, both caught in dogfood runs, because [observability for the three pillars](/blog/observability-three-pillars) turns "the agent broke" into "here is the line."
+
+**The runaway loop.** Aladeen caught this in its own engine. A deterministic lint-fix-lint loop ran **somewhere between 1,930 and 2,267 iterations** before tripping any budget, because `totalRetries` was only incremented on the *agentic* path, so the global cap never saw the deterministic loop. The rule that falls out: **a budget counter that does not instrument every path through the loop is not a governor.** It has to live at the super-step or edge level, above the branches, or a non-model sub-loop walks straight past it, the docs' "1,000 calls instead of 25" warning made real, except the bill ran to two thousand.
+
+**Hallucinated completion, defeated by a guard.** The "agent claims success but did nothing" failure, also from Aladeen. The runner uses a `retry` outcome to mean "the agent said it succeeded, but `git status --short` shows no file changes, so try again." The bug: a `retry` with no explicit `on:'retry'` edge **fell through to the default success edge**, so the run advanced and the `requiresFileChanges` guard was silently bypassed, the exact hallucination-of-completion it was built to catch. The fix restricts default edges to success and failure only; a `retry` with no retry edge re-executes the same node instead of advancing.
+
+This is the most dangerous assumption in the field: that the model knows when it is done. It does not. Hallucinated task completion is a *named, measured* failure mode in MAST, the agent emits the right format with the wrong content, or never commits the work at all. So **do not let the model self-certify completion. Verify it against ground truth**, a file diff, a checksum, a check digit, an independent evaluator. IntelliFill's MRZ cross-validation and its vision-confidence cap at 85 (a refusal to "pass a fake 99% into the downstream confidence math") exist for exactly this reason. The corollary: **outcome must be inferred from behavior, not read from a flag.** As Aladeen's engine notes put it, *"Exit code zero means nothing here. An agent can stall mid-tool-call, get interrupted, or bomb on a run of failing tools and still quit clean."*
+
+## The honest landing
+
+You do not get a magic box. You get a control loop, and the model is one node in it. The model proposes; the graph disposes. Reliability is an architecture property, not a model property, which is the good news, because architecture is the part you control. The interesting engineering was never the prompt. It was the edges that route backward, the four governors, the durability dial you set on purpose, the idempotency key on every side-effecting call, and the verification that refuses to let the model certify its own success.
+
+So place your system on the autonomy axis and refuse to climb past the simplest pattern that works. Wire all four governors and instrument the counter above every branch. Pick a durability mode for the workload, and remember that a saved checkpoint is not a guaranteed completion. Verify "done" against ground truth, never a flag. Do that, and the 2 a.m. loop hits a wall instead of your budget. Skip it, and you ship the demo that worked every time you ran it and failed the one time it mattered. The same lesson runs through [the system design interview framework](/blog/system-design-interview-framework): the boring parts are where the system is actually built. Agents might be the clearest example.
+
+## FAQ
+
+<FAQ />

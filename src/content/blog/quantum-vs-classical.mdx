@@ -1,0 +1,132 @@
+export const meta = {
+  slug: 'quantum-vs-classical',
+  title: 'How Quantum Computing Differs From the Chip in Your Laptop',
+  description:
+    'A quantum computer is not a faster laptop. It is a different model where amplitudes interfere, measurement gives one answer, and the speedup is narrow and hard-won.',
+  headline: 'How Quantum Computing Differs From the Chip in Your Laptop',
+  deck: 'It does not try every answer at once, and believing that it does is the fastest way to misjudge what it can actually do.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['quantum-computing', 'qubits', 'algorithms', 'complexity-theory', 'cryptography', 'computer-science'],
+  faq: [
+    {
+      q: 'Does a quantum computer really try every answer at the same time?',
+      a: "No, and this is the single most misleading thing said about them. A qubit register can hold a superposition over all inputs, so in the math you have computed the function on every input at once. But when you measure, you get exactly one outcome, chosen at random with a probability set by its amplitude. Measure an undirected superposition and you get a random answer, no better than a coin flip. The whole skill of a quantum algorithm is arranging interference so the right answer's amplitude is large before you measure. Parallelism is real in the state; reading it out is brutally limited.",
+    },
+    {
+      q: 'Will quantum computers make my software faster?',
+      a: "Almost certainly not. There is no known speedup for web serving, databases, CRUD apps, video encoding, or most machine learning training. The exponential wins are confined to a narrow set of problems with hidden structure, like integer factoring and simulating quantum physics. Unstructured search gets a quadratic speedup from Grover's algorithm and nothing better, and that is provably the ceiling. For everyday work a classical CPU is faster, cheaper, and does not need a refrigerator near absolute zero.",
+    },
+    {
+      q: 'Can a quantum computer break encryption?',
+      a: "Eventually, for some of it. Shor's algorithm factors integers and computes discrete logarithms in polynomial time, which breaks RSA and elliptic-curve cryptography, the math behind most of today's public-key security. That is the genuine exponential threat and the reason post-quantum cryptography exists. But a cryptographically relevant run needs millions of high-fidelity physical qubits with error correction. Current machines have around a hundred noisy ones. The threat is real and years out, not imminent, which is exactly why migration is starting now.",
+    },
+    {
+      q: 'Do quantum computers solve NP-complete problems instantly?',
+      a: "No. NP-complete problems are conjectured to lie outside BQP, the class a quantum computer solves efficiently. There is no known quantum algorithm that cracks SAT or the traveling salesman in polynomial time. You can point Grover's search at an NP problem, but it only halves the exponent: brute-forcing 2^n possibilities becomes 2^(n/2), still exponential. A quantum computer is a different model of computation, not a magic box that defeats intractability.",
+    },
+    {
+      q: 'Is qubit count the right way to compare quantum computers?',
+      a: "It is the headline number and the most misleading one. A hundred noisy qubits are not a hundred useful ones. What matters more is coherence time (how long the state survives before it decays), gate fidelity (how close each operation is to ideal), connectivity, and above all the number of logical, error-corrected qubits you can sustain. Today it can take hundreds to thousands of physical qubits to protect a single logical one. Counting raw qubits is like rating a car by the number of cylinders while ignoring whether the engine runs.",
+    },
+  ],
+}
+
+The chip in your laptop and a quantum computer both compute, in the way a sailboat and a submarine both travel by water. The shared word hides almost everything that matters. Your laptop is faster, cheaper, and better at every task you will ever actually give it. The quantum machine is worse at all of that and good at a tiny, strange set of things your laptop cannot touch. Understanding the difference is mostly a matter of unlearning one sentence you have heard a hundred times.
+
+The sentence is: a quantum computer tries every possible answer at the same time.
+
+It is the most repeated claim about the technology and one of the most wrong. It is not a simplification that loses some nuance. It points you at the wrong mechanism, sets the wrong expectations, and makes you misjudge both what these machines can do and how far away the useful versions are. This piece is about replacing that sentence with one that is true, and following the consequences honestly, including the ones the press releases skip.
+
+## What a bit is, and what a qubit is instead
+
+Start with the thing you already know. A classical bit is a switch. It is 0 or it is 1, and at any instant it is exactly one of those. Every computation your laptop performs is billions of these switches being read, combined through logic gates, and written, a few billion times a second. The whole edifice of software sits on that one rock-solid fact: a bit has a definite value, and you can look at it as often as you like without changing it.
+
+A qubit is a different kind of object, not a switch with a third setting. Its state is described by two numbers, called amplitudes, written as the combination alpha times "0" plus beta times "1". Those amplitudes are not probabilities. They are complex numbers, which means they carry a sign and a phase, and that detail is where the entire story lives. The only constraint is that the squared magnitudes add to one, so that alpha-squared plus beta-squared equals 1.
+
+The popular gloss is "a qubit is 0 and 1 at the same time." Throw it away. A truer picture is a direction. Picture an arrow pointing somewhere on the surface of a sphere. Straight up is "definitely 0," straight down is "definitely 1," and every other direction is a particular blend with a particular phase. The arrow has a definite state at all times. It is simply a state with more room in it than a switch has, and crucially, the phase, where the arrow points around the equator, is physical and does real work.
+
+The leap from a bit to a qubit is not "one more value." It is moving from a number that is either-or to a vector that has a sign you can use against itself. Hold onto that sign. It is the whole game.
+
+## Where the power is, and where it is not
+
+Here is the move that feels like magic and sets the trap. With n classical bits you store one of 2^n possible values. With n qubits you have a state spread across all 2^n basis combinations at once, each with its own amplitude. Ten qubits carry 1,024 amplitudes; fifty qubits carry more than a quadrillion. Apply one operation to the register and, in the mathematics, you have transformed all of those amplitudes simultaneously.
+
+So you ran the function on every input at once. That is real. It is also where most explanations stop, and stopping there is what produces the myth. Because now you have to get an answer out, and getting an answer out is where the universe collects its toll.
+
+You do not get to read the amplitudes. When you measure a quantum register, you get exactly one of those 2^n basis values, a single n-bit string, chosen at random. The probability of each outcome is the squared magnitude of its amplitude. This is the Born rule, and it is not a hardware limitation that better engineering will lift. It is how measurement works. You packed 2^n amplitudes in; you get n bits out, once, and the act of looking destroys the rest.
+
+Put three qubits into an equal superposition over all eight values. In the state, you have "computed" something about all eight inputs. Now measure. You get one value, with probability one in eight each, and you have learned precisely nothing a single die roll could not have told you. The parallelism was genuine and completely useless, because an undirected superposition measures to a random answer.
+
+That is the real reason "tries every answer at once" misleads. The trying is real. The reading is the bottleneck, and a naive parallel computation hands you noise.
+
+## Interference is the actual engine
+
+So what makes a quantum algorithm work, if not the parallelism itself?
+
+Interference. This is the word the pop-science version leaves out, and it is the one that matters. Because amplitudes are complex numbers with signs, they can cancel. A positive contribution and a negative contribution to the same outcome add up to less than either alone, possibly to zero. This has no analogue in classical probability, where everything is non-negative and combining two possibilities can only ever increase the total. Probabilities pile up. Amplitudes can erase each other.
+
+A quantum algorithm is a piece of choreography. You design a sequence of gates so that, for every wrong answer, the many paths leading to it carry amplitudes that cancel, summing toward zero. And for the right answer, the paths reinforce, summing toward one. You spend the whole computation reshaping the distribution of amplitudes so that when you finally measure, the outcome you want is overwhelmingly the one you get. IBM puts it in one line: interference is the engine of quantum computing. Superposition and entanglement load the gun; interference aims it.
+
+This reframes everything. A quantum speedup is not "checked all the answers and picked the best." It is "arranged for the wrong answers to destroy themselves so the right one is what survives." That is why writing quantum algorithms is genuinely hard and why so few exist. You are not parallelizing a search. You are engineering a cancellation pattern, and most problems offer no structure to build one from.
+
+The second ingredient is entanglement. An entangled state of n qubits is not a list of n independent arrows. It lives in that full 2^n-dimensional space and encodes correlations that no collection of separate qubits can express. It is necessary for exponential advantage, though, as the next section shows, never sufficient on its own.
+
+## The speedup is narrow, and the math says so
+
+Here the honest account parts ways with the hype, and the gap is enormous. "Quantum computers will make everything exponentially faster" is false for the overwhelming majority of computing. The known speedups fall into a short, specific list, and most workloads are nowhere on it.
+
+The crown jewel is Shor's algorithm. It factors large integers and computes discrete logarithms in polynomial time, while the best known classical method, the general number field sieve, runs in sub-exponential time that explodes as numbers grow. This is a true exponential separation, and it is not academic: RSA and elliptic-curve cryptography rest on factoring and discrete logs being hard, so Shor is the reason "quantum-safe cryptography" is a phrase your security team will care about. The honest caveat, which the headlines bury, is that running Shor against RSA-2048 needs millions of high-fidelity physical qubits wrapped in error correction. Today's machines have around a hundred noisy ones. The threat is real and not close.
+
+The other genuine win is the one Richard Feynman pointed at in the first place: simulating quantum systems. Molecules, materials, chemistry. Nature is quantum, and a classical computer drowns trying to track exponentially many amplitudes, while a quantum computer represents them natively. This is the application most physicists actually expect to matter, and it gets far less airtime than codebreaking.
+
+Then there is Grover's algorithm, and it is the one most often oversold. Grover searches an unstructured space of N items in about the square root of N steps, versus N over 2 for a classical scan. Real, but quadratic, not exponential. Search 2^64 items and a classical machine needs roughly 2^63 evaluations while Grover needs about 2^32 iterations. A massive improvement, and still nowhere near instant, with every iteration demanding a coherent oracle call. And here is the part that should end a certain kind of optimism for good: Grover is provably optimal. The BBBV theorem proves no quantum algorithm can beat square-root-of-N for a black-box search. Quadratic is the ceiling, not the floor. Point Grover at an NP-complete problem with 2^n candidates and you get 2^(n/2), which is still exponential. You have not defeated intractability. You have square-rooted it.
+
+For everything else, the ordinary fabric of computing, there is no advantage at all. Serving web requests, running a [distributed cache](/blog/distributed-cache), querying a database whose engine you might choose with an eye to [LSM-tree versus B-tree](/blog/lsm-tree-vs-btree) tradeoffs, shortening a URL with the kind of design from [the URL shortener](/blog/url-shortener), training and serving large models the way [LLM inference serving](/blog/llm-inference-serving) and [quantization](/blog/llm-quantization) describe, running the vector lookups behind [vector databases](/blog/vector-databases) and [RAG systems](/blog/rag-system) and [recommendation systems](/blog/recommendation-systems), or reasoning about [how LLMs work](/blog/how-llms-work) at all. None of these has a known quantum speedup. The classical chip in your laptop is not a placeholder waiting for a quantum upgrade. For the work that fills a data center, it is the right tool and will stay the right tool.
+
+This is the senior-grade correction in one sentence: a quantum computer is not a faster classical computer. It is a different model that buys something only where amplitude interference can be made to pay, and that is a narrow place.
+
+## Why it does not solve NP, in complexity terms
+
+The clean way to state the boundary uses complexity classes, and it is worth the thirty seconds because it kills a stubborn myth precisely.
+
+The problems a quantum computer can solve efficiently form a class called BQP, "bounded-error quantum polynomial time." The established relationship is a chain of containments: P sits inside BPP, which sits inside BQP, which sits inside PSPACE. Everything your laptop does efficiently, the class P, lives comfortably inside BQP, so a quantum computer can do anything a classical one can, no slower in the asymptotic sense. The interesting question is what BQP contains that P does not, and the answer is "some things, like factoring, but a short list."
+
+NP-complete problems, the famously hard ones like SAT and the traveling salesman, are conjectured to lie outside BQP. No one has proven it, but there is no known quantum algorithm that solves any NP-complete problem in polynomial time, and most experts expect none exists. A quantum computer is not a "solve NP" machine. Anyone who tells you it makes the traveling salesman tractable is selling the myth in a more sophisticated dialect.
+
+The containment in PSPACE carries a quiet, deep consequence. Because BQP sits inside PSPACE, a classical computer can simulate any quantum computation using only polynomial memory, just possibly exponential time. So quantum computing does not break the Church-Turing thesis, the claim about what is computable at all. At most it challenges the efficiency version, the part about what is computable quickly. Nothing a quantum computer does is uncomputable classically. It is, for a few problems, dramatically faster, and that is a more modest claim than the marketing implies.
+
+## The hardware tax nobody puts on the slide
+
+Even granting all of the above, "just add more qubits" is where the engineering reality bites hardest, and it explains why the useful machine is not arriving next quarter.
+
+Qubits are almost unimaginably fragile. The superposition and entanglement that do the work are destroyed by the faintest interaction with the outside world, a stray photon, a thermal vibration, a whisper of electromagnetic noise. This decay is called decoherence, and it is measured in coherence times labeled T1 and T2. On Google's recent superconducting hardware, T1 sits around 100 microseconds. A two-qubit gate takes tens of nanoseconds. So you get roughly a few thousand to ten thousand operations before the state melts into noise. The deep circuits Shor needs are far longer than that. Raw qubits simply cannot stay coherent long enough.
+
+The answer is quantum error correction, and the cost is staggering. You encode the information of one reliable logical qubit across many noisy physical qubits, using a scheme like the surface code, so that errors can be detected and corrected faster than they accumulate. The threshold theorem says this works, but only once your physical error rate drops below a critical threshold, around one percent for the surface code. Below that line, adding more physical qubits per logical qubit drives the logical error rate down. Above it, more qubits make things worse. The overhead is brutal: hundreds to thousands of physical qubits to sustain a single logical qubit at crypto-relevant scale.
+
+This is why qubit count is the wrong scoreboard, the way lines of code is the wrong measure of a program. A hundred noisy physical qubits are not a hundred useful ones. What matters is coherence time, gate fidelity, connectivity, and above all how many logical qubits you can hold. Late in 2024, Google's Willow chip crossed the threshold experimentally for the first time: scaling the surface-code grid from 3-by-3 to 5-by-5 to 7-by-7, the logical error rate fell by a bit over 2x at each step. Adding qubits reduced error. That is a real milestone, the precondition for everything that follows. It is the starting line, not the finish.
+
+## How a senior engineer reads a quantum headline
+
+The discipline that separates signal from noise here is the same one that separates a [system design interview](/blog/system-design-interview-framework) answer that lands from one that recites buzzwords: insist on the boundary conditions. When a quantum announcement crosses your feed, three questions do almost all the filtering.
+
+First: is this a physics milestone or a commercial result? These get conflated constantly, usually on purpose. When Google ran a random-circuit-sampling benchmark that a classical supercomputer would take an absurd span of years to match, that proved a point about physics. Google itself noted the benchmark has yet to demonstrate practical commercial applications. Below-threshold error correction, quantum supremacy demonstrations, these are genuine and important, and they are about whether the device behaves as quantum theory predicts at scale. They are a separate thing from "this did a job someone would pay for." Both matter. Confusing them is the most common way smart people get the timeline wrong.
+
+Second: what is the actual speedup, and over what classical baseline? Exponential or quadratic? Quadratic is real but bounded; Grover will never beat it. And exponential over what, exactly? Which brings the third question, the one that has humbled this field before.
+
+Is the classical baseline holding still? It does not always. In 2018, an 18-year-old named Ewin Tang, working from a problem her advisor Scott Aaronson had handed her, produced a classical algorithm that matched a celebrated quantum speedup for recommendation systems. She "dequantized" it. The quantum advantage that had stood for years simply evaporated, because the right classical algorithm had not been found yet. The lesson is permanent: a claimed exponential quantum advantage is only as good as the best known classical algorithm, and that bar can move under your feet. A fast quantum algorithm is not a proof of advantage. You also need a hard classical lower bound, and those are rare.
+
+This skepticism is not pessimism. It is how the serious people in the field, the ones building the machines, talk about their own work. John Preskill, who coined the term NISQ for today's "noisy intermediate-scale quantum" devices, wrote plainly that the hundred-qubit machine will not change the world right away. The honesty is the signal. The breathless certainty is the tell.
+
+## The honest landing
+
+A quantum computer is not the next laptop. It is a different machine, built on a different model of computation, and the difference is not a matter of degree. Your laptop's bits hold definite values you can read at will, and it computes by switching them. A quantum computer holds amplitudes with signs, computes by making wrong answers cancel and right answers reinforce, and gives you a single answer when you look, with no way to read the rest.
+
+That design buys an exponential speedup for a short list of problems with deep hidden structure, factoring and quantum simulation chief among them, a quadratic and provably capped speedup for unstructured search, and nothing at all for the vast ordinary bulk of computing. It does not try every answer at once in any sense that helps, it does not solve NP-complete problems, and it does not make your software faster. The version that breaks RSA needs millions of qubits the field does not yet have, and the path there runs through an error-correction tax measured in thousands of physical qubits per logical one.
+
+None of which makes it less remarkable. A machine that turns the sign of an amplitude into a computational resource, that simulates nature in nature's own currency, that threatens the cryptography holding the internet together, is one of the strangest and most ambitious things humans have ever tried to build. It simply is not the thing the headline says it is. And the fastest way to understand what it actually is, is to stop believing it tries everything at once and start asking how it makes the wrong answers disappear.
+
+## FAQ
+
+<FAQ />

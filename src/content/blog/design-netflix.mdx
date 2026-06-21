@@ -1,0 +1,169 @@
+export const meta = {
+  slug: 'design-netflix',
+  title: 'Design Netflix: Streaming, the CDN, and Open Connect',
+  description:
+    'Netflix is read-mostly and egress-dominated, so the design is about where the bytes live at play time. A walk through Open Connect, ABR, and per-shot encoding.',
+  headline: 'Design Netflix: Streaming, the CDN, and Open Connect',
+  deck: 'The hard part of Netflix was never storage or compute, it was moving tens of terabits per second of video to the right eyeballs at the right moment, which is why they built a CDN that lives inside your ISP.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['system-design', 'netflix', 'cdn', 'streaming', 'video', 'distributed-systems'],
+  faq: [
+    {
+      q: 'Does Netflix run on AWS?',
+      a: "Half of it. The control plane runs on AWS: signup, browse, recommendations, licensing, DRM, the steering service that picks a server, encoding orchestration, and telemetry. The video bytes never touch AWS. 100% of video is served from Open Connect, Netflix's own CDN of appliances placed inside ISP networks. Conflating the two is the most common mistake in this interview.",
+    },
+    {
+      q: "Why doesn't Netflix just use CloudFront or a commercial CDN?",
+      a: "Because a generic CDN is demand-driven: it caches on a miss, so the first viewer in each region pays a slow origin fetch and later viewers hit warm cache. Netflix viewing is predictable a day ahead, so it pushes content into ISP-embedded appliances during an off-peak fill window and spends 100% of peak capacity on serving. No commercial CDN does proactive predictive fill at this scale economically, which is why Netflix left them and built Open Connect.",
+    },
+    {
+      q: 'Who decides which quality you stream, the server or the client?',
+      a: 'The client. Adaptive bitrate (ABR) is a control loop running in the player. The server (an Open Connect appliance) is a dumb byte server that hands out whatever segment you ask for. The player reads a manifest listing every available rendition, estimates throughput, watches its own buffer, and steps quality up or down segment by segment to maximize resolution without rebuffering.',
+    },
+    {
+      q: 'How does Netflix decide which server you connect to?',
+      a: "It is BGP best-path routing, not GeoIP. When several appliances could serve you, the steering service resolves it with standard BGP logic: longest-prefix match, then shortest AS-path, then lowest MED, then geolocation as the final tiebreak. An appliance embedded inside your ISP wins automatically because its route arrives with a shorter AS-path. The ISP controls which of its customers route to the box by what it announces over BGP.",
+    },
+    {
+      q: 'When does Netflix encode a video?',
+      a: "Long before you press play, as a fully offline batch job. A single high-bitrate mezzanine master is chopped into chunks (or individual shots), and each piece is encoded in parallel into the full matrix of resolution, bitrate, and codec, scored against the VMAF perceptual quality metric. The play path only selects and serves pre-made segments. Encoding is the one compute-heavy part of the system, and it is nowhere near the serving path.",
+    },
+  ],
+}
+
+Most system design questions are about writes. How do you fan a tweet out to a million followers, keep two replicas of a counter from disagreeing, avoid double-charging a card. Netflix is the opposite. Almost nobody writes anything. A few thousand titles get encoded once and then sit there, static, while hundreds of millions of people read the same handful of bytes over and over.
+
+That sounds easy until you do the arithmetic, and the arithmetic is the whole interview.
+
+A 1080p stream runs around 5 Mbps. A 4K stream runs 15 to 25. Multiply by tens of millions of concurrent streams on a weekday evening and aggregate egress lands in the tens of terabits per second, globally, sustained, every night. Storage is solved, because disks are cheap and the catalog is static. Egress is not solved by anything you can buy off a shelf. The whole design collapses to one question: where do the bytes physically live at the moment of play, and who decides that?
+
+If you have read [the system design interview framework](/blog/system-design-interview-framework), you know the move is to name the dominant constraint in the first two minutes and let everything follow from it. For Netflix that constraint is bytes-to-eyeball. Say that out loud, separate the read path from the write path, and the rest of the design almost derives itself.
+
+## Read-mostly, egress-dominated, and why that changes everything
+
+Let me make the asymmetry concrete, because it is what a shallow answer misses. Encode the catalog: 10,000 titles, each a ladder of maybe ten rungs across several codecs (AVC, HEVC, AV1) plus audio, a few terabytes per title, so the whole catalog is on the order of tens of petabytes. Big, but boring. It is static, it is cacheable, and you pay to produce each file once. Then those same petabytes get served billions of times over, concentrated into a few peak evening hours per timezone, from wherever the viewer happens to be. No sharding scheme makes tens of terabits per second of egress go away. Only one lever works: move the bytes closer to the viewer so each one traverses as little expensive network as possible. Ideally one hop.
+
+This is the same shape as [Design YouTube](/blog/design-youtube): a transcode pipeline dominates the write side, a CDN dominates the read side. It rhymes with [Design Instagram](/blog/design-instagram) too, where the hot media is static and the win is caching it hard at the edge. What makes Netflix distinct is how far "the edge" goes. Not a metro PoP. Inside your ISP's building.
+
+## The control plane and the data plane
+
+The single most important architectural decision is a split, and naming it early is the tell of a staff candidate.
+
+There are two planes. The control plane runs in AWS and handles all the deciding: who you are, whether your subscription is active, what to recommend, whether you are licensed for this title, which files your device and network need, which server should serve them, and what every server in the fleet is currently doing. The data plane is Open Connect, Netflix's own fleet of cache appliances, and it does one job: store bytes and serve them over HTTP.
+
+The official documentation states the data plane's job in one sentence worth memorizing. The appliances do only two things: report their status to the AWS control plane, and serve content over HTTP or HTTPS when a client asks. They store no member data. No viewing history, no DRM keys, no account information. Just video files and a heartbeat.
+
+Once you have that split, three things fall out for free.
+
+They scale independently. You add serving capacity by shipping more appliances into ISPs with no change to AWS, and control-plane capacity the normal cloud way.
+
+They fail independently, and this is the part worth dwelling on. An AWS regional incident can break new play-starts, because steering and licensing live there, while every stream already in flight keeps running, because the appliance serving it needs nothing from AWS to deliver the next segment. The split is a blast-radius boundary: the worst case degrades discovery, not playback.
+
+They have a clean security story. The appliance holds no keys and no member data and serves only encrypted segments it cannot itself decrypt, so it is safe to drop inside a third party's network. DRM lives in the control plane. The appliance is a vault it cannot open.
+
+## The six-step handshake
+
+Here is the whole playback flow, mirroring the official Open Connect overview. Read it as the control plane deciding and the data plane delivering.
+
+```
+   AWS control plane                          Open Connect (data plane)
+        |                                              |
+   [Cache Control Service] <--- health, BGP routes, ---  [OCA]
+        |                       which files it holds
+   1) OCAs continuously report status to CCS
+        |
+   2) User presses Play --> [Playback Apps]
+   3) Playback Apps: check auth + licensing (DRM),
+      decide WHICH files (device + network aware)
+        |
+   4) [Steering Service / CODA] uses CCS data to pick
+      the best OCAs and mints the segment URLs
+        |
+   5) Playback Apps returns OCA URLs to the client
+        |
+   6) Client --- HTTP GET segments ---> [OCA] --- bytes ---> client
+```
+
+Trace the responsibilities. The Cache Control Service knows the live state of the fleet, because every appliance constantly tells it what it can serve, which BGP routes it has learned, and which files are on its disks. Playback Apps is the policy gate: subscription, license, the DRM dance, and which exact renditions your device should get. The Steering Service, codenamed CODA, is the matchmaker: it consults the Cache Control Service's view of the fleet, mints the URLs pointing at specific appliances, then gets out of the way. Step six, the only step that moves real volume, is your player talking HTTP directly to a box with no AWS in the loop.
+
+Notice what steering is. It is soft state, recomputed on every single play, with no sticky session pinning you to a box. If an appliance dies, the next manifest request gets steered somewhere healthy, because the authoritative truth (who is healthy, who holds what, which routes exist) is continuously re-reported. The system self-heals by re-deriving the answer from scratch every time you press play, with no failover machinery in the path. This is cattle-not-pets taken seriously: no single appliance is load-bearing, so losing one is invisible.
+
+## Steering is BGP, not a GeoIP guess
+
+The bootcamp answer to "which server do I connect to" is "GeoIP to the nearest one." That is wrong in a way worth being precise about, because the real mechanism is more elegant and explains a design choice that otherwise looks arbitrary. When you could be served from several places, the control plane resolves it with standard BGP best-path logic, in order: longest-prefix match, then shortest AS-path, then lowest MED, and only then geolocation as the final tiebreak. Geography is the last resort, not the first instinct.
+
+This matters because of how Netflix deploys boxes. There are two models: embedded, where an appliance sits physically inside an ISP's network, and IX, where it sits in an Internet Exchange and peers with ISPs over settlement-free interconnect. Netflix runs two autonomous system numbers to keep these clean: AS40027 for embedded, AS2906 for IX peering. An embedded box wins automatically, with no special-casing, because its route reaches your ISP with an AS-path length of 1 (straight from AS40027) versus 2 for the IX path (AS2906 then the ISP). Shorter AS-path, BGP prefers it, done. The routing protocol does the steering preference for free.
+
+The consequence is that the ISP, not Netflix, controls which of its customers hit the embedded box, by choosing which prefixes it announces toward it. Netflix gives the ISP the hardware; the ISP gives power, space, and connectivity, and gets the traffic off its expensive transit links. The scale this buys: roughly 95% of Netflix traffic worldwide is delivered over direct connections to residential ISPs, and 100% of video is served from Open Connect. AWS serves zero video bytes. Not few. Zero.
+
+## The thing that makes Netflix not a normal CDN
+
+Here is the deepest conceptual difference, and the place to spend your points if you want to sound like you have actually thought about this.
+
+A normal CDN is demand-driven. It pulls. The first viewer in a region requests a file, the edge misses, the origin fills it, and every later viewer gets a hit, so the cost of that miss is paid in real time, on the request path, by an unlucky user.
+
+Open Connect is prediction-driven. It pushes. Content lands on the appliance before the first viewer asks, because Netflix viewing is forecastable with high accuracy a day out, and that forecast turns the caching problem inside out.
+
+The mechanism is a fill window. Each appliance negotiates an off-peak window with its host ISP, typically overnight, then pulls a manifest from the control plane (the titles it should hold given tomorrow's predicted demand), diffs it against what is on disk, and fetches only the delta. Come evening peak it spends 100% of its capacity serving, because the filling already happened on bandwidth nobody was using. You use the ISP's idle 3 a.m. capacity to pre-stage the bytes you serve at 9 p.m.
+
+Replication tracks popularity. Inside a cluster, a title is copied to N appliances where N is proportional to predicted popularity. Tonight's blockbuster is replicated widely; the obscure documentary lives on a few boxes, or upstream. It is a forecast-driven version of the instinct behind [the distributed cache](/blog/distributed-cache): keep the hot keys on more nodes, let the cold tail live thin.
+
+And the fill itself is a replication graph, not a dumb copy command. The "Netflix and Fill" design elects some appliances as masters for a given asset. Masters pull from upstream with priority, then peer-fill their siblings in the same cluster or site. So a brand-new blockbuster crosses the expensive backbone essentially once per location, to the master, which then gossips it sideways to its neighbors over cheap local links. Shipping a new title to 8,000 boxes becomes "pull to one master per cluster, then spread locally," keeping backbone churn near zero. Placing which assets land on which box within a cluster is the same problem [consistent hashing](/blog/consistent-hashing) solves for caches: you want adding or losing an appliance to reshuffle as few titles as possible.
+
+There is a feedback loop here worth naming. The recommender shapes what people watch, that shapes the popularity forecast, and the forecast shapes the fill, so a change to the recommendation model can shift CDN load. The recommender and the demand forecaster are two faces of the same data, even though they sit nowhere near each other in the request path. Recommendations stay off the byte-delivery hot path, yet they are the reason proactive caching works at all.
+
+## A note on the hardware, because the trend is counterintuitive
+
+The fleet is 8,000-plus boxes, over a billion dollars invested, running FreeBSD with NGINX and BIRD, launched in 2012. The current Storage Appliance holds up to 120 TB of SSD at around 200 Gbps in a 2U chassis; the Global Appliance, for smaller ISPs, holds up to 60 TB at around 80 Gbps.
+
+Here is the nuance a staff engineer raises. An older spinning-disk box held up to 350 TB but pushed only a handful of 10 GbE ports. The newer SSD box holds far less and serves far more, on purpose, because the binding constraint at peak is not how much catalog a box can shelve, it is how fast it can serve concurrent streams. SSDs sustain ~200 Gbps of seek-free random reads; spinning disks cannot feed that many simultaneous streams no matter their capacity. "More disk equals better appliance" is exactly backwards for this workload.
+
+## Encoding: the one heavy thing, done offline
+
+Everything so far is the read path. The write path is the encoding pipeline: an embarrassingly parallel offline batch that never touches the serving path.
+
+It starts with one mezzanine master, a single very high bitrate source per title. That master is chunked, and every chunk is encoded independently and in parallel into the full matrix of resolution, bitrate, codec, and audio: a textbook map step, thousands of idempotent re-runnable jobs producing static files. It is the only compute-heavy part of the system, and it runs days or weeks before anyone presses play.
+
+The interesting evolution is how the ladder is chosen. The naive approach uses one fixed ladder for every title, and Netflix abandoned it in 2015. A talking-heads cartoon and a fireworks-heavy action film have wildly different complexity, so encoding both to the same 1750 kbps at 480p wastes bits on the cartoon and starves the action film.
+
+Per-title encoding fixed this. For each title, run trial encodes at several resolutions and quality levels (spaced about one just-noticeable-difference apart), plot quality against bitrate per resolution, and keep the points on the convex hull, the upper envelope where each bitrate gets its optimal resolution. The concrete payoff: at around 500 kbps a 480p or 720p encode actually beats a 1080p one on measured quality, because the 1080p version is too starved to look good, so the hull serves the lower resolution there. The headline result is roughly the same perceived quality at about 20% lower bitrate, and far more for simple content.
+
+Per-shot encoding (the Dynamic Optimizer) pushed granularity further, from multi-minute chunks down to the individual shot, around four seconds on average, so a one-hour episode becomes roughly 900 independently optimized shots instead of about 20 chunks. The reported savings: 17.1% average bitrate reduction optimizing for VMAF, 22.5% for PSNR. The hidden cost a senior names: 900 independent encodes explodes the batch fan-out and the bookkeeping, and shot boundaries must align with segment boundaries or the player shows quality pops at every shot change.
+
+That VMAF is the quality metric, and it is a strategic choice, not a detail. Netflix open-sourced it in 2016: an SVM regression fusing visual information fidelity, a detail-loss metric, and motion into a 0-to-100 score that tracks human opinion far better than the old PSNR and SSIM. Why does the metric matter to the architecture? Optimizing PSNR over-spends bits on fidelity nobody can perceive; optimizing VMAF cuts around 20% of bitrate at equal perceived quality. Bitrate is egress, and egress is the dominant cost, so encoding quality and CDN cost are the same lever pulled from two ends. A better quality metric is, quite literally, a cheaper CDN.
+
+## Adaptive bitrate: the client is in charge
+
+The last subsystem runs on your device, and the key reversal is that the server adapts nothing. The client does.
+
+When a stream starts, the player fetches a manifest (a `.mpd` for DASH, a `.m3u8` for HLS) advertising every rendition and each segment's URL. From there the player runs a control loop: download segments one at a time, estimate throughput from how fast recent ones arrived, watch how full the playback buffer is, and step quality up when there is headroom or down when the buffer risks draining and stalling. The appliance just serves whatever segment URL the player asks for. All the intelligence is client-side.
+
+```
+   player control loop, per segment:
+     estimate throughput (recent download speed)
+     read buffer occupancy (seconds of video queued)
+        |
+     decide next bitrate:
+        buffer healthy + throughput high  -> step up
+        buffer draining or throughput low -> step down
+        |
+     fetch next segment at chosen bitrate -> update buffer -> repeat
+```
+
+There are two families of ABR algorithm and one synthesis. Rate-based ones predict the next bitrate from recent download throughput. Buffer-based ones, the canonical being BOLA, map buffer occupancy directly to a bitrate choice with provable near-optimality, the appeal being that buffer level is a fact you measured rather than a future you guessed. Production players, including dash.js, use MPC-style hybrids that blend the two signals. The tension they navigate is three-way: rebuffer rate versus average bitrate versus how often you switch. Push bitrate too hard and you rebuffer; switch too eagerly and the picture visibly pulses. Tuning that is tuning quality of experience, and a rebuffer is exactly the kind of [tail-latency event](/blog/latency-throughput-tail) the player exists to avoid: the average segment arriving on time is no comfort if the one that drains your buffer arrives late.
+
+One pragmatic note: DASH versus HLS is not a war you have to win. DASH is a codec-agnostic ISO standard, HLS is mandated on Apple devices, and a real design serves both over the same segments (often via CMAF) instead of storing everything twice.
+
+## How a senior frames the whole thing
+
+A one-paragraph version to anchor the interview: Netflix is read-mostly and egress-dominated, so the question is where the bytes live at the moment of play and who decides that. Answer it with a control-plane and data-plane split. AWS decides who you are, what you can watch, which files you need, and which box should serve them. Open Connect, a purpose-built CDN of appliances embedded inside ISPs, only stores and serves bytes, proactively filled overnight from a demand forecast so 100% of peak capacity goes to serving. Steering is BGP best-path and soft state, recomputed on every play, which makes the system self-healing and any single appliance disposable. Encoding is an offline batch that optimizes per-title and per-shot ladders against VMAF, because cutting bitrate at equal perceived quality is the same as cutting CDN cost. The client owns adaptive bitrate; the server is dumb. And recommendations sit off the hot path but quietly drive the forecast that makes the caching work.
+
+The boundary that matters most is the line between those two planes. The same split that lets the cloud and the CDN scale on different curves keeps an AWS outage from stopping a movie already playing and makes it safe to put a Netflix server inside a stranger's network. One architectural decision, paying off as scalability, as a failure boundary, and as a security model at once. That is the kind of decision worth leading with, the way the best answers to [Design Twitter](/blog/design-twitter-feed) lead with the fan-out choice rather than discovering it halfway through.
+
+It is also a clean contrast with systems where the hard part is the write path. [Kafka vs queues](/blog/kafka-vs-queues) is about durable ordered writes; [idempotency and the exactly-once lie](/blog/idempotency-exactly-once) is about making duplicate writes safe; [CRDTs](/blog/crdts) and the [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) spectrum exist because concurrent writes to shared state are genuinely hard. A live hub like the one behind [NomadCrew](/case-study/nomadcrew), pushing presence and location over WebSockets, is write-heavy and order-sensitive in exactly the ways Netflix is not, as are the siblings in this batch: [Design WhatsApp](/blog/design-whatsapp), [Design Google Docs](/blog/design-google-docs), and [Dropbox-style file sync](/blog/file-storage-sync). Netflix sidesteps all of it by being read-mostly; there is no consensus problem when nobody is writing. The trade is that your entire cost and effort shift to a problem few systems face at this magnitude: delivering an ocean of static bytes to the exact place each viewer is sitting, a few milliseconds before they want them. Build for that, and you have designed Netflix.
+
+## FAQ
+
+<FAQ />

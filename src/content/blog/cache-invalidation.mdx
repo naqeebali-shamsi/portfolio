@@ -1,0 +1,145 @@
+export const meta = {
+  slug: 'cache-invalidation',
+  title: 'Cache Invalidation: The Hardest Easy Problem in Computer Science',
+  description:
+    'Why cache invalidation is genuinely hard: the stale-set race, why you delete instead of update, leases, the dual-write problem, and the staleness budget.',
+  headline: 'Cache Invalidation: The Hardest Easy Problem in Computer Science',
+  deck: 'A cache is a copy that is allowed to lie, and the entire discipline is bounding how much it lies and for how long.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['caching', 'distributed-systems', 'cache-invalidation', 'consistency', 'cdc', 'system-design'],
+  faq: [
+    {
+      q: 'Why is cache invalidation considered so hard?',
+      a: "Because a cache is a copy of data that lives apart from its source of truth, and the source keeps changing under concurrency. Keeping the copy honest means detecting every change that matters, propagating it before a reader trusts the stale value, and surviving races where a slow reader writes an old value after a newer delete. None of those are individually exotic, but together they make a one-line idea (remove the entry when the data changes) quietly fail in production.",
+    },
+    {
+      q: 'Why delete the cache entry instead of updating it on a write?',
+      a: "Because deletes are idempotent and the cache is not the authoritative copy. Two writers racing to set different versions can leave the older one clobbered on top of the newer; two writers racing to delete both converge on absent, and the next read re-fills from the source of truth. Deleting also means the cache never has to understand your write format. Facebook chose delete-on-write at scale for exactly this reason in the NSDI 2013 Memcache paper.",
+    },
+    {
+      q: 'What is a staleness budget?',
+      a: "The explicit tolerance for how out of date a piece of data is allowed to be. Instead of asking how to keep a cache perfectly fresh (usually impossible and rarely necessary), you ask how stale you are allowed to be and what the worst case is when you exceed it. Prices, inventory, and permissions each get a different budget. RFC 5861's stale-while-revalidate turns this idea into a wire-level header.",
+    },
+    {
+      q: 'Does delete-on-write make a cache consistent?',
+      a: "No. A slow reader that missed before your write can still set the old value into the cache after your delete lands, poisoning the entry until the next write or TTL. This is the stale-set race. Closing it requires a per-key lease or fence token that rejects any write carrying a token older than the latest invalidation, which is what Facebook's lease mechanism does.",
+    },
+    {
+      q: 'When should I use event-driven invalidation versus a TTL?',
+      a: "Use event-driven invalidation (ideally driven off the database transaction log via change data capture) only where the staleness budget is near zero, such as authorization decisions or anything that gates money. Let everything else ride a TTL with per-key jitter. Event-driven invalidation is more machinery and more failure modes, so spend it where stale data is genuinely dangerous and let the budget decide.",
+    },
+  ],
+}
+
+There is a joke every engineer has heard, usually attributed to Phil Karlton: there are only two hard things in computer science, cache invalidation and naming things. It survives because the first half is literally true, and the reason is more interesting than the joke.
+
+Worth being honest about the quote: there is no contemporaneous written record of Karlton saying it. His son places it at Netscape, and Martin Fowler traced the first sighting anywhere online to Tim Bray's blog around 1996 or 1997. So it is attributed, not documented. What is not in doubt is why it landed: caching and naming are the same problem in different clothes, both about the gap between a copy or a name and the actual thing it points at.
+
+A cache is a copy that is allowed to lie. That is the whole of it. You keep a faster, closer duplicate of some data so you do not pay for the slow path every time, and the moment you make that duplicate you have signed up to keep a known-stale copy honest against a source that will not stop changing, while writers and readers race through it. Eliminating the lie is not the job. Bounding it is: how much it can lie, and for how long.
+
+## The job is detection, not deletion
+
+State "invalidate the cache when the data changes" and it sounds like a one-liner. The deletion is trivial: `DEL user:42:profile` is one call. The hard part is the word "when." To invalidate on change you have to know, reliably, every time the underlying data changes, in time to act before a reader trusts the stale copy. How do you observe every write, including the ones that bypass your application and hit the database directly? How do you stop a slow reader from writing a stale value back after your delete? What happens when one row backs a hundred derived entries, or a hot key's invalidation stampedes the origin? Each is a real distributed-systems problem, and stacked together behind a one-line API is why the joke is true. The rest of this is the stack.
+
+## Pick your poison: the write patterns and how each one fails
+
+Before invalidation, you choose how reads and writes flow through the cache. The useful way to learn the handful of patterns is by failure mode, since the happy path looks identical across them.
+
+**Cache-aside** (lazy-loading, look-aside) is the default. The application reads the cache; on a miss it loads from the store and populates the cache; on a write it updates the store and invalidates the entry. Simple, and the cache only holds data someone asked for. It goes stale on any write that bypasses the application, and the first reader of each key eats the slow path. Microsoft's documentation says the quiet part out loud: cache-aside "doesn't guarantee consistency between the data store and the cache," because "an external process can change an item in the data store at any time."
+
+The rest vary who mediates the read and write. **Read-through** pushes load-on-miss into the cache layer (cleaner code, same staleness, plus the cache must know how to load your data). **Write-through** writes cache and store synchronously (consistent at write time, at the cost of write latency and caching data nobody may read). **Write-back** writes the cache and acknowledges immediately, flushing later (fast writes, but a node death before the flush loses acknowledged writes). **Write-around** writes straight to the store and skips the cache (good when fresh writes are rarely read back soon, at the cost of a guaranteed first-read miss).
+
+The senior move is naming, for the pattern in front of you, exactly which guarantee it buys and which it gives up. "We use write-back here, so a node failure can lose up to one flush interval of acknowledged writes, and we accept that because this data is regenerable" ends an architecture argument. "We use write-back because it is fast" starts one. The [system design interview framework](/blog/system-design-interview-framework) treats this skill, stating the tradeoff before the choice, as what separates a passing answer from a senior one.
+
+## TTL is not freshness
+
+The most common invalidation strategy is to set a time-to-live and let entries expire. It is also the most misunderstood, because people reach for a TTL and quietly believe they have bought fresh data when they have bought the opposite.
+
+A TTL guarantees stale data for the entire window. Set a five-minute TTL on a value that changes, and for up to five minutes after it changes, every reader gets the old value, by design. The TTL does not eliminate staleness, it bounds it, and that bound is the entire value as long as you state it accurately: "we serve data up to five minutes stale here."
+
+The instinct is to shorten the TTL, and this is where the tradeoff bites with no free corner. A key changes about once an hour and you set a five-minute TTL; at ten thousand reads per second with a 99% hit rate, the origin sees roughly a hundred refills per second. Drop the TTL to five seconds to cut staleness sixtyfold and the refill load jumps sixtyfold too, to thousands of requests per second, and you have started building a stampede by hand. The TTL knob trades the staleness window against origin load directly: you cannot turn one down without turning the other up. Anyone who tells you a TTL gives you fresh data has not drawn that curve.
+
+One refinement is mandatory: jitter. If a fleet of entries is populated together (a deploy, a warm-up, a cold-cache fill) and they all carry the same TTL, they expire in lockstep and stampede the origin at the same instant. Add a per-key random jitter to every TTL so expirations spread out instead of detonating together. Cache topology and replication get the fuller treatment in [the distributed cache](/blog/distributed-cache); the load-bearing point here is narrow: a TTL is a staleness bound with an origin-load price, never a freshness guarantee.
+
+## The race nobody draws on the whiteboard
+
+Here is the bug that makes cache invalidation genuinely hard, the one that separates engineers who have run a cache in anger from those who have only read about it: the stale-set race, a motivating problem behind Facebook's Memcache design. Take a single key, `user:42:profile`, a reader R, and a writer W.
+
+1. At t0, reader R misses the cache and reads the database, getting **v1**, not yet written back.
+2. At t1, writer W commits **v2** to the database, then deletes the cache key. (It does everything right: update the store, then invalidate. Textbook.)
+3. At t2, reader R (descheduled between its read and its set, as processes are) runs `set(user:42:profile, v1)`.
+
+```
+   t0  R: miss, read DB -> v1            (R holds v1, not yet written)
+   t1  W: commit v2 to DB, DEL cache     (cache empty, DB = v2)
+   t2  R: SET cache = v1   <-- poisons   (cache = v1, DB = v2, stale)
+```
+
+Now the cache holds **v1** while the database holds **v2**, until the next write or TTL expiry. A reader that arrived a microsecond too late wrote an old value on top of a correct deletion. This is why delete-on-write alone does not make a cache consistent, however carefully you order the write and the delete: the gap between R's read and R's set is a window another writer can complete inside, and application code cannot close it, because the two halves of R's operation straddle a deschedule it does not control.
+
+The fix is a lease, the cache equivalent of a fence token. When R misses, the cache hands it a token bound to that key; when W deletes the key at t1, the cache invalidates that token; when R tries to set at t2, the cache sees the token is dead and rejects the write, so it stays empty and the next reader re-fills v2 cleanly. Facebook frames leases as working "in a manner similar to how load-link/store-conditional operates," the CPU primitive where a store succeeds only if nothing touched the location since the matching load. Same idea on a cache key: reject any write carrying a token older than the latest invalidation.
+
+The same shape shows up in [event-driven RBAC](/blog/event-driven-rbac): a cached authorization decision is another copy allowed to lie, and a fence (the policy version it was computed against) is what lets you reject a stale "allow" after the policy changed. Identical mechanism, higher stakes.
+
+## Delete, do not update
+
+The lease story rests on a design choice worth stating on its own, the most quotable line in the Memcache paper. Facebook wrote: "We choose to delete cached data instead of updating it because deletes are idempotent. Memcache is not the authoritative source of the data and is therefore allowed to evict cached data."
+
+Sit with why deleting beats updating. Two writers each try to keep the cache fresh by writing the new value in. A writes v2; B writes v3. If their writes race and land out of order, the cache holds v2 on top of v3, the older value clobbering the newer, and stays wrong until something corrects it. Value-sets do not converge under concurrency. Have both writers delete instead, and "delete then delete" is "absent" in either order, so the next read re-fills from the source of truth. Deletes converge; sets do not.
+
+A second reason: updating forces the cache to understand your write format and derived fields, so every site that mutates the data also mutates its cached shape, each a chance to write the wrong thing. Deleting asks the cache to understand nothing. Because the cache is non-authoritative, the right verb is forget, not correct.
+
+## The dual-write problem, and the only real fix
+
+Even with delete-on-write and leases, a failure sits one level up, and it breaks the most production systems. The dual-write problem.
+
+You write to the database, then delete from the cache. Two systems, two operations, no shared transaction. So ask what happens if the process crashes after the commit and before the delete. The database holds v2, the cache still holds v1, and nothing will ever reconcile them, because the only code that knew to delete is gone and the next reader is served v1 with full confidence. The same hole exists for any "write system A, then write system B" pattern, including writing to a queue after a commit. A crash in the gap desyncs the two permanently.
+
+You cannot fix this with careful ordering or a retry, because the crash takes the retry with it. Two independent writes to two systems can never be made atomic by application code. The only real fix is to stop doing two writes: make one atomic write whose side effects are derived from it.
+
+That is the transactional outbox: in the same transaction that writes your state change, you write a row to an `outbox` table describing the event to propagate, so the change and the intent to invalidate commit or roll back together. A separate relay reads the outbox and performs the invalidation, retrying freely because the intent was recorded durably exactly once. Pushing idempotency across a boundary you cannot wrap in a transaction is the same move that makes [idempotent webhooks](/blog/idempotent-webhooks) safe.
+
+The cleaner version reads the database transaction log directly, which is [change data capture](/blog/change-data-capture). You tap the committed log the database already keeps for replication and turn each change into an invalidation event. The Debezium team puts the failure it cures sharply: with manual invalidation "it's vital to not forget about calling that invalidation functionality," and worse, "when bypassing the application, e.g. when modifying records directly in the database," an ORM "has no way of knowing that the cached data has become stale." Because CDC reads the committed log, it cannot miss a write, including the out-of-band ones a migration or manual `UPDATE` performs behind your application's back. The point is not that CDC is a nicer way to call `invalidate()`. It is that the log becomes the one ordering authority, so the cache can no longer silently desync.
+
+## Stampede: when invalidation succeeds too well
+
+Suppose every race is closed and the cache is correct. There is still a way to take down the database, and invalidation working exactly as designed is what causes it. A hot key expires, and every concurrent reader misses at once. Ten thousand readers on one key, a regeneration that takes two hundred milliseconds: they all miss simultaneously and fire the same expensive query before the first refill completes, turning one expiry into a ten-thousand-times origin spike on a single key. This is the thundering herd, also called a cache stampede or dogpile, and Facebook described it precisely: "as the write activity repeatedly invalidates the recently set values, many reads default to the more costly path."
+
+Three real defenses, in rough order of sophistication.
+
+**Single-flight** (request coalescing) lets only one reader through to regenerate the value while the others wait for its result. Simple in a single process; across many processes you need a shared lock, with its own coordination cost.
+
+**Stale-while-revalidate** serves the stale value instantly while one background task revalidates, so nobody waits and the herd never forms. RFC 5861 made this a wire-level primitive: `Cache-Control: max-age=600, stale-while-revalidate=30` means "fresh for ten minutes, and for thirty seconds past that, serve the stale copy instantly while you revalidate in the background." The same RFC adds `stale-if-error` ("if the origin is down, keep serving stale rather than erroring"), which CDNs like Fastly and browsers both implement.
+
+**Probabilistic early expiration** is the elegant one, and it is provably optimal. Each reader independently rolls a small random number weighted by how expensive the value is to recompute, and refreshes early if it wins, while the value is still valid. The published algorithm (sometimes called XFetch) has the property that, on average, exactly one reader refreshes just before expiry, with no synchronized cliff and no lock. The paper proves this exponential form optimal "in terms of its effectiveness in preventing stampedes."
+
+What does not work, despite being the first reach, is "add some random jitter." Jitter helps a little by smearing expirations, and you should use it on TTLs as established earlier, but two thousand simultaneous misses instead of ten thousand is still a stampede. Jitter smooths; it does not coalesce, and the herd needs coalescing.
+
+At Facebook's scale the stakes are concrete: "billions of requests per second," "trillions of items," and a single hot key's herd that can saturate a database shard. That is why their lease mechanism also throttles regeneration, handing out a token "only once every 10 seconds per key" and telling other readers in that window to wait briefly, by which time "the data is often present in cache." [Consistent hashing](/blog/consistent-hashing) decides which node owns each key, and it plus [replication](/blog/replication-strategies) shape how a stampede spreads.
+
+## The reframe that makes it tractable: the staleness budget
+
+Everything above is mechanism. What makes cache invalidation solvable rather than endless is a change of question. The junior question is "how do we keep the cache perfectly fresh." The senior question is "how stale are we allowed to be, and what is the worst case when we exceed it." That second question is the staleness budget, a distributed-systems problem reframed as the product decision it actually is.
+
+You almost never need perfect freshness. You need bounded staleness, and the bound differs by class of data. A display name a minute out of date harms nobody. An authorization decision one second stale after a permission is revoked can be a security incident. These are product facts, not engineering facts, and once you have them the strategy falls out almost mechanically.
+
+- Budget near zero (authorization, money-gating): event-driven invalidation off the transaction log, with a lease to close the stale-set race.
+- Budget of seconds (prices, inventory): stale-while-revalidate, or a short TTL with early-expiration to head off the stampede it would otherwise cause.
+- Budget of minutes (most application data): a TTL with per-key jitter. Cheap, boring, correct.
+- Budget of hours (reference data, slow config): a long TTL, and stop thinking about it.
+
+[Event-driven RBAC](/blog/event-driven-rbac) is the budget-near-zero corner in practice: an authorization service knows the exact moment a policy change makes a cached decision wrong, so it event-invalidates that tiny critical slice while low-stakes data rides a TTL. The discipline is to spend expensive invalidation only where the budget is near zero and let everything else ride the cheapest strategy that fits. Trying to make the whole cache strongly consistent burns a quarter on machinery the data never needed, and usually means you should ask whether that data needs caching at all. A cache is, by definition, a copy allowed to lie; if you cannot tolerate any lie, you do not want a cache, you want the source of truth.
+
+## What actually separates the seniors
+
+Three sentences hold it. A cache is a copy allowed to lie, so the work is bounding how much it lies and for how long, never eliminating the lie. Delete instead of update because deletes are idempotent, close the stale-set race with leases, and kill the dual-write with an outbox feeding change data capture so the log is the one ordering authority. And you rarely need perfect freshness, you need a staleness budget, so spend event-driven invalidation only where that budget is near zero and let everything else ride a TTL with jitter.
+
+These patterns connect outward. The same outbox-and-CDC spine that keeps a cache honest is how [IntelliFill](/case-study/intellifill) keeps derived state in step with its source documents, and the "treat the event as a hint, re-read the truth" instinct keeps [Aladeen](/case-study/aladeen) and [Audex](/case-study/audex) correct when inputs arrive in a messy order. For how caches sit beside replication and partitioning, [the database mindmap](/blog/database-mindmap) is the wider territory.
+
+The joke says cache invalidation is hard, and it is. The reason is not that any single piece is exotic. It is that a one-line idea has to survive concurrency, out-of-band writes, crashes between two systems, and a herd that forms the instant you do the invalidation right. The engineers who make it look easy did not find a trick that erased the difficulty. They asked a sharper question, how stale are we allowed to be, and spent their hardest machinery only where the answer demanded it.
+
+## FAQ
+
+<FAQ />

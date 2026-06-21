@@ -1,0 +1,210 @@
+export const meta = {
+  slug: 'ledger-double-entry',
+  title: 'How to Design a Ledger: Double-Entry Accounting for Engineers',
+  description:
+    'A mutable balance column is a bug: it races, it forgets, it cannot explain itself. Build a ledger as an append-only log of debits and credits, balance a query.',
+  headline: 'How to Design a Ledger: Double-Entry Accounting for Engineers',
+  deck: 'A balance is not a number you store, it is a sum you prove every time someone asks.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['ledger', 'double-entry', 'accounting', 'databases', 'fintech', 'system-design'],
+  faq: [
+    {
+      q: 'Why not just store a balance column and update it?',
+      a: "Three reasons, and any one of them is enough. It races: two concurrent transfers both read 100, both subtract, both write 90, and you have lost an update. It forgets: an UPDATE overwrites the old value, so there is no record of how the balance got where it is. And it cannot explain itself: when a customer disputes a number, you have nothing to show them but the number. A ledger fixes all three by storing immutable entries and deriving the balance as a sum over them.",
+    },
+    {
+      q: 'Does a debit mean money out and a credit mean money in?',
+      a: "No, and this is the single most common confusion. The meaning flips depending on the account type. A debit increases an asset account but decreases a liability account. The intuition comes from your bank statement, where a debit reduces your money, but that statement is written from the bank's point of view, not yours. To the bank your deposit is a liability it owes you, so crediting it increases what the bank owes. Learn the rule per account type and ignore the bank-statement reflex.",
+    },
+    {
+      q: 'How do you correct a mistake in an immutable ledger?',
+      a: "You never edit or delete. You append a reversing entry that cancels the original, then append the corrected entry, both as new transactions. The original stays exactly where it was. This preserves the audit trail and the attribution chain, so you can always answer how a balance got to its current value. Editing in place destroys the forensic record, which is the entire reason you built a ledger instead of a balance column.",
+    },
+    {
+      q: 'What is the difference between posted, pending, and available balance?',
+      a: "Posted is settled money: transactions that have fully cleared. Pending is money in flight: holds and authorizations that have not yet settled. Available is the conservative figure you are actually allowed to spend, computed by subtracting pending debits from the posted balance. A single balance number is not enough in production because money that is authorized but not captured is not yet money you have, and money on hold is not money you can spend again.",
+    },
+    {
+      q: 'Why store money as integers instead of floats?',
+      a: "Floating-point arithmetic cannot represent most decimal fractions exactly, so sums drift by fractions of a cent and silently break the invariant that debits equal credits. Store money as an integer count of the smallest currency unit, cents for dollars, satoshi for bitcoin, or use a fixed-precision decimal type. The ledger's correctness rests on exact equality, and floats cannot give you exact equality.",
+    },
+  ],
+}
+
+Somewhere in almost every application that touches money there is a column called `balance` and a line of code that does `UPDATE accounts SET balance = balance - 50`. It looks innocent. It passes every test. It is a bug.
+
+Not a subtle one either. That column has three distinct failures baked in, and a real product hits all three: it races, it forgets, and it cannot explain itself.
+
+The fix is not a clever lock or a faster database. It is a 500-year-old accounting discipline that engineers keep rediscovering the hard way: build the ledger as an append-only log of balanced debits and credits, where the balance is something you compute, not something you store. If you have read [the payment system](/blog/payment-system) walkthrough, this is the data model living underneath it.
+
+## The bug in the balance column
+
+Start with the race, because it is the one that costs money first.
+
+Two requests arrive at the same moment to move funds out of the same account, which currently holds 100. Both run the same read-modify-write.
+
+```
+Request A: read balance -> 100
+Request B: read balance -> 100
+Request A: 100 - 50 = 50,  write 50
+Request B: 100 - 30 = 70,  write 70
+Final balance: 70
+```
+
+The account should hold 20. It holds 70. Fifty dollars appeared out of nothing, because B read the balance before A's write landed and then clobbered it. This is the classic lost-update anomaly, and it is invisible in any test that fires one request at a time; it only shows up under the concurrency production guarantees and your test suite never reproduces. The mechanics of why your database does or does not stop this live in [MVCC and isolation levels](/blog/mvcc-isolation-levels), and we will return to them.
+
+The second failure is quieter and worse. `UPDATE balance = 70` destroys the fact that it was ever 100: no record that money moved, when, or why, just a current value and total amnesia about how it got there. For a cache that is fine. For money it is malpractice, because the first time anything goes wrong everyone asks "what happened?" and your schema has thrown away the only possible answer.
+
+The third failure ends up in a support ticket. A customer says the balance is wrong, and you cannot prove them right or wrong, because a single mutable number is an assertion with no evidence. You are left trusting the very code whose correctness is in question.
+
+All three share one root cause: you stored a derived fact as if it were primary. The balance is a consequence of money movements. Store the movements.
+
+## The fix accountants already shipped in 1494
+
+Here is the reframing that makes everything else fall into place. A balance is the running total of every movement into and out of an account, so do not keep the total. Keep the movements, append-only, and add them up when you need the answer.
+
+The accountants worked this out long ago. In 1494 a Franciscan friar named Luca Pacioli wrote down the method Venetian merchants already used, and double-entry bookkeeping has been the lingua franca of money ever since. The idea is almost suspiciously simple: every transaction is recorded in at least two accounts, as equal and opposite **debits** and **credits**, such that the transaction sums to zero.
+
+That zero-sum rule is the whole engine. Money never appears or vanishes; it only moves between accounts. Debit one account and you must credit another by the same amount, so the total across all accounts is unchanged. TigerBeetle, a database built for exactly this, puts it well: two entities, accounts and transfers, and one invariant, every debit has an equal and opposite credit, can model any exchange of value in any domain. Square states it operationally: every journal entry must balance to zero, so each cent lost somewhere is matched by a cent gained somewhere.
+
+For an engineer, the payoff is that this invariant is *checkable*. At any instant, the sum of all debits across the system must equal the sum of all credits, and that is not a slogan, it is a query you can run in production continuously and alert on the moment it drifts by a cent. Stripe treats double-entry in its own ledger as a mathematical proof of correctness and reconciles against it constantly. A balance column gives you a number to trust. A ledger gives you an invariant to verify. That difference is the entire reason this design exists.
+
+## The schema: three tables, no UPDATE
+
+The data model that falls out of this is small. Three tables carry it, synthesized from how Square, Modern Treasury, and TigerBeetle describe their own.
+
+```
+accounts      (id, name, type, currency, normal_balance)
+              -- normal_balance is 'debit' or 'credit'
+
+transactions  (id, occurred_at, idempotency_key UNIQUE, description, status)
+              -- one atomic money-movement event
+
+entries       (id, transaction_id FK, account_id FK, direction, amount, currency)
+              -- direction is 'debit' or 'credit'
+              -- amount is a positive integer in minor units
+              -- INSERT only. Never UPDATE. Never DELETE.
+```
+
+An **account** is a labeled pool of value. A **transaction** is one atomic event that moves money. An **entry** is a single debit or credit line belonging to exactly one account and one transaction. The entries are the atoms, and the rule that makes this a ledger rather than a log is enforced at write time: within a transaction, for each currency, the debit amounts must sum to exactly the credit amounts.
+
+The hard constraint, the one a junior implementation always softens, is that `entries` is insert-only: no `UPDATE`, no `DELETE`. Square states this flatly about its own tables, only inserts and no updates, because once data is mutated the old value is gone and you can no longer reconstruct what changed. Immutability is not a stylistic preference; it is the property that makes the audit trail exist at all.
+
+A $50 transfer from Alice's wallet to Bob's is one transaction with two entries: a `debit` of `5000` against Alice and a `credit` of `5000` to Bob. Note the amount: `5000`, not `50.00`. Store money as an integer count of minor units, cents here, so the invariant rests on exact integer equality. Use a float and rounding drifts your sums by fractions of a cent, silently violating debit-equals-credit. There is no acceptable use of `float` for money: integer minor units or a fixed-precision decimal type, nothing else.
+
+## Debit and credit do not mean what your bank taught you
+
+This is where most engineers trip. The reflex says debit means money out and credit means money in, and that reflex is wrong for roughly half of all accounts. The meaning of a debit or credit depends on the account's **type**. Asset and expense accounts are *debit-normal*: a debit increases them, a credit decreases them. Liability, equity, and revenue accounts are *credit-normal*: a credit increases them, a debit decreases them.
+
+| Account type | Debit | Credit | Normal balance |
+| --- | :---: | :---: | --- |
+| Asset | increase | decrease | Debit |
+| Expense | increase | decrease | Debit |
+| Liability | decrease | increase | Credit |
+| Equity | decrease | increase | Credit |
+| Revenue | decrease | increase | Credit |
+
+Why does your bank statement say "debit" when money leaves? Because it is written from the bank's point of view, not yours. Your deposit is, to the bank, a liability: money it owes you. Liabilities are credit-normal, so crediting your account increases what the bank owes, and a withdrawal debits it down. The statement is internally consistent; it is just keeping the bank's books, not yours. Carry that intuition into your own ledger and you get the sign wrong on every liability.
+
+The mnemonic worth memorizing is DEALER: **D**ebits increase **E**xpenses and **A**ssets; **L**iabilities, **E**quity, and **R**evenue increase on credit. Underneath it sits the accounting equation every transaction must preserve: Assets equal Liabilities plus Equity. Every balanced entry keeps that equation true.
+
+## The balance is a query, not a column
+
+With entries stored immutably, a balance is a fold over them.
+
+```sql
+-- balance of a debit-normal account (asset, expense)
+SELECT COALESCE(
+  SUM(CASE WHEN direction = 'debit' THEN amount ELSE -amount END), 0)
+FROM entries
+WHERE account_id = :id;
+
+-- credit-normal accounts (liability, equity, revenue): flip the signs
+```
+
+The balance is computed on demand from the durable, append-only truth. There is no `balance` column to corrupt, because there is no `balance` column. The lost-update race from the opening cannot happen, because nobody reads a balance, modifies it, and writes it back: two concurrent transfers are just two pairs of inserts, and inserts do not clobber each other. The moment you want to `UPDATE` a number to keep money correct, you have left the ledger and walked back into the bug.
+
+A real ledger does keep more than one number, because in production a balance is genuinely several balances: TigerBeetle models an account as four figures, debits and credits each split into pending and posted. The split exists because money in flight is not money at rest, which is the next thing to get right.
+
+## Why you reverse, and never edit
+
+Eventually an entry will be wrong: a transfer posts for the wrong amount, a charge lands on the wrong account, a duplicate slips through. The instinct is to fix it in place with an `UPDATE`, or worse, to delete the bad row and insert a good one. Both destroy the thing you built the ledger to keep.
+
+The discipline is to correct by appending. Leave the original where it is, append a new transaction that reverses it, then append another with the correct amount. The mistake, the reversal, and the correction all stay visible, so anyone auditing the account sees the full story: what happened, that it was wrong, and how it was fixed.
+
+The failure mode editing in place creates is sharper than "you lose history." Imagine a marketplace that has already paid out to a seller on an order amount, and then someone edits that amount in place. The money already moved on the old number, so there is now no way to attribute the adjustment back to the original payout; the edit orphans the correction. Append a reversal instead and the adjustment is a first-class transaction with its own identity, linked to the original. Multiple transactions can point at one order, which is exactly what you want: a chain, not an overwrite.
+
+Two flavors of correction exist, and a senior author picks deliberately: full reverse-and-rebook cancels the original and posts a fresh correct one, the cleanest record for a contested or customer-facing entry, while a single delta entry posts only the difference, cheaper but subtler to audit, for nudging an internal figure at volume.
+
+Be precise about scope, too. The ledger is the source of truth for money movement and nothing more; business facts like an order's price are *linked* to ledger transactions, not copied into them. Conflate the two and every business-state change starts wanting to mutate the ledger, which is how immutability quietly dies.
+
+## Holds: posted, pending, and available
+
+A bank authorization makes the point. You swipe a card at a hotel, it authorizes $200, and the money is neither fully gone nor fully yours. It is on hold, and a ledger that knows only one balance cannot represent it, which is why production ledgers track three.
+
+**Posted** is settled money. **Pending** is money in flight: holds and authorizations not yet final. **Available** is the conservative figure you are cleared to spend, the posted balance minus pending debits. The conservatism is deliberate: you approve against available, never posted, so an authorized-but-uncaptured charge cannot be spent twice. Money that might leave is treated as already gone.
+
+This lifecycle has a name: the two-phase transfer, or hold-then-capture. TigerBeetle models it as a small state machine:
+
+```
+1. PENDING transfer, amount 4000, flags.pending, timeout 3600s
+     -> reserves into debits_pending / credits_pending  (the hold)
+
+2a. POST   -> post_pending_transfer   (full, partial, or up to the max)
+              moves pending -> posted
+2b. VOID   -> void_pending_transfer
+              releases the full reserved amount, untouched
+2c. TIMEOUT -> unresolved after 3600s, auto-released
+```
+
+The guarantee that makes this safe is that the resolving step can never break an account's configured balance invariants, and that each step is a *new* transfer with its own id pointing back at the pending one. The original pending transfer stays immutable; the hold resolves into a posted movement, a release, or an expiry, every transition recorded rather than mutated. Holds are unavoidable because settlement is not instant, a bank transaction can sit pending for days. Modeling pending as a first-class lifecycle, mutable intent resolving into immutable fact, is what lets a ledger represent the real timeline of money instead of pretending every movement is instantaneous.
+
+## Idempotency: the same transfer, submitted twice
+
+Networks retry. A client fires a transfer, the response is lost, the client cannot tell whether it happened, so it fires again, and a ledger that processes both posts the money twice. This is the at-least-once reality behind [idempotency and the exactly-once lie](/blog/idempotency-exactly-once), pointed straight at your books.
+
+The defense is the `idempotency_key` already in the transactions table, with a `UNIQUE` constraint on it. The client supplies a stable key, identical across every retry of the same logical transfer. The first attempt inserts and posts; the retry hits the unique constraint, fails to insert, and instead of erroring you replay the original result. Stripe runs exactly this, holding keys for 24 hours and replaying the cached response on any reuse.
+
+```
+Transaction T1  (idempotency_key = "xfer-9f3a")  -> inserts, posts
+Retry of T1     (idempotency_key = "xfer-9f3a")  -> UNIQUE conflict
+                                                 -> replay original result, no double-post
+```
+
+The constraint is doing real concurrency work, not just validation. It serializes concurrent writers down to a single winner, the same role the database plays for [distributed locks](/blog/distributed-locks) and the same reason the unique index, not application code, has to be the referee: check-then-insert in application code leaves a gap a concurrent retry slips straight through. The unique key is the 80% solution. The staff-grade version, for when a half-completed transfer across two systems becomes a real failure mode, is Brandur Leach's recovery-point state machine: persist the phases of a transfer atomically so a crash mid-flight resumes correctly, and isolate the external charge from the local database transaction.
+
+## The consistency money actually demands
+
+Underneath all of this is a choice you do not get to skip: what consistency model guards concurrent writes to the same account. There is no single right answer, which is the ledger-shaped instance of the tensions in [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum).
+
+Modern Treasury chose optimistic locking for its Ledgers API, and explained it crisply: they expected most operations to be reads, and did not want reads to block writes or writes to block reads. Each account carries a `lock_version`; a writer commits only if the version is unchanged, and a conflict rolls back to retry. Optimistic control suits a read-heavy ledger where conflicts are rare, because it never makes readers wait. When conflicts are common the retrying becomes its own cost, and pessimistic locking, `SELECT ... FOR UPDATE`, or `SERIALIZABLE` isolation earns its keep by serializing contended writers directly.
+
+Then there is the failure mode scaling a ledger eventually hits: the hot account. A platform's revenue or fee account participates in nearly every transaction. Lock it pessimistically and you have serialized your entire system on one row. This single problem is the reason purpose-built ledger databases exist: TigerBeetle's whole premise is strong consistency without row locks, so hot accounts do not serialize the system, targeting a million transactions a second. Whether you need that is a real decision, and it connects to [latency and the tail](/blog/latency-throughput-tail): the hot account is where your tail latency goes to die.
+
+Money wants strict serializability, transactions appearing to execute one at a time in real-time order, and there is more than one way to buy it. State which you picked and why, the same way you would defend any consistency choice in [the system design interview framework](/blog/system-design-interview-framework).
+
+## The nuances a staff engineer raises
+
+A few more things separate a ledger that survives an audit from one that merely runs.
+
+**Balance per currency, never across it.** A multi-currency ledger must require debits to equal credits *within each currency*, separately. Net a euro debit against a dollar credit through an exchange rate and you can quietly create or destroy value, because the rate moves and the invariant only holds on exact equality. Real transactions are multi-leg anyway, with fees, taxes, and FX as separate entries, and the rule generalizes cleanly: within each currency, total debits equal total credits.
+
+**Snapshot balances for read performance, but never trust the snapshot.** Summing millions of entries on every read gets expensive, so production systems cache a materialized balance as of a particular version and only sum the entries after it. The discipline is that the snapshot is an optimization derived from the log, never the source of truth: you must be able to throw it away, recompute from entries, and get the identical answer. The moment the cache becomes authoritative, you have reinvented the balance column with extra steps. This is also why timestamps alone cannot order entries at scale: they collide and arrive out of order, so you need a monotonic per-account version, not just a `created_at`.
+
+**Immutability collides with the right to be forgotten.** Keep the *financial facts* immutable forever and hold *personal data* in a separate, referenceable store you can crypto-shred on request, so a GDPR deletion never has to touch the books.
+
+**Reconciliation is a live SLO, not a one-time property.** The invariant that debits equal credits system-wide is not something you verify once and forget. Stripe runs continuous reconciliation, tracking clearing, timeliness, and completeness, and treats double-entry as a monitored property rather than an assumption. The ledger gives you something *continuously checkable*; a serious system actually checks it and pages when it drifts. This is the instinct that produced [Audex](/case-study/audex), a financial-statement engine made byte-deterministic and locked behind a golden hash so any drift in output is caught the instant it happens. A ledger and a golden hash are the same idea at different layers: make correctness an invariant a machine can assert, not a claim a human has to trust.
+
+## The honest landing
+
+A ledger is not a fancier balance column. It is a different stance toward what money data is. The balance column treats the number as primary and the history as disposable; the ledger treats the movements as primary and the balance as derived, which inverts every failure. It cannot lose an update, because it never updates. It cannot forget, because it only appends. And it can always explain itself, because the explanation is the data.
+
+So store the movements, not the total. Keep the entries immutable, correct by reversal, and compute the balance as a query. Track posted, pending, and available separately, dedupe retries with a unique idempotency key, and pick a consistency model deliberately. And run the invariant as a live check, because a ledger's real gift is not the audit trail. It is that correctness becomes something a machine can prove, instead of something you hope is still true.
+
+The mutable balance column is the simplest thing that looks correct and the first thing you get paged for. The ledger is more code up front and the last thing that ever surprises you about where the money went.
+
+## FAQ
+
+<FAQ />

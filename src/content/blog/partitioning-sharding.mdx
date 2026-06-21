@@ -1,0 +1,152 @@
+export const meta = {
+  slug: 'partitioning-sharding',
+  title: 'Database Sharding: Splitting Data When One Machine Is Not Enough',
+  description:
+    'Sharding is the last scaling lever, and the shard key is the one decision you cannot take back. How range, hash, and consistent hashing trade off, and where each fails.',
+  headline: 'Database Sharding: Splitting Data When One Machine Is Not Enough',
+  deck: 'Sharding does not make your database faster. It trades a capacity ceiling for a permanent tax on every query that forgets the shard key.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '16 min',
+  tags: ['sharding', 'partitioning', 'distributed-systems', 'databases', 'scalability', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between partitioning and sharding?',
+      a: 'Partitioning is splitting one table into pieces; it can happen entirely within a single machine, the way Postgres table partitions live on one host. Sharding is partitioning across machines, so each piece sits on its own database server. The distinction matters because sharding is what introduces the network: cross-shard joins, distributed transactions, and rebalancing are problems you only inherit once the pieces live on separate hosts. Often the cheaper answer is single-node partitioning, which buys you a smaller working set per query without any of the distributed-systems tax.',
+    },
+    {
+      q: 'How do I choose a shard key?',
+      a: 'Three criteria, and a good key satisfies all of them. High cardinality, so there are enough distinct values to spread across many shards; even distribution, so no single value attracts a disproportionate share of data or traffic; and presence in your WHERE clauses and join keys, so queries can be routed to one shard instead of fanning out to all of them. Multi-tenant systems usually shard by tenant id, which scopes most queries to a single shard. The key choice is the most consequential and hardest-to-undo decision in the whole design, because changing it means relocating every row.',
+    },
+    {
+      q: 'Does hashing the shard key fix hot spots?',
+      a: 'Only one kind. Hashing evens out an uneven distribution of keys, so a million different user ids land roughly uniformly across shards. It does nothing for a single hot key, a celebrity account or a viral post, because every request for that one key still hashes to the same shard. Fixing a hot key needs a different toolkit: splitting the key with a suffix and fanning reads back in, coalescing duplicate concurrent requests, or caching the hot value in front of the database.',
+    },
+    {
+      q: 'Why is sharding considered a last resort?',
+      a: 'Because most of its decisions are irreversible and it taxes everything afterward. Once you shard, any query that does not include the shard key fans out to every shard and gets slower than it was on a single box, and cheap joins and transactions across shards become expensive or impossible. The senior ordering is to exhaust the reversible levers first: index and query tuning, caching, read replicas, and vertical scaling. Only when those run out do you split, and only on a key you are confident you will never have to change.',
+    },
+    {
+      q: 'Can I change the shard key later if I pick the wrong one?',
+      a: 'You can, but it is the single most expensive operation in the system, which is why people avoid doing it twice. Re-keying re-derives the location of every row, so it requires a full physical rebalance plus a live migration: double-writing to old and new, backfilling history in parallel, verifying with dark reads before cutover, and a brief read-only window to switch. Resharding into more shards of the same key is the well-trodden, automatable path. Re-keying is the thing nobody wants to repeat.',
+    },
+  ],
+}
+
+Every database starts on one machine, and for a surprisingly long time that is the right place for it to stay. You add an index, the slow query gets fast. You put a cache in front, the read load drops. You add a read replica, and now the reporting queries stop fighting the checkout path. You move to a bigger box, and the whole thing breathes again. Each of those moves is cheap, reversible, and buys you months.
+
+Then one day you hit a wall none of them can move. The working set no longer fits on the largest instance your provider sells. The write throughput saturates a single primary, and replicas do not help because replicas scale reads, not writes. The table is too big to back up inside the maintenance window. You have run out of vertical room, and the only lever left is to split the data across many machines so that no single one holds all of it.
+
+That is sharding. And the reason it sits at the bottom of the toolbox, after everything else has been tried, is that most of what you decide here you cannot take back. The shape of every query changes the moment the data lives on more than one host. So before reaching for it, it helps to be honest about what it actually costs.
+
+## Sharding is the last rung, and that ordering is the point
+
+There is a sequence to scaling a database, and sharding is the final rung on it. Tune your queries and indexes. Add a cache so the hot reads never touch the database. Add read replicas for read-heavy load and high availability. Scale the machine up. And only then, when those are exhausted, shard.
+
+The ordering is not arbitrary, and it is not about effort. It is about reversibility. Every rung below sharding is something you can undo on a Tuesday afternoon. An index you can drop. A cache you can flush and remove. A replica you can decommission. A bigger instance you can scale back down. Sharding is the first rung where the decisions calcify. Once your data is split across thirty-two hosts on a chosen key, unwinding that is a project measured in weeks, not an afternoon. Teams that shard early, before the reversible levers are spent, frequently could have stayed single-node for another eighteen to twenty-four months and saved themselves a permanent increase in operational complexity.
+
+So the one-line frame to carry into every conversation about this: sharding does not make your database faster. It raises the capacity ceiling, and it charges you for that ceiling on every query that does not include the shard key, plus the loss of cheap joins and cheap transactions. You earn it. You do not reach for it first.
+
+If you want the full ladder of where this sits among the levers above it, [the system design interview framework](/blog/system-design-interview-framework) walks the progression, and [replication](/blog/replication-strategies) covers the read-replica rung that should always come first. A useful way to internalize the difference: replicas and sharding solve opposite problems. Replicas copy the whole dataset to more machines to scale reads and add failover; they do nothing for write throughput or data size, because every replica still holds the entire dataset. Sharding splits the dataset so each machine holds a slice, which is the only thing that scales writes and storage. They are complementary, and replicas come first because they are reversible.
+
+## Where the slice gets cut: range, hash, and the hybrid
+
+Once you have decided to split, the first real choice is how. There are two base strategies with opposite tradeoffs, and a hybrid that steals from both.
+
+Key-range partitioning assigns each shard a contiguous range of keys, the way a physical encyclopedia splits volumes A through C, D through F, and so on. The win is range scans: because adjacent keys live together and stay sorted, "give me everything between these two values" hits one shard and reads sequentially. The loss is hot spots. The textbook failure is a timestamp key. If you shard by time, every write that happens today lands on the single shard that owns today's range, while every other shard sits idle holding history nobody is writing to. You bought a hundred machines and you are hammering one of them.
+
+Hash partitioning fixes exactly that. You run the key through a hash function and partition by the hash, which scatters adjacent keys uniformly across all shards and defuses the write hot spot. The cost is the mirror image of the win above. As Designing Data-Intensive Applications puts it, you lose the ability to do efficient range queries, because keys that were once adjacent are now scattered across all the partitions. A range scan under hash partitioning has to fan out to every shard and stitch the results back together.
+
+The hybrid is what most large systems actually run. Cassandra's compound primary key hashes only the first column to pick the shard, then sorts the remaining columns within that shard. You get one-shard routing from the hash and an in-shard sort and range scan from the clustering columns. Discord uses precisely this shape to store its messages: the partition key is a channel id paired with a time bucket, so all messages for a channel land together, replicated three ways, and stay sorted by time within the partition. Point the query at one channel and you read one shard, in order, no fan-out.
+
+The decision here is not aesthetic, it is dictated by your access pattern. If you do range scans, lean range and plan to mitigate hot spots. If your access is point lookups by key, hash. If you need both, compound key. A senior engineer reads the dominant query first and picks the partitioning to match it, rather than picking a partitioning and hoping the queries cooperate.
+
+One more piece of vocabulary worth absorbing, because it trips up otherwise-fluent engineers in interviews. The same concept wears a different name in every system. It is a shard in MongoDB and Elasticsearch, a region in HBase, a tablet in Bigtable and Spanner, a vnode in Cassandra and Riak, a vBucket in Couchbase, and a partition in Kafka and Citus. They are all "a horizontal slice of data on one machine." Fluency means code-switching between these without friction. The conceptual scaffolding for how these databases relate lives in [the database mindmap](/blog/database-mindmap).
+
+## The shard key is the one decision you cannot take back
+
+Everything above is reversible-ish. You can argue your way from range to hash with a migration. The shard key is the decision that calcifies, because the shard key determines, for every single row, which machine it lives on. Change the key and you have to re-derive the location of every row in the database. This is the irreversible one. Spend your judgment here.
+
+Three independent sources, Vitess in the MySQL world, Citus in the Postgres world, and the field reports from teams who have done it, converge on the same three criteria for a good shard key.
+
+High cardinality. There have to be enough distinct values to spread across many shards. Citus says it directly: low-cardinality columns like status fields limit shard distribution. If your key has five possible values, you physically cannot fill more than five shards no matter how clever the rest of your design is.
+
+Even distribution. High cardinality is necessary but not sufficient, because the values also have to be evenly used. If you distribute on a column skewed to a few common values, data accumulates in a few shards while the rest stay empty. Cardinality without evenness is just a hot shard with extra steps.
+
+Presence in your queries. This is the one juniors skip, and it is the one that determines whether sharding helps or hurts. The shard key should appear in your WHERE clauses and as your join keys, because that is what lets the router send a query to one shard. If the key is absent from the query, the router has no idea which shard holds the answer, so it asks all of them. Vitess is explicit that the key should appear often in query WHERE clauses for efficient routing; Citus wants it frequently used in group-by clauses or as join keys.
+
+Get this right and you earn the real payoff of a shared key: co-location. When related tables share a distribution column, rows with the same value live on the same machine even across different tables, which means joins, foreign keys, and transactions scoped to one key value stay on a single shard and behave like ordinary SQL. Vitess calls these colos; Figma calls them colos too; Citus calls it co-location. It is the same idea, and it is a first-class design tool: deliberately give related tables the same key so the operations that matter stay single-shard.
+
+There are two archetypes that drive the key choice, and Citus names them cleanly. A multi-tenant application shards by tenant id, because the vast majority of queries are already scoped to one tenant, so they hit one shard with full SQL available. This is the best case, and it is why Notion shards on workspace id and Figma shards on org id. A real-time analytics system does the opposite on purpose: it shards by a high-cardinality entity id specifically to fan out, so that a heavy aggregation uses every core in parallel. There, fan-out is the feature. The lesson is that "good shard key" is not absolute; it depends on whether you are trying to avoid fan-out or to ride it.
+
+## Why a bad key punishes you forever: fan-out
+
+Here is the failure mode that makes the shard key so consequential, stated plainly. Any query that includes the shard key routes to one shard and stays fast. Any query that does not include the shard key fans out to every shard, waits for the slowest one, and gathers the results. This is scatter-gather, and it is slower than the same query was on a single machine, because now you are paying network round-trips to every shard and you are bottlenecked on the tail latency of the slowest responder. The mechanics of why the slowest shard dominates are the same tail-latency dynamics that govern any fan-out system.
+
+This is why the shard key has to match your access patterns and not just your data model. A key that looks beautiful in the schema but is absent from your hottest query means that hot query now scatters. And because the key is irreversible, you are stuck scattering until you undertake a full re-key.
+
+There is a single metric that tells you whether your shard key is aging well: the fraction of production queries that are single-shard versus scatter. A creeping scatter ratio is the earliest warning that your access patterns have drifted away from your shard key, which is to say that the irreversible decision is quietly going bad. Measure it. It is the closest thing sharding has to a check-engine light.
+
+## Rebalancing, and the trap everyone hits once
+
+Shards are not static. Data grows, you add machines, and something has to decide how data moves onto them. The naive approach is the one almost everyone reaches for first, and it is a trap.
+
+The trap is `hash(key) % N`, where N is the number of nodes. It distributes evenly, so it looks correct. Then you add one node, N changes, the modulus changes for every key at once, and almost every row has to move to a different machine. You have turned "add a node" into "reshuffle the entire dataset across the network." This is the same wall that motivates [consistent hashing](/blog/consistent-hashing), which is the proper answer to cheap rebalancing: add or remove a node and only about K/N keys move on average, K keys over N nodes, instead of nearly all of them. If you take one algorithm away from this topic, that is the one, and its full treatment, including the virtual-node refinement from Amazon's Dynamo paper that spreads a departing node's load across many neighbors instead of dumping it on one, lives in that piece.
+
+But consistent hashing is not the only rebalancing scheme, and the field reports lean on a different one. Designing Data-Intensive Applications lays out three, and they are worth knowing because you will recognize them in real systems.
+
+Fixed number of partitions. Create far more partitions than you have nodes, up front, and never change that count. A thousand logical partitions on ten nodes. When you add a machine, it steals whole partitions from existing nodes; the partition a key belongs to never changes, only which node hosts that partition. Elasticsearch, Riak, and Couchbase work this way. This is exactly what Notion means by 480 logical shards and what Figma means by colos.
+
+Dynamic partitioning. Partitions split when they grow past a size threshold and merge when they shrink, the way a B-tree node splits. It adapts to data volume automatically, at the cost of starting cold: an empty database has one partition, so one node does all the work until the first split. HBase and MongoDB work this way.
+
+Partitioning proportional to nodes. A fixed number of partitions per node, so the partition count grows as the cluster grows; adding a node splits some existing partitions to claim its share. This is the Cassandra and Ketama style.
+
+The choice among these is a product decision about your growth shape. Fixed-partition gives you a stable mapping and easy reasoning, which is why it dominates the large Postgres shardings. Notion chose 480 logical shards for a reason that has nothing to do with throughput and everything to do with arithmetic: 480 is a highly composite number, divisible by a long list of host counts, so they can rebalance from 32 to 40 to 48 to 60 physical databases without ever re-sharding the logical layer. Pick the shard count for divisibility, not raw performance.
+
+## The hidden taxes: secondary indexes and cross-shard operations
+
+Two costs surprise people who only ever think about the primary key, and both are large enough to change designs.
+
+The first is secondary indexes. On a single database, a secondary index is free in the sense that it just works. On a sharded database, you have to choose how it is partitioned, and both choices hurt. A local index, partitioned by document, means each shard indexes only its own rows. Writes are cheap because you touch one shard, but every secondary-index read becomes a scatter-gather across all shards, because the matching rows could be anywhere. A global index, partitioned by term, shards the index itself by the indexed value, so reads target one index shard, but a single row insert may now touch multiple index partitions, which means global indexes are usually updated asynchronously and are eventually consistent. Vitess prices this concretely: its lookup vindex, which is a global secondary index backed by its own table, costs 20 in its routing-cost table against 1 for a functional hash vindex. That is a literal, numeric statement that a secondary index on a sharded database is roughly twenty times the routing cost of the primary, plus write amplification on every insert and delete. Budget for it. Do not assume a sharded secondary index is free or immediately consistent.
+
+The second tax is cross-shard operations, and it is the real cost of sharding. A join across two shards, or a transaction that has to touch two shards atomically, requires coordination that a single database gives you for nothing. The pragmatic senior move is to avoid the need via co-location, and to design around cross-shard transactions failing, rather than to engineer a heroic distributed commit. Figma did exactly this, deliberately choosing not to implement atomic cross-shard transactions and building application-level workarounds instead, because two-phase commit across shards is a latency and availability liability. The patterns that replace it, idempotent compensations and outbox-style eventual consistency, are the same machinery covered in [change data capture](/blog/change-data-capture), and the broader saga approach belongs to its own topic. Two smaller tools round this out: convert small, frequently-joined lookup tables into reference tables that you replicate to every node, so they never force a cross-shard join, and plan ID generation before you shard, because a global auto-increment is a single point of contention and a hot spot. Vitess replaces it with managed sequences; others use UUIDs or Snowflake-style ids.
+
+## The hot key that hashing cannot save
+
+There is a specific failure that catches people who believe hashing solved their distribution problem, and it is worth its own section because the intuition is so commonly wrong.
+
+Hashing distributes keys. It does not distribute load within a key. If one single key is hot, a celebrity user, a viral post, the channel for a launch everyone is watching, then every request for that one key hashes to the same shard, and that shard melts while the others idle. Designing Data-Intensive Applications is blunt about it: all the writes for that one hot post could end up at the same partition, and hashing does nothing to prevent it, because the hash of one value is one value. This is the celebrity problem, and it is the reason "we hashed the key, we are fine" is a sentence that precedes an outage.
+
+Discord lived the production version. A server with a small group of friends sends orders of magnitude fewer messages than a server with hundreds of thousands of people, so a single hot channel-and-bucket pair drove what they described as unbounded concurrency leading to cascading latency: queries piled onto the hot partition, and each one got slower as the node strained harder, which made the pile deeper. Notice what their fix was. No shard key fixes a single hot key, so they reached instead for a layered defense in front of the key. They built data services in Rust that coalesce requests, so that if many users ask for the same row at the same instant, the database is queried only once and everyone shares the result, and they routed requests with consistent hashing so that all traffic for a given channel reaches the same service instance and can actually coalesce there.
+
+That is the shape of the real answer, and it has layers because no single layer is enough. Split the hot key itself by appending a suffix and fanning reads back in, so one logical key becomes a hundred physical ones. Coalesce duplicate concurrent requests so a thundering herd becomes one query. Cache the hot value in front of the database; the discipline for keeping that cache correct is its own deep topic, and [the distributed cache](/blog/distributed-cache) covers the read-path design while cache invalidation, which publishes alongside this piece, covers keeping it honest. And if you want to cap any single node's share structurally, consistent hashing with bounded loads limits how much load one node will accept and spills the overflow. The point is that a hot key is not a sharding problem you can solve with a key choice; it is a load problem you solve with a stack of mitigations.
+
+## Logical versus physical: the safety net that makes the irreversible reversible-ish
+
+If you learn one operational pattern from this whole topic, learn this one, because it is what turns the scariest migration in your career into something you can verify before it commits.
+
+Decouple the logical shard map from the physical placement. The logical map says which logical shard a row belongs to; the physical placement says which machine that logical shard currently lives on. When those are separate, you can roll out and verify the entire logical model, the part that depends on the irreversible key choice, before you ever move a byte of data between machines. Notion does this with schemas: 480 logical shards spread across 32 physical databases, 15 schemas per database, and rebalancing to more hosts just re-homes logical shards without re-keying anything. Figma does it with Postgres views: the application behaves as if the data is sharded while the data still physically lives on one database, gated behind feature flags, and only after that logical layer is proven correct do they perform the physical split. The irreversible decision gets a dress rehearsal.
+
+This is also why the live migration itself is survivable. The toolkit is consistent across every team that has done it well. Begin double-writing every change to both the old database and the new shards. Backfill the history in parallel; Notion ran its backfill across 96 CPUs and finished in about three days, after discovering that logical replication could not keep pace with their write volume, so they drove the double-write off an audit log instead. Verify before cutover with dark reads and random sampling, comparing what the new shards return against the old source of truth on live traffic. Then cut over in phases, reads first and writes last, with only a brief read-only window. The windows are genuinely small: Notion cut over with roughly a five-minute read-only window, Figma's first production physical shard flipped with about ten seconds of partial primary availability and zero replica impact, and Vitess automates the same dance, copying online with VReplication, verifying with VDiff, switching reads first and writes last, and serving live traffic throughout with only a few seconds of read-only downtime at the write cutover.
+
+Notion's single sharpest hindsight lesson is worth ending the operational section on, because it cuts against the "shard last" advice in exactly the right way. Their number-one regret was that they should have sharded earlier, because by the time they were heavily strained, the strain itself had removed their good migration options. So the honest synthesis is to shard with runway: late enough that you have exhausted the reversible levers and you are confident in the key, early enough that you still have the headroom to migrate calmly. Desperation is a bad state to design an irreversible decision in.
+
+## How a senior decides
+
+Strip away the mechanisms and the decision procedure is short.
+
+First, do not shard yet. Confirm that you have actually spent the reversible levers, query and index tuning, caching, read replicas, vertical scale, because each one you skipped is months of runway you are throwing away and complexity you are buying early.
+
+Second, if you must shard, spend almost all of your judgment on the key. Apply the three criteria, high cardinality, even distribution, presence in your hottest queries, and decide consciously whether you are sharding to avoid fan-out, the multi-tenant case, or to ride it, the analytics case. Co-locate related tables on a shared key so your important joins and transactions stay single-shard.
+
+Third, choose the partitioning to match the dominant access pattern, range for scans, hash for point lookups, compound for both, and choose a fixed-partition rebalancing scheme with a divisible logical shard count so you can grow the cluster without re-keying.
+
+Fourth, budget for the taxes up front. Decide how secondary indexes are partitioned and accept their cost. Design to avoid cross-shard transactions rather than to perform them. Plan ID generation before you split. Build the hot-key defenses, key-splitting, coalescing, caching, before the celebrity arrives, not during the incident.
+
+Fifth, never move the physical data without proving the logical model first, and run the migration with double-writes, parallel backfill, dark-read verification, and a phased cutover. Then watch the single-shard versus scatter ratio forever, because that number is how you find out whether the one decision you could not take back was the right one.
+
+The systems that scale to trillions of rows are not the ones that sharded cleverly. They are the ones that sharded late, on a key they were sure of, with a logical layer they could verify before they committed. The cleverness is in the restraint.
+
+## FAQ
+
+<FAQ />

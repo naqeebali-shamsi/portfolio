@@ -1,0 +1,177 @@
+export const meta = {
+  slug: 'stream-processing',
+  title: 'How Stream Processing Works: Windows, Watermarks, and Exactly-Once',
+  description:
+    'Stream processing computes over data that never ends, where records arrive late and out of order. How windows, watermarks, and exactly-once actually work.',
+  headline: 'How Stream Processing Works: Windows, Watermarks, and Exactly-Once',
+  deck: 'Every hard part of stream processing is the same problem wearing a different hat: you can never be sure you have seen everything yet.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '13 min',
+  tags: ['stream-processing', 'flink', 'kafka', 'distributed-systems', 'event-time', 'system-design'],
+  faq: [
+    {
+      q: 'What is a watermark in stream processing?',
+      a: "A watermark is a heuristic estimate of input completeness with respect to event time. A watermark of value X asserts that all input with event times less than X has probably been observed, so any window ending at or before X can be considered complete and emitted. Because perfect knowledge of a distributed input is impractical, real watermarks are always estimates: set one too slow and results lag, set it too fast and genuinely late data slips past and gets dropped. A watermark tells you when input is complete, not when to emit; triggers decide emission.",
+    },
+    {
+      q: 'What is the difference between event time and processing time?',
+      a: "Event time is when an event actually occurred, recorded at the source. Processing time is when your system observes that event. The gap between them is skew, which is just the latency your pipeline introduces, and it is never zero and never constant because of network delay, scheduling, offline devices, and uneven key distribution. Correctness depends on event time. Processing-time windows only attribute events to the right interval if the data arrives in order, which for any distributed source it does not.",
+    },
+    {
+      q: 'Does stream processing give you exactly-once?',
+      a: "What systems like Flink call exactly-once is more precisely effectively-once: a guarantee about state, not delivery. After a failure, records get replayed and reprocessed, but the effect on state reflects each event exactly once because state and input offsets are snapshotted together in a consistent checkpoint. Extending that to external systems needs either an idempotent sink that dedupes repeated writes, or a transactional sink using two-phase commit. End-to-end exactly-once does not happen automatically just because the engine claims it internally.",
+    },
+    {
+      q: 'How do windows handle late data?',
+      a: "A window fires when the watermark crosses its end, but late data can still arrive after that. Flink has allowed lateness (default zero) that keeps a window's state alive past its end and re-fires it for each late event, plus a side output to catch events arriving after even that grace runs out. Kafka Streams has a grace period plus suppress to emit only a final result. All of these trade correctness for cost: longer lateness means later final results and more state retained, so it is a knob, not a free win.",
+    },
+    {
+      q: 'What is barrier alignment and why does it matter?',
+      a: "Flink takes consistent snapshots by injecting checkpoint barriers into the source streams; the barriers flow with the records, and each operator snapshots its state when a barrier passes. At an operator with multiple inputs, alignment makes it wait for the barrier on every input before snapshotting, which is what gives exactly-once state. The catch is that alignment stalls under backpressure, because a barrier gets stuck behind a queue of buffered records and a checkpoint that should take seconds can take minutes. Unaligned checkpoints exist to fix exactly that by folding in-flight buffers into the snapshot so barriers can overtake the queue.",
+    },
+  ],
+}
+
+A batch job knows when it is done. It reads a file, processes every row, writes a result, and exits. The data had a last line, and reaching it was the definition of finished.
+
+A stream processor never reaches the last line. The events keep coming, they do not arrive in the order they happened, and they do not arrive on any schedule you control. A purchase that occurred at 12:01 can land at 12:08, after one that occurred at 12:05, because the first user's phone went into a tunnel. So when you ask something as simple as "how many sales happened between noon and 12:05," the honest answer is that you cannot know for certain, because one more straggler might still be on its way.
+
+That single fact is the spine of everything below. You are computing over data that never ends, and you can never be sure you have seen everything for a given slice of time. Windows, watermarks, triggers, checkpoints, exactly-once: every one is a lever for trading **completeness** against **latency** against **cost** under that one irreducible uncertainty. This is the framing of Google's Dataflow Model paper, and once you hold it, the field stops being a pile of features and becomes a set of knobs on a single problem.
+
+If you have read [Kafka vs queues](/blog/kafka-vs-queues), you know how to move an unbounded stream of events around reliably. This is the next question: how do you *compute* over one.
+
+## "Streaming" is not the same as "real-time"
+
+People hear streaming and think "fast," but speed is not the defining property. The shape of the data is. Tyler Akidau, who led the Dataflow work, defines a streaming system as a data processing engine built with infinite datasets in mind. **Unbounded data** is ever-growing and essentially infinite; **bounded data** is finite. A click stream is unbounded. Yesterday's logs are bounded.
+
+Batch and streaming are not opposites, and that reframe pays off later. Batch is unbounded data whose completeness you already know, because the file is closed: a stream whose watermark already sits at the end of time. That is why the Dataflow Model could unify the two under one set of primitives, and why its headline contribution was showing the batch-versus-streaming dichotomy is false, not shipping a faster runtime. Read streaming as "computation over data with no known end," and put the stopwatch down.
+
+## The distinction that decides correctness: event time vs processing time
+
+There are two clocks in any streaming system, and confusing them is the root of most wrong answers. **Event time** is when an event actually occurred, stamped at the source: the moment the user tapped buy, the moment the sensor read 41 degrees. **Processing time** is when your system observed that event. They are never the same, and the gap has a name: **skew**, the latency your pipeline introduces. Skew is never zero and never constant. It expands and contracts with network congestion, with how the scheduler places work, with a phone that was offline for an hour and then dumped a backlog, with one partition carrying a hot key while others sit idle. You do not get to assume it away.
+
+This is why processing-time windows are a trap for anything that has to be correct. Bucket events by *when you saw them* and the answer is only right when data arrives in event-time order, which for any distributed source with retries and mobile clients and parallel partitions it does not. The 12:01 sale that showed up at 12:08 lands in the wrong five-minute bucket and your revenue-per-minute chart is quietly lying. Event-time windowing is the correct answer, and the hard one, because it forces two uncomfortable things: buffer state while you wait for stragglers, and reason about a completeness you can never fully establish. The rest of this piece is about living with those two costs.
+
+## Windows: bounding the unbounded
+
+You cannot sum an infinite stream. "Total sales" over data that never ends is a number that never stops changing. So before you aggregate, you chop the endless stream into finite chunks. That is windowing, and three shapes are worth knowing cold.
+
+**Tumbling (fixed) windows** slice time into fixed-length, non-overlapping segments, so every event lands in exactly one window. "Sales per hour, on the hour." The default, and usually the right one.
+
+**Sliding (hopping) windows** have a fixed length and a fixed step. When the step is smaller than the length the windows overlap and a single event lands in several at once: "average over the last 10 minutes, recomputed every minute." You pay for the smoothness in duplicated work, because each event feeds multiple windows. One naming landmine: Kafka Streams calls this overlapping variant a **hopping** window and reserves *sliding window* for a different, event-pair-driven construct, while Flink and the Dataflow Model use *sliding* for the overlapping case. Same word, different meaning, so read the docs of whatever you run.
+
+**Session windows** are the strange, useful one. A session is a burst of activity terminated by a gap of inactivity longer than some timeout: data-driven, not clock-driven, with boundaries that come from the events themselves. Think of a browsing session that lasts as long as the user keeps clicking and ends when they go quiet for 30 minutes. Sessions are categorically harder than the other two. A tumbling window's extent is known the instant it opens; a session's extent is *unknown until the gap elapses*. Worse, sessions **merge**: an open session ending at 12:10 and another starting at 12:25 fuse into one the moment a straggler arrives at 12:15 and bridges the gap. That merging is why session state is fiddly to maintain and grows in ways tumbling state does not.
+
+A window answers *what* you compute and *where in event time* it lands. It says nothing about *when* you emit. A 12:00-to-13:00 window is logically complete at 13:00 in event time, but when does that moment arrive in your system, given stragglers might still be coming? For that you need the watermark.
+
+## Watermarks: a heuristic for "we have probably seen everything up to T"
+
+This is the heart of the topic, and where shallow explanations go to die.
+
+A **watermark** is a notion of input completeness with respect to event time. Akidau's definition is worth quoting exactly: a watermark with a value of time X makes the statement that all input data with event times less than X have been observed. When the watermark passes 13:00, the system asserts that every event in the noon hour has arrived, so the noon window can close and emit. The word that matters is *asserts*, because the assertion can be wrong.
+
+There are two kinds, and only one exists in the real world. A **perfect watermark** requires perfect knowledge of the input, so under it there is no such thing as late data; you get it only in tidy cases like a single ordered file. A **heuristic watermark** is what every distributed system uses, because perfect knowledge of input arriving from millions of phones and dozens of partitions is impractical. It is a best-effort estimate, so it is sometimes wrong, and the question is never *whether* but *which way*. That gives two failure modes, and naming them is the difference between knowing this topic and reciting it.
+
+**Watermark too slow.** A conservative estimate makes results correct but late. One stuck record holds back global event-time progress, and the window will not fire even though it is logically complete. Akidau's example is visceral: a poorly chosen watermark can mean nearly seven minutes from when the first value in a window occurs until you see *any* result.
+
+**Watermark too fast.** An aggressive estimate advances the watermark past data that has not arrived. The window fires, you emit, and then the straggler shows up as **late data**, with an event time below the current watermark, to be dropped or to force a correction.
+
+So a watermark trades completeness for latency, with no setting that gives you both. In Flink the common generator, bounded out-of-orderness, makes this explicit:
+
+```
+watermark = (max event timestamp seen so far) - outOfOrdernessBound - 1
+```
+
+A 20-second bound says "I will wait 20 seconds of event time for stragglers before declaring an interval complete." After a max event time of 12:00:50, the watermark sits at 12:00:29.999, so a window ending at 12:00:30 fires only once an event at or after 12:00:50 arrives. You bought 20 seconds of tolerance for out-of-order data and paid 20 seconds of added emission latency. That is the trade, in one line, with a number on it.
+
+One last thing the watermark does not do, and missing it is the single most common error: a watermark tells you *when input is complete*, not *when to emit*. The second decision belongs to triggers.
+
+## Triggers and accumulation: what / where / when / how
+
+The Dataflow Model decomposes every streaming computation into four orthogonal questions. Hold them apart and the whole design space gets legible.
+
+| Axis | Question | Mechanism |
+| --- | --- | --- |
+| **What** | What result is computed? | The aggregation, e.g. a sum |
+| **Where** | Where in event time? | Windowing (tumbling, sliding, session) |
+| **When** | When in processing time do you emit? | Watermarks and **triggers** |
+| **How** | How do later results relate to earlier ones? | **Accumulation mode** |
+
+A **trigger** declares when a window's output should be materialized relative to some signal. The watermark crossing the window end is the most common, but not the only one: you can trigger on processing-time intervals (an early partial answer every minute so a dashboard is not frozen for seven minutes), on element counts, or on data-dependent punctuations, and triggers compose with repeat, AND, OR, sequence. This is how you get what every product wants: a fast approximate answer now, a corrected final answer once the window is complete.
+
+The moment a window fires more than once, how does the second emission relate to the first? That is the **accumulation mode**, and there are three, each changing the contract with whatever consumes your output.
+
+**Discarding.** State is thrown away after each firing, so each emission is an independent delta. The consumer sums the pieces itself.
+
+**Accumulating.** State is retained, so each firing is the full running answer that builds on the last. A late event updates the running total, and the consumer overwrites the previous value by key. This is the common choice, and it composes with [idempotent writes](/blog/idempotency-exactly-once): because each emission is the complete answer keyed by window, the sink can upsert and a duplicate emission is harmless.
+
+**Accumulating and retracting.** Like accumulating, but each firing also emits an explicit retraction of the previous one. You need this when the consumer cannot simply overwrite, for instance when results move between keys, like re-bucketing or a windowed join where an element changes which group it belongs to. Overwrite-by-key works only if the key does not change; the instant it can, you need retractions or you double-count.
+
+Akidau's mobile-game example makes this concrete. Sum the scores in a window, with one value arriving badly late. In **accumulating** mode with early triggers, the window emits 7, then 14, then a final 22 as data fills in: each number is the full answer so far. In **discarding** mode the same window emits 7, then 7, then 8: the per-firing deltas, which the consumer must add up to 22 itself. Same input, same window, completely different sink contract, decided entirely by the accumulation mode.
+
+This is also where you manage the late data your heuristic watermark guarantees. By default a window's state is dropped the instant the watermark passes its end, so anything later is gone. Flink's **allowed lateness** (default zero) keeps the state alive for an extra span past the window end and re-fires for each late event, and `sideOutputLateData` catches whatever comes in after even that grace runs out, so late records land somewhere instead of vanishing. Kafka Streams has the equivalent in a **grace period** plus `suppress` to emit only the final result. All of these trade correctness for cost in the same direction: longer grace means later final results and more state retained. A knob, not a free win, the recurring shape of every decision in this field.
+
+## State and checkpointing: surviving a crash
+
+Everything above assumes the processor remembers things. A window waiting for stragglers holds partial aggregates in memory; a session window holds open sessions. That accumulated memory is **state**, and the hard question is what happens to it when a machine dies mid-computation, which over a long-running job it certainly will.
+
+Flink distinguishes two kinds. **Keyed state** is partitioned along with the stream by key, like an embedded key-value store scoped to each key. **Operator state** is per-parallel-instance, the classic example being a Kafka source remembering its read offsets. Where it lives is the **state backend**: the JVM heap (fast, bounded by memory) or an embedded RocksDB on local disk (slower per access, but supports state far larger than memory and enables incremental snapshots). For large jobs the on-disk backend is the production default, because keyed state for millions of keys does not fit in heap.
+
+The survival mechanism is the **checkpoint**: periodically the system snapshots all state plus the corresponding input offsets and writes it durably. If a machine fails, every operator restores from the last *complete* checkpoint and the input replays from exactly the recorded offsets. State and position were captured together, so on recovery they line up and the job resumes as if the crash had not happened.
+
+The naive way is to freeze the whole dataflow and copy it, but freezing a high-throughput pipeline several times a minute is a non-starter. The fix is **Asynchronous Barrier Snapshotting**, the ABS algorithm from Carbone, Fora, Ewen, Haridi, and Tzoumas. Where a naive Chandy-Lamport approach eagerly persists all in-flight records along with operator state, bloating snapshots and stalling the computation, ABS persists only operator state on acyclic topologies and produces a consistent global snapshot *without halting processing*. That last property is the whole game.
+
+The mechanism: the coordinator injects markers called **checkpoint barriers** into the source streams, and they flow downstream with the ordinary records. When a barrier reaches an operator, the operator snapshots its state asynchronously and forwards the barrier on. At an operator with multiple inputs, **barrier alignment** kicks in: it waits until the barrier has arrived on *all* inputs before snapshotting. That alignment makes the snapshot consistent across the whole graph, and graph-wide consistency is what delivers exactly-once *state*.
+
+One footnote that separates people who have run Flink from people who have only read about it: checkpoints are automatic, system-owned, and they expire. **Savepoints** are manually triggered snapshots that do not expire, the primitive for upgrades, rescaling, and migration. You do not change parallelism or deploy a new version off a checkpoint; you do it off a savepoint.
+
+## Exactly-once is really effectively-once
+
+Here is the sentence repeated wrong more than any other in this field: "Flink gives you exactly-once." It is true and misleading at once, and untangling it is the insight the whole topic is built toward.
+
+Exactly-once means each incoming event affects the final result exactly once. Read that carefully: it is a statement about the effect on **state**, not about delivery. After a failure, records do get replayed, and operators do reprocess them, possibly many times. What is guaranteed is that the *effect on state* reflects each event once, because recovery rewinds to a consistent checkpoint and replays from there. The literal number of times a record traverses an operator is not one. This is why careful people call it **effectively-once**, and why Flink's own docs note that only embarrassingly parallel dataflows get exactly-once even in at-least-once mode: the guarantee is about snapshot consistency, not delivery counts. I wrote a whole piece on [why exactly-once delivery is a lie](/blog/idempotency-exactly-once); this is the same lie from the stream-processing side.
+
+A consistent checkpoint buys exactly-once *inside* the system. The hard part is the boundary, the moment your computation has to affect the outside world: write to a database, push to another Kafka topic, send something. Internal exactly-once does not extend across that boundary by itself. There are two ways to make it.
+
+**Idempotent sinks.** If writing the same record twice is a no-op, replays are harmless. Upsert by a deterministic key into a key-value store or an upsert-keyed table, and a duplicate write changes nothing. This is the cheapest and most durable option, and when you can shape output this way, take it. It is the streaming twin of the idempotency-key discipline from the webhook world.
+
+**Transactional sinks via two-phase commit.** When you cannot make the write naturally idempotent, you tie the external effect to a checkpoint. Flink's TwoPhaseCommitSinkFunction does this: when a barrier passes, the sink **pre-commits** an external transaction and snapshots its own state; only after *every* operator finishes and the coordinator fires the checkpoint-completed callback does the sink **commit**. If the job restarts, pre-committed-but-uncommitted transactions are committed or aborted from the checkpointed metadata, so nothing is half-applied. The cost surprises people: the commit is gated on checkpoint completion, so your **checkpoint interval becomes your end-to-end output latency** for transactional sinks. Checkpoint every 60 seconds and your transactional output is up to 60 seconds behind, and the transaction's own timeout must comfortably exceed your maximum checkpoint interval or a slow checkpoint lets it expire and abort under you. Exactly-once at the boundary is real, but the bill is paid in latency and operational care.
+
+## Kafka end-to-end, the worked instance
+
+Kafka exactly-once is the canonical concrete case, and a clean way to see the three guarantees from [Kafka vs queues](/blog/kafka-vs-queues) play out. It has three moving parts, and the third is the one everyone forgets.
+
+The **idempotent producer** handles duplicates from producer retries: each producer gets a producer ID, and the broker dedupes on the tuple of producer ID, partition, and sequence number, discarding any sequence number it has already accepted. The **transactional producer** handles atomic writes across multiple partitions: give it a stable `transactional.id` and it writes to several partitions as one atomic unit via two-phase commit, and enabling transactions auto-enables idempotence. So far this is all producer-side.
+
+The **read_committed consumer** is the half that makes it work end-to-end, and the easiest to miss. A consumer set to `read_committed` only reads up to the **Last Stable Offset**, the lowest offset of any still-open transaction, so records from uncommitted or aborted transactions are never delivered. Leave the consumer at the default and every bit of producer-side machinery buys you nothing, because it happily reads the uncommitted and aborted writes anyway. The config is small and the failure is silent:
+
+```properties
+# producer
+enable.idempotence=true          # dedupe on (PID, partition, sequence number)
+transactional.id=orders-sink-1   # stable across restarts, enables two-phase commit
+# consumer
+isolation.level=read_committed   # read only up to the Last Stable Offset
+```
+
+Omit that last line and you have built a careful exactly-once producer feeding a consumer that reads everything. The guarantee is only as strong as its weakest hop, the recurring lesson of distributed systems and the throughline of [distributed transactions and sagas](/blog/distributed-transactions-sagas).
+
+## The nuances a staff engineer raises
+
+The fundamentals above get you a correct mental model. These turn a 2 a.m. page from a mystery into a known failure mode.
+
+**Idle sources freeze your windows.** A watermark is the *minimum* across all input partitions, because the slowest input governs how confidently you can declare completeness. So one idle partition that emits nothing pins global event time and freezes every downstream window, even though the rest of your inputs flow fine. This is a top real-world incident cause, and the fix is to mark quiet inputs as idle (Flink's `withIdleness`) so they drop out of the minimum instead of holding everyone hostage.
+
+**Aligned versus unaligned checkpoints under backpressure.** Barrier alignment is required only for exactly-once, and it stalls under backpressure, because a barrier gets stuck behind a long queue of buffered records and cannot advance, so a checkpoint that should take two seconds takes two minutes or times out. **Unaligned checkpoints** (FLIP-76, Flink 1.11+) snapshot the in-flight buffers as part of state, so barriers overtake the queue and checkpoint duration decouples from backpressure, at the cost of larger snapshots. The staff-grade signal is knowing when unaligned is the *wrong* fix: if state-backend I/O is itself the bottleneck, letting barriers jump the queue does not help, because the slow part is writing the snapshot, not moving the barrier.
+
+**State growth is a primary operational risk, not an afterthought.** Session windows and keyed state grow without bound unless you bound them. Set state TTL, clean up keys you will never see again, and watch checkpoint size as a metric, the same way you watch the fundamentals in [the database mindmap](/blog/database-mindmap). A job that runs fine for a week and then falls over is very often one whose state quietly grew past what the backend or checkpoint can carry. And keep the two clocks separate: event-time watermarks run behind wall time normally and far *ahead* during a backfill, so timers fire on the watermark, never the clock on the wall.
+
+## The honest landing
+
+No configuration gives you correctness, low latency, and low cost at once. That falls out of the one fact we started with: the data never ends and you can never be certain you have seen all of it for any interval. Everything you tune is a position on that triangle. Early triggers buy latency and pay in recomputation. Long allowed-lateness buys correctness and pays in retained state. Frequent checkpoints buy fast recovery and pay in throughput. A senior engineer does not hunt for the setting that wins all three; they decide which corner the *workload* cares about, favor it, and name out loud what they gave up.
+
+So: event time over processing time, because the two clocks are never the same. Watermarks as an honest heuristic with two named failure modes, not a guarantee. Triggers to decide emission separately from completeness. Idempotent or transactional sinks to carry exactly-once across the boundary the engine cannot cross alone. Get those four right and the straggler that arrives eight minutes late lands in the correct bucket and updates the right total. Get them wrong and you have a real-time dashboard that is confidently, precisely incorrect, which is the worst kind of wrong, because everyone believes it.
+
+## FAQ
+
+<FAQ />

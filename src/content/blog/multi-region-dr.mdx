@@ -1,0 +1,141 @@
+export const meta = {
+  slug: 'multi-region-dr',
+  title: 'Multi-Region and Disaster Recovery: RPO, RTO, and the Cost of Always-On',
+  description:
+    'Two numbers price disaster recovery: data you can lose, time you can be down. The four-rung ladder to active-active, and why most teams should stop short.',
+  headline: 'Multi-Region and Disaster Recovery: RPO, RTO, and the Cost of Always-On',
+  deck: 'Active-active is not the summit everyone should climb; for most systems it is a multi-master write problem with a permanent latency tax and a legal minefield.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '13 min',
+  tags: ['disaster-recovery', 'multi-region', 'distributed-systems', 'cap-theorem', 'aws', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between RPO and RTO?',
+      a: "RPO (Recovery Point Objective) is how much data you can afford to lose, measured in time: an RPO of five minutes means a disaster can cost you the last five minutes of writes. It is set by your replication strategy, because replication lag is your RPO. RTO (Recovery Time Objective) is how long you can be down before recovery completes, also measured in time. It is set by your standby strategy, meaning how much warm infrastructure you keep running. RPO prices your data pipeline; RTO prices your idle capacity.",
+    },
+    {
+      q: 'Should I run active-active across regions?',
+      a: "Usually not. Active-active is roughly double your steady-state infrastructure cost forever, plus a permanent tax on every feature, because each write path has to be conflict-aware. It is justified only when downtime directly bleeds revenue and your write pattern is naturally partitionable (each region owns a key range, so writes never collide). For the median system a warm standby gets you minutes of RTO at roughly 1.1 to 1.3 times cost while letting engineers write ordinary single-writer code. AWS itself hedges toward warm standby for teams that do not want both regions serving live traffic.",
+    },
+    {
+      q: 'Does active-active give you zero data loss?',
+      a: "Not for the disasters that actually hit you most. Active-active protects against infrastructure loss, not logical disasters. If a bad deploy corrupts or deletes data, that mutation replicates to every region in about a second, so recovery means restoring from a point-in-time backup, which means RPO and RTO are both greater than zero for that class of failure. AWS states this outright. Replication faithfully copies your mistake; it is not a backup.",
+    },
+    {
+      q: 'Did Spanner beat the CAP theorem?',
+      a: "No. Spanner is a CP system: it chooses consistency and would become unavailable under a sufficiently bad partition. What Google did was spend enormous capital, private fiber plus GPS and atomic clocks in every datacenter, to make the partition probability so low that Spanner is effectively CA in practice with availability above five nines. The theorem still holds. You do not escape CAP; you pay to make the partition branch almost never execute. Most companies cannot buy atomic clocks, which is why globally strong active-active is a Google-scale luxury, not a default.",
+    },
+    {
+      q: 'Why is DNS failover not instant?',
+      a: "Because three delays stack. Route 53 health checks with a 10-second request interval and a failure threshold of 3 take about 30 seconds to declare a region dead. Then the failover DNS record has a TTL, commonly 60 seconds, before resolvers ask again. Then some clients cache aggressively and ignore TTL entirely. Realistic DNS failover lands at one to three minutes, not zero. A five-minute RTO target is comfortably met; a 30-second target is not, and you need anycast or Global Accelerator or active-active instead.",
+    },
+  ],
+}
+
+Every disaster recovery decision comes down to two numbers, and most teams pick them by accident. The first is how much data you can afford to lose. The second is how long you can afford to be down.
+
+Name those two numbers honestly and the architecture falls out of them, including how much money you are about to spend and which laws of physics you are about to fight. Refuse to name them and you will discover them anyway, at 3 a.m., during the outage, in the worst possible units. We climb a four-rung ladder pricing each rung, and then I argue that most systems should stop one short of the top, because that top rung is not the summit everyone imagines. It is a different problem wearing a reliability costume.
+
+## The two numbers that price everything
+
+**RPO, the Recovery Point Objective**, is how much data you can lose, measured in time. An RPO of five minutes means a disaster can cost you the last five minutes of writes and that is acceptable. RPO is a statement about your replication strategy, because the lag between primary and replica *is* your RPO: if writes reach the second region one second behind and the first region vanishes, that last second is gone. Replication lag equals RPO, the whole identity.
+
+**RTO, the Recovery Time Objective**, is how long you can be down before recovery completes, also in time. RTO is a statement about your standby strategy, how much warm infrastructure you keep running so you do not build it under fire. An RTO of one hour buys time to redeploy; thirty seconds forces you to already be running.
+
+The two numbers are independent. You can have a tiny RPO with a large RTO: stream every write to a replica continuously, but keep the compute switched off so bringing it up takes twenty minutes. RPO prices your data pipeline; RTO prices your idle capacity.
+
+And both come from the *business*, not from engineering. The right RTO for a checkout flow that bleeds revenue per minute is not the right RTO for an internal dashboard. The discipline is to get a real RPO and RTO out of the people who own the revenue, then buy the cheapest architecture that meets them, which is exactly what AWS's Well-Architected guidance says: choose the lowest-cost recovery strategy that still meets your objectives. It is the same move as sizing a system around its actual load instead of its imagined peak, which I walk through in [the system design interview framework](/blog/system-design-interview-framework). Pick the number first, architect second.
+
+## The four-rung ladder, priced
+
+AWS names four canonical strategies, four points on a curve where RPO and RTO shrink toward zero while cost and complexity climb.
+
+| Strategy | Typical RPO | Typical RTO | Standby cost | Failover model |
+| --- | --- | --- | --- | --- |
+| Backup & Restore | Hours (= backup interval) | Hours (rebuild + restore) | Storage only (lowest) | Redeploy, then restore |
+| Pilot Light | Seconds to minutes | Tens of minutes | Data infra always on; compute dark | Turn on + scale up |
+| Warm Standby | Seconds | Minutes | Scaled-down full stack, always running | Scale up (already serving) |
+| Active/Active | Near-zero* | Near-zero* (no failover) | 2x (or Nx) full production | Route away from the dead region |
+
+The asterisk is doing a lot of work and we will get to it. First, the rungs.
+
+**Backup and Restore** is the floor. Periodic backups; on disaster you redeploy infrastructure, config, and code into the recovery region, then restore the data. RTO is hours because you are *rebuilding*, and without infrastructure-as-code, restoring by hand is slow enough to blow past it.
+
+**Pilot Light** keeps the data warm and the compute cold. You replicate data continuously and provision your core infrastructure, so the stateful pieces are always on while the stateless ones sit deployed but switched off. Data is live, so RPO is low; RTO is tens of minutes, because failover means turning the servers on and scaling up.
+
+**Warm Standby** keeps a scaled-down but fully functional copy of production running in the second region all the time. The single best line in the AWS whitepaper draws the distinction precisely:
+
+> The distinction is that pilot light cannot process requests without additional action taken first, whereas warm standby can handle traffic (at reduced capacity levels) immediately.
+
+That difference, on versus off, collapses RTO from tens of minutes to minutes: the standby is already serving, you just give it more capacity. This is the rung to remember, because it is where most systems should live.
+
+**Active/Active** runs your full workload in multiple regions at once, all serving live traffic, and the structural fact that changes everything is that there is no failover. AWS: "because the workload is running in more than one Region, there is no such thing as failover in this scenario." You do not switch over when a region dies; you stop sending traffic to the corpse and the survivors absorb it. RPO and RTO approach zero for infrastructure loss, and it is also "the most complex and costly approach to disaster recovery."
+
+## The cliff at the top of the ladder
+
+Each step down the table buys RTO for money, until the last one, where the cost goes vertical and what you start paying with is no longer money. At the near-zero end of RPO and RTO, you stop trading dollars and start trading *consistency*. That is the CAP theorem, made geographic.
+
+Most people know CAP as a slogan: consistency, availability, partition tolerance, pick two. The slogan is wrong, and Eric Brewer, who coined it, retracted it himself in 2012. Gilbert and Lynch proved the real theorem in 2002: in an asynchronous network, no register can be simultaneously linearizable, available (every request to a non-failing node returns), and partition-tolerant. Brewer's reframing is what makes it usable: **partitions are not a choice.** Over a wide-area network between regions, a partition is not an unlucky event you might avoid; it *will* happen, so you never get to drop P. The real theorem is narrower: *when a partition occurs, you choose between C and A,* and the rest of the time there is no CAP tension at all. The pain arrives rarely, which sounds reassuring until you learn the part CAP leaves out.
+
+## PACELC: the tax you pay even when nothing is broken
+
+If CAP were the whole story, cross-region consistency would be nearly free in the common case, because partitions are rare. It is not. PACELC, Daniel Abadi's extension of CAP, adds the branch CAP forgets:
+
+> In case of network partitioning (P) ... one has to choose between availability (A) and consistency (C) (as per the CAP theorem), but else (E), even when the system is running normally in the absence of partitions, one has to choose between latency (L) and loss of consistency (C).
+
+CAP's choice happens during the rare partition; **PACELC's happens on every single operation, partition or not.** Every strongly consistent write that has to be durable across regions pays a latency tax: the round trip to a quorum, bounded by the speed of light.
+
+This is where geography turns an abstraction into a physical floor. A synchronous cross-region quorum write waits for light to travel to another region and back: tens of milliseconds US coast to coast at the theoretical minimum, more across an ocean. No engineering removes that floor. You can only hide it (replicate asynchronously, weakening consistency and growing your RPO) or avoid it (keep each write local). I unpack why the tail is worse than the average in [latency and the tail](/blog/latency-throughput-tail). Strong global consistency is slow because it is asking electrons to outrun physics.
+
+PACELC also classifies datastores more honestly because it names both branches (Dynamo is PA/EL, Spanner is PC/EC, MongoDB is PA/EC), which I unpack in [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum). The point for DR: the moment you reach for active-active strong consistency, you have signed up for the EC tax on every write, forever.
+
+## Spanner: how Google bought its way around the theorem
+
+The obvious objection: Google Spanner is globally distributed and externally consistent, so does it not beat CAP? No. Spanner uses TrueTime, GPS receivers and atomic clocks in every datacenter, to bound clock uncertainty and reach external consistency globally. Brewer's own framing is that Spanner is *technically CP*: it would go unavailable under a partition severe enough to break its quorum, but Google engineers the partition probability so low (private fiber, redundant everything) that the unavailable branch almost never executes and availability runs above five nines. The lesson is not that consistency is solved. It is this: *you do not escape CAP, you spend enormous capital to make the partition branch almost never run.* That is what globally strong active-active costs, a Google-scale luxury. Reach for it on a normal budget and you have already weakened your consistency without admitting it, or you are about to.
+
+## Active-active is a write problem, not a reliability feature
+
+Active/passive is easy because writes only ever go to the primary: one source of truth, and failover is just who gets promoted. Active-active throws that away, because more than one region accepts writes, so you must decide *where writes land and what happens when two of them collide.* AWS names three patterns, and the gap between them is the whole game.
+
+**Write Global** routes all writes to one region and promotes another on failure (Aurora Global Database promotes in under a minute). Be honest about what this is: active-active *reads*, single-writer. It sidesteps conflicts by not distributing writes, and you should notice when "active-active" quietly means this. **Write Partitioned** gives each region a key range, say by user ID, so a key is only ever written in one region and conflicts cannot occur by construction. It is the cleanest genuine write distribution, and it works only when your data partitions naturally; routing a key to its owning region is [consistent hashing](/blog/consistent-hashing) lifted to the geographic layer. **Write Local** routes writes to the nearest region, true multi-master, which forces conflict resolution.
+
+Write Local is the hard one, and the problem hides inside "last-writer-wins," which DynamoDB Global Tables uses. LWW does not *resolve* a conflict; it *discards* the losing write and keeps the later timestamp. For a shopping cart the item someone added is silently gone; for a bank balance a transaction vanishes and nobody got an error. It is a policy for which data loss you find acceptable, dressed up as a feature. Underneath sits **split-brain**: during a partition both regions accept writes, and on heal you have two divergent histories with no clean answer for which is the truth. Quorum or a single-writer discipline avoids it by construction; LWW just throws away half the writes. And because retries cross regions, none of this is safe without idempotency keys on every write path, or failover quietly *duplicates* side effects, the whole subject of [idempotency and the exactly-once lie](/blog/idempotency-exactly-once).
+
+## The asterisk: active-active does not save you from yourself
+
+Back to that asterisk. Active-active gives RPO and RTO near zero for exactly one class of disaster: losing infrastructure. A region falls over, the others carry the load, recovery is near-instant. That is real and valuable, and also the *less common* disaster, because the thing that takes you down at 2 a.m. is rarely a datacenter fire. It is a bad deploy, a botched migration, a DELETE without a WHERE clause. And the cruel part: in active-active, that corruption replicates to every region in about a second. The property you paid for is now propagating your mistake everywhere, and recovery means restoring from a point-in-time backup, so RPO and RTO are greater than zero for the failure mode you face most. AWS states this directly: recovery from data corruption or deletion is *always* RPO > 0 and RTO > 0, even in active-active.
+
+Which surfaces the most important sentence here: **replication is not backup.** A replica is a faithful mirror of your current state, mistakes and all; a backup is a frozen copy of a *past* state you can return to. You need both. Active-active protects against the hardware; backups protect against you.
+
+## Roblox: more regions do not save you from a bug that replicates
+
+The cleanest cautionary tale is the Roblox outage of October 2021: seventy-three hours of downtime, fifty million users affected, and the root cause was not a lost region. A newly enabled Consul feature caused contention under load, compounded by a latent pathology in BoltDB. The structural problem: a *single* Consul cluster served all backend services, so when that substrate degraded, it took everything with it. No region loss, a shared dependency failing. The detail that should haunt every architect comes from the postmortem itself:
+
+> Critical monitoring systems that would have provided better visibility into the cause of the outage relied on affected systems, such as Consul.
+
+Their monitoring depended on the thing that broke, which is much of why a diagnosis took three days. The staff-level reading: this was a correlated-dependency, blast-radius event, not a region-loss event. More regions would not have helped, because the failure was a shared control-plane substrate, not lost hardware. Active-active is *no defense* against a bug that replicates, because the bug rides the same replication you are paying for; adding regions only adds coordination failure modes. The structural fix it lacked is cell-based architecture: isolated cells so a single failure cannot take everything, shrinking the blast radius *within* a region. And monitoring-depends-on-the-failed-thing is the canonical argument that your observability stack must not share fate with the system it watches, the case I make in [Metrics, Logs and Traces](/blog/observability-three-pillars). Instrument the failover path, or you fly blind during the one event it exists to handle.
+
+## The leaks: failover timing, the control-plane trap, and the law
+
+Even when the strategy is sound, the *mechanism* of failover leaks time. DNS failover is not instant: between health-check detection (~30s), a 60-second record TTL, and clients that ignore TTL, it lands at one to three minutes. A five-minute RTO is met that way; a 30-second target needs anycast, Global Accelerator, or active-active. The deeper trap, the one that separates engineers who have *tested* their DR from those who merely have it, is data-plane versus control-plane. AWS: "you should use only data plane operations as part of your failover operation." Changing Route 53 weights is a *control-plane* operation, as is triggering Auto Scaling, and control planes carry lower availability targets than the serving path, so the move you were counting on to fail over might itself be down during the outage you are recovering from. This is also why *hot standby* exists, provisioning the recovery region to full capacity so failover does not depend on scaling up at the worst moment, the property called static stability.
+
+And one constraint can forbid the whole conversation above, which engineers discover last: data residency. GDPR's penalty ceiling is 20 million euros or 4 percent of global turnover, and Russia, China, and India have rules that can *prohibit* foreign storage outright. So your active-active topology may be *legally forbidden* from replicating EU-person data to a US region: the replica you need for RPO near zero is the one the law will not let you create. Multi-region is a legal-and-finance decision, and the fines make it one you lose your job over.
+
+## The senior verdict: buy the warm standby
+
+So where does a senior engineer land? For most systems, on the rung below the top, and AWS itself hints at it:
+
+> Most customers find that if they are going to stand up a full environment in the second Region, it makes sense to use it active/active. Alternatively, if you do not want to use both Regions to handle user traffic, then Warm Standby offers a more economical and operationally less complex approach.
+
+Read the structure of that hedge. The case for active-active is "you already paid for the second region, so you might as well serve from it." That is a *utilization* argument, not a reliability one, and it only holds once you have committed to a full second environment for other reasons. For everyone else, the answer is warm standby.
+
+The economics make it crisp. Active-active is roughly 2x steady-state cost forever, plus a permanent tax on every feature, because your engineers stop writing ordinary single-writer code and start writing distributed-consensus code for the life of the product. Warm standby is roughly 1.1 to 1.3x and lets them write normal code. For the median business, the *expected* cost of a few minutes of warm-standby RTO sits far below the *certain* daily cost of active-active's complexity. Reserve active-active for the narrow case where downtime directly bleeds revenue *and* the write pattern is naturally partitionable.
+
+One discipline is non-negotiable regardless of rung: DR you have not tested does not exist. The only way to know a recovery path works is to rehearse it, with game days and deliberately killing a region in a controlled window. The same instinct runs through [replication](/blog/replication-strategies): your replica is only as good as your last verified failback.
+
+So: get a real RPO and RTO from the people who own the revenue, buy the cheapest rung that meets them, keep point-in-time backups regardless, and fail over on the data plane. And be honest that active-active is not warm standby plus more money. It is a fundamentally harder problem, and the median system is better served stopping one rung early and spending the difference on testing the rung it has.
+
+## FAQ
+
+<FAQ />

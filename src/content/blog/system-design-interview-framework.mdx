@@ -1,0 +1,180 @@
+export const meta = {
+  slug: 'system-design-interview-framework',
+  title: 'The System Design Interview, Reverse-Engineered: A Repeatable Framework',
+  description:
+    'A repeatable framework for the system design interview: the eight-stage pipeline, the hidden rubric you are scored on, and how senior and staff bars actually differ.',
+  headline: 'The System Design Interview, Reverse-Engineered: A Repeatable Framework',
+  deck: 'You do not fail system design for not knowing enough. You fail for how you behave under ambiguity.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '17 min',
+  tags: [
+    'system-design',
+    'interviews',
+    'distributed-systems',
+    'staff-engineer',
+    'architecture',
+    'career',
+  ],
+  faq: [
+    {
+      q: 'What is the framework for a system design interview?',
+      a: 'Eight stages, in order: clarify functional and non-functional requirements, run a quick capacity estimate, define the API and data model, draw the high-level design and get buy-in, drive a deep dive into the two or three components that carry the risk, name the bottlenecks and failure modes, make the tradeoff calls out loud, then wrap up with what you would monitor and what you would do next with more time. Alex Xu, Donne Martin, interviewing.io, and Hello Interview all describe the same arc at different granularity. The order matters more than the exact stage count, because each stage feeds the next.',
+    },
+    {
+      q: 'What are you actually scored on in a system design interview?',
+      a: 'Not the diagram. Three axes: breadth (do you know the full range of components and principles), depth (can you go deep with real hands-on detail), and proactiveness (do you drive, scope, foresee problems, and critique your own design). Breadth is weighted heaviest at mid level and tapers; depth and proactiveness rise sharply with level. The interviewer is reading for judgment and signal, not coverage, which is why a complete-looking design with no decisions in it scores badly.',
+    },
+    {
+      q: 'How is the senior bar different from the staff bar?',
+      a: 'Senior is depth-in-two: fundamentals are assumed, and you go deep in around two components from real experience, spot the hard part early, and critique your own design before the interviewer does. Staff is depth-in-many plus teaching the interviewer: you go deep across multiple areas, lead almost the whole interview, reason about operations and cost and how the system touches the rest of the org, push back on requirements that do not make engineering sense, and contribute an insight the interviewer did not have. The meta-signal is who is holding the pen.',
+    },
+    {
+      q: 'What is the most common mistake strong candidates make?',
+      a: 'Behavior, not ignorance. The mistakes that sink otherwise-strong candidates are jumping to architecture before clarifying scope, narrating pros and cons forever without ever committing to a decision, dropping brand names like Kafka or Cassandra they cannot defend, going silent for minutes when stuck, ignoring the interviewer steering them off a dead path, and reaching for internet-scale machinery before a baseline exists. You can know every pattern and still fail by performing coverage instead of emitting signal.',
+    },
+    {
+      q: 'How much time should you spend on each part of the interview?',
+      a: 'For a 45 to 60 minute interview, roughly: five minutes clarifying requirements with a quick estimate folded in, five to seven on the API and data model, ten to fifteen on the high-level design, ten on the deep dive where bottlenecks and tradeoffs get worked continuously, and a few minutes to wrap up. The budget is a guide, not a stopwatch. The real skill is spending your minutes where the risk is and not burning them drawing boxes everyone already agrees on.',
+    },
+  ],
+}
+
+A system design interview is the only technical interview where knowing the answer can still get you a no-hire. You can name every pattern, draw a clean diagram, and walk out having covered the whole problem, and the feedback comes back lukewarm. Meanwhile someone who designed less, talked through more, and changed their mind twice gets the offer. That outcome looks like noise. It is the rubric working exactly as designed.
+
+This is the reference I wish I had when I started taking these seriously, and it is the hub the rest of the engineering writing on this site links back to, so it goes deep on purpose. The plan: reverse-engineer what the interview is actually measuring, then give you one repeatable framework that emits those signals deliberately instead of by accident. Every stage is grounded in a system I have shipped, because a framework you cannot apply to real work is a script, and scripts break the moment the interviewer goes off-book.
+
+## The thing you are actually being graded on
+
+Here is the reframe everything hangs on. The diagram is the artifact. The product is a sequence of judgment calls made out loud, under ambiguity, with someone watching how you handle being uncertain. The interviewer is not checking whether your design would work. They are reading you for signal: can this person scope a vague problem, pick the few things that matter, go deep where it counts, and own the consequences of their choices.
+
+Hello Interview, which publishes its rubric openly, scores three axes. Breadth: do you know the full range of components and principles. Depth: can you go deep with real hands-on detail, the kind you only have from operating something. Proactiveness: do you drive the conversation, scope it yourself, foresee problems before they bite, and critique your own design. Those weights shift with level, and that shift is the entire leveling story.
+
+Sit with what this means. A complete design with no decisions in it scores low, because completeness is not a signal of judgment. An incomplete design where every choice is defended and every tradeoff is named scores high, because that is judgment on display. The candidate who optimizes for covering everything is playing the wrong game. The one who optimizes for demonstrating judgment on the few things that matter, and steering the conversation there themselves, is playing the right one.
+
+So the framework below is not a checklist to complete. It is a machine for producing those signals in the order the interviewer expects them.
+
+## One framework, eight stages
+
+There is no single industry framework. There are several, and the useful discovery is that they agree. Alex Xu teaches four steps. Donne Martin's primer teaches four. interviewing.io compresses to three. Hello Interview expands to six with a published minute budget. Read them side by side and they trace the same arc at different resolution. I fuse them into eight stages because the seams between stages are where candidates fall, and naming each seam makes it harder to skip one.
+
+The order is load-bearing. Each stage produces an input the next consumes. Skip capacity estimation and your high-level design has no numbers to justify it. Skip clarification and you deep-dive a component the system does not need. Run them in order and the design assembles itself.
+
+| Stage | Minutes | What a junior does | What senior-grade looks like |
+| --- | --- | --- | --- |
+| 1. Clarify requirements | ~5 | Restates the prompt, assumes the rest, starts drawing | Splits functional from non-functional, picks the top three to five constraints that matter, names the one thing that makes this system uniquely hard |
+| 2. Capacity estimate | folded in | Skips it, or computes numbers it never uses | Derives QPS, read/write ratio, storage per year, working-set size, and carries them forward into design choices |
+| 3. API and data model | ~5 | Jumps to a database brand, vague endpoints | Defines core entities first, then a small clean contract, chooses the data model with a stated reason |
+| 4. High-level design | ~10-15 | One giant blob, tries to design everything at once | Draws the end-to-end happy path, justifies each box, gets buy-in before going deeper |
+| 5. Deep dive | ~10 | Waits to be told where to go, shallow everywhere | Drives the dive, goes deep in two or three components from real experience |
+| 6. Bottlenecks and failure | within the dive | Assumes the happy path | Proactively names single points of failure, hot partitions, cache stampedes, and proposes recovery |
+| 7. Tradeoffs | continuous | Lists pros and cons, never decides | Makes the call, states how the decision would change under different constraints |
+| 8. Wrap-up | ~2-5 | Trails off when time runs out | Summarizes, restates key tradeoffs, names what to monitor and what to do next with more time |
+
+The minutes assume a 45 to 60 minute slot. Treat them as a center of gravity, not a stopwatch. The actual skill is spending your budget where the risk lives and refusing to burn it drawing boxes everyone already agrees on.
+
+## Stage 1: clarify, and earn the right to draw
+
+The most expensive mistake in the interview happens in the first two minutes: you hear the prompt, your pattern-matcher fires, and you start drawing. Now you are solving a problem nobody asked for, at a scope nobody confirmed, and every minute after compounds the error.
+
+The move is to split requirements into two buckets out loud. Functional requirements are what users can do: "a user can post a message," "a member can see the group's live location." Non-functional requirements are how the system has to behave: "writes must be durable," "reads can tolerate a few seconds of staleness," "the system stays available during a regional outage." Juniors design only the functional half and discover the hard part too late. The non-functional half is where the design actually gets decided.
+
+Then narrow. You cannot optimize for everything, so name the three to five constraints that dominate and say why. The discipline is to find the one property that makes this system uniquely hard, because that property is what the whole design has to bend around.
+
+When I built [NomadCrew](/case-study/nomadcrew), a group-travel coordinator with live location and group chat, the uniquely-hard property was not throughput. It was concurrency on shared mutable state. Several people in one trip edit the same itinerary and watch each other move on the map at once, and they expect a coherent view, not a smear of conflicting writes. That single observation, surfaced in stage one, is what justified a WebSocket hub and a deliberate stance on consistency later. Had I clarified for "how many trips" instead of "what does concurrent editing of one trip have to feel like," I would have designed the wrong system and defended it confidently.
+
+That is the signal stage one emits: you can tell the difference between the scale that is interesting and the scale that is decoration.
+
+## Stage 2: estimate enough to make a decision, and no more
+
+Capacity estimation intimidates people because they imagine a spreadsheet. It is the opposite. The point of back-of-the-envelope math is to surface the two or three numbers that change a design decision, then stop.
+
+Ask whether the interviewer wants estimation at all, then derive only the load-bearing figures. Reads and writes per second. The read/write ratio, because a 100-to-1 read-heavy workload and a write-heavy one want opposite architectures. Storage growth per year, because it decides whether one database is even an option. Working-set size, because it decides whether your hot data fits in memory or gets paged off disk on every request.
+
+This is where the latency ladder earns its keep. The Dean and Norvig numbers are the canonical anchor, and you only need the shape: a main-memory reference is around 100 nanoseconds, a round trip inside one datacenter is roughly half a millisecond, a disk seek is around 10 milliseconds, and a packet from California to the Netherlands and back is roughly 150 milliseconds. The ratios are the lesson. Memory is about a hundred thousand times faster than a disk seek, and a cross-continent round trip is three hundred times slower than a local one. When someone proposes a synchronous cross-region call on the hot path, those numbers are how you know in your head that the latency budget is already blown.
+
+A senior estimate is a few numbers that constrain the design. A junior estimate is skipped or a pile of arithmetic that never gets used again. The tell is whether the numbers come back later. Compute QPS and never reference it and you did theater. Compute it and then say "at this read rate the database is the bottleneck, so a cache is not optional here" and you did engineering. Capacity estimation deserves its own deep treatment, and it will get one.
+
+## Stage 3: entities first, then the contract
+
+The reflex here is to name a database. Resist it. You decide storage technology after you understand the data, and announcing "I'll use Postgres" before you have entities is a choice you cannot yet defend.
+
+Start with the core entities. For [Aladeen](/case-study/aladeen), a multi-tenant platform, the entities and their relationships were the whole game, because the moment you have tenants, how tenant boundaries live in the schema dominates everything downstream. Get that wrong and every query, every index, every access check inherits the mistake. I designed Aladeen around a schema waist: a small, stable core contract that the variable parts plug into, so the pieces that change often do not get to reach into the pieces that must stay invariant. That is a stage-three decision, and the kind of thing an interviewer is delighted to see, because it shows you treat the data model as the thing that outlives the code.
+
+Then define a small, clean API over those entities. A handful of endpoints with clear inputs and outputs beats an exhaustive surface. Think about identifiers explicitly: is the ID user-facing, is it sequential and therefore guessable and enumerable, does it risk collision under concurrent creation. ID design looks trivial and is a frequent source of real bugs, so naming it is cheap signal.
+
+Choosing relational versus non-relational belongs here too, and it belongs with a reason. "Relational, because the access patterns are relational and I want transactions across these three entities" is defensible. "NoSQL because it scales" is the brand-name mistake wearing a category label, and a good interviewer will ask you to defend it until it falls apart.
+
+## Stage 4: the happy path, end to end, then stop
+
+Now you draw, and the goal is a single coherent picture of the request flowing from client to response, with every major component present and every box justified. Client, load balancer, application tier, datastore, a cache if your stage-two numbers demanded one, a queue if you have async work. The complete happy path, no more.
+
+The failure mode is trying to design everything at once. You start detailing the sharding scheme before the overall shape exists, the interviewer loses the thread, and you lose the chance to get buy-in. Getting buy-in is the explicit move here: lay out the high-level design, then check that the interviewer agrees before you spend ten minutes deep in one corner. That check is not weakness. It is how you avoid building depth on a foundation the interviewer was about to redirect.
+
+What separates senior designs at this stage is restraint. The junior instinct is to reach for internet-scale machinery immediately: a globally distributed database, Kafka between every two services, sharding before there is anything to shard. A globally distributed database for a blog comment system is overkill, and reaching for it signals that you scale by reflex rather than by need. The senior move is to build the simplest baseline that satisfies the requirements you clarified, and let the bottlenecks pull complexity in. Fahim ul Haq put the truth cleanly: the architecture evolves because the bottlenecks evolve. Simplicity is a feature, and the most senior thing you can do at stage four is often to leave a component out and explain that nothing yet justifies it.
+
+## Stage 5: the deep dive, where level is decided
+
+This is the stage that determines whether you read as mid, senior, or staff, so it is worth knowing precisely what changes.
+
+A junior waits to be told where to dig and is shallow wherever they land. The interviewer drives, because the candidate cannot. Senior-grade is the inversion: you pick the two or three components that carry the real risk and go deep in them from experience, the kind of depth that includes the configuration details and the things that bit you in production. Hello Interview's bar is explicit. Senior should go deep in around two places and show practical experience there. Staff is expected to provide expertise in multiple areas, contribute novel insights, and at the top of the range, educate the interviewer.
+
+So at NomadCrew the deep dive was the WebSocket hub: connection lifecycle, how fan-out to everyone in a trip works, what happens to in-flight messages when a client reconnects, how you keep one slow consumer from backing up the whole room. That is depth you can only narrate if you have built it, which is exactly why it scores. For [Audex](/case-study/audex), the deep dive was determinism: given the same input, the system must produce byte-identical output every time, which sounds simple and is brutal, because it means hunting down every source of nondeterminism, map iteration order, timestamps, floating-point, concurrency interleaving, and pinning each one. Narrating how you made a pipeline deterministic is a depth signal almost nobody can fake, because the failure modes are too specific to invent on the spot.
+
+The distributed-systems vocabulary lives here, and each deep-dive topic maps to a chapter of the canonical reference. Replication tradeoffs, single-leader versus multi-leader versus leaderless, replication lag, quorum reads and writes. Partitioning, hot keys, skew, rebalancing, with consistent hashing as the standard tool. Transactions and isolation levels. Consistency as a spectrum. These earn depth points, and the way to make them land is to reach for them only where your specific design needs them, never as a tour.
+
+For [IntelliFill](/case-study/intellifill) the interesting axis was multi-agent orchestration: how you bound several agents working one task, keep one agent's failure from corrupting the shared result, and make it observable when the control flow is no longer a straight line. That is a contemporary problem, and raising it well tips a deep dive from senior toward staff, because you are bringing the interviewer something current rather than reciting something settled.
+
+## Stage 6: name what breaks before it does
+
+Stage six lives inside the deep dive but carries its own signal, so I separate it. Failure-mode analysis is one of the clearest senior tells, because juniors design the happy path and assume it holds, and seniors assume it breaks and design for the break.
+
+Run the system through the standard failure questions. Where is the single point of failure, and what happens when it dies. Which partition goes hot under a skewed key, and how do you spread the heat. What happens under a thundering herd, a thousand clients reconnecting at once after a blip, or a cache stampede, when a popular key expires and every request misses to the database at once. How far does replication lag let a stale read drift. Where does backpressure build when a downstream consumer falls behind.
+
+The point is not to list every possible failure. It is to identify the failures this design is exposed to given the constraints you clarified, and propose redundancy, failover, or graceful degradation for the ones that matter. Doing this proactively, before the interviewer asks "what if that node goes down," is the difference between answering questions and anticipating them. The candidate who has already named the SPOF and proposed a standby reads a full level above the one who waits to be asked.
+
+## Stage 7: decide, out loud, and say what would change your mind
+
+Here is the mistake that sinks more strong candidates than any knowledge gap: narrating tradeoffs forever and never committing. You weigh strong consistency against availability, lay out the pros and cons beautifully, then move on without saying which you chose. To the interviewer that reads as an inability to decide under uncertainty, which is the exact thing the job requires. interviewing.io says it flatly: you have to make a decision.
+
+So make the call, and reason over the real axes: consistency, availability, latency, durability, cost. CAP and its refinement PACELC are levers in this conversation, not buzzwords to drop. You use CAP well by applying it to a specific choice: "during a network partition, this system favors availability and serves possibly-stale reads, because a member briefly seeing a slightly old location is fine, while refusing to load the trip is not." That sentence uses CAP to justify a concrete decision tied to the product. Naming the theorem and moving on uses it as decoration.
+
+The senior flourish is to state how your decision would change under different circumstances. "I'm choosing eventual consistency here because the read tolerance is loose. If this were account balances instead of map positions, I would pay the latency for strong consistency, because a stale balance is a correctness bug, not a cosmetic one." That move shows the interviewer your decision is not a memorized default. It is a function of the constraints, and you can see the other branch. NomadCrew sits on exactly this choice, leaning toward availability and convergence over strict consistency, because the product can absorb brief staleness but cannot absorb being unavailable when a group is mid-trip.
+
+One instance of this discipline earns disproportionate credit: idempotency in any pipeline with retries. When I designed webhook handling for a payments flow, the whole correctness argument came down to making at-least-once delivery behave like exactly-once processing, which I wrote up in [idempotent webhooks](/blog/idempotent-webhooks). Raising idempotency unprompted at the moment you introduce a queue or an external call is a depth signal, because it shows you know the happy path is the easy part and the retries are where correctness lives.
+
+## Stage 8: land it like you own it
+
+When time gets short, juniors trail off. Seniors land the plane. The wrap-up is a real stage with a real signal, and the signal is operational ownership: you think past the design into running the thing.
+
+Summarize the design in a few sentences. Restate the two or three tradeoffs that defined it, so the interviewer remembers you made choices on purpose. Then say what you would do next with more time, and how you would operate this in production: what you would monitor, what you would alert on, how you would deploy and roll back, what the blast radius of a bad change is. That operational layer is where the staff bar lives, and most candidates never reach it because they spend their last five minutes adding a box instead of closing the loop. Access control is one place this shows up cleanly, and pushing authorization changes through events rather than synchronous checks is a pattern I unpack in [event-driven RBAC](/blog/event-driven-rbac), the kind of cross-cutting concern a wrap-up should at least name.
+
+## The leveling ladder, and who holds the pen
+
+Now the part the rubric was building toward. The same framework produces a mid, senior, or staff read depending on how you run it, and the difference is mostly about who is driving.
+
+Mid level, the L3 to L4 band: you show broad understanding, guide the early phases, and the interviewer drives the deep dives because you need the prompting. That is a fine outcome for the level. Fundamentals are demonstrated, judgment is emerging.
+
+Senior, the L5 band: fundamentals are assumed, so proving you know what a load balancer does is wasted budget. You go deep in around two areas from real experience, spot the uniquely-hard part early, and critique your own design before the interviewer gets the chance. Proactiveness has crossed a threshold: you recognize the limitations in your own approach and raise the alternatives yourself.
+
+Staff, the L6 band: depth across multiple areas, and you lead almost the entire interview. You reason about operations, cost, and how this system interacts with the rest of the organization. You push back on requirements that do not make engineering sense, because at this level "the spec said so" is not sufficient reason to build something wasteful. And at the top of the range you teach the interviewer something, a contemporary approach or a non-obvious insight they did not walk in with.
+
+Compress all of it to one signal: who is holding the pen. The further you are from needing the interviewer to prompt, scope, or redirect you, the higher the level reads. Mid needs the pen handed over for the hard parts. Senior takes the pen for the parts that matter. Staff holds the pen the whole time, and occasionally hands the interviewer a page they did not have.
+
+## The mistakes that fail strong candidates
+
+The mistakes that sink people who know plenty are behavioral, not technical, which is why this interview is hard to study for. Knowledge you can read. Behavior under ambiguity you have to rehearse. The recurring ones, in rough order of damage to a strong candidate:
+
+Jumping to architecture before clarifying scope, so you solve the wrong problem well. Narrating tradeoffs forever and never committing to one. Dropping brand names, Kafka, Cassandra, Spanner, that you cannot defend under follow-up; the fix is to say the generic component, message queue, wide-column store, unless you can go deep on the specific one. Going silent for minutes when stuck, which reads as frozen; ask for a hint instead of disappearing. Ignoring the interviewer when they steer you, when they have watched that exact path dead-end in fifty other interviews and are trying to save you. Reaching for internet-scale machinery before a baseline exists. Picking components with no stated reason. Designing only what the system does and ignoring how it has to behave. And treating the whole thing as an exam to be aced rather than an engineering conversation to be had, which produces memorized templates that shatter the instant an assumption shifts.
+
+Every one of these optimizes for the wrong thing. Coverage over judgment. Sophistication over fit. Performance over conversation. The framework is the antidote because it forces the right thing at each stage: clarify before you draw, decide before you move on, go deep where the risk is, and keep talking while you do it.
+
+## The repeatable part
+
+This is repeatable because the stages do not depend on the problem. Design a URL shortener, a chat system, a ride-dispatch service, a notification fan-out, and the pipeline is identical: clarify, estimate, model, sketch, dive, break, decide, land. What changes is which constraint dominates and therefore where you spend the deep dive. The framework is the constant; the problem just tells you where to point it. So stop memorizing reference architectures, which only works if you draw the exact system you studied, and run this loop on system after system until the stages are automatic and your attention is free for the thing that scores: judgment calls, made out loud, owned completely. Build a few real systems and the deep-dive material stops being theory you recite and becomes experience you narrate, the single hardest signal to fake and the one every level above mid is built on.
+
+The diagram was never the point. The point is to show, in forty-five minutes, that you are the kind of engineer who can be handed a vague hard problem and trusted to drive it to something that works, decide the tradeoffs, see what will break, and own it in production. Run the framework, and the diagram draws itself while you do the part that matters.
+
+## FAQ
+
+<FAQ />

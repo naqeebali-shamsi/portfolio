@@ -5,6 +5,8 @@ import clsx from 'clsx';
 const NAV_LINKS = [
   { label: 'Experience', href: '#experience' },
   { label: 'Work', href: '#work' },
+  { label: 'Blog', href: '/blog' },
+  { label: 'Shop', href: '/products' },
   { label: 'Contact', href: '#contact' },
 ] as const;
 

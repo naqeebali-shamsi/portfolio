@@ -1,0 +1,190 @@
+export const meta = {
+  slug: 'slos-error-budgets',
+  title: 'SLOs and Error Budgets: Deciding What "Reliable Enough" Means',
+  description:
+    'A perfect uptime target blocks every deploy and costs a fortune for reliability nobody feels. How SLIs, SLOs, and error budgets price "reliable enough" right.',
+  headline: 'SLOs and Error Budgets: Deciding What "Reliable Enough" Means',
+  deck: 'An error budget turns the endless fight between shipping fast and staying up into a single number both sides spend against.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['reliability', 'sre', 'slo', 'error-budgets', 'observability', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between an SLI, an SLO, and an SLA?',
+      a: 'An SLI is the measurement: good events divided by valid events, on a scale where 100% means nothing broke. An SLO is the internal target you commit to for that measurement, such as 99.9% of requests succeed over 28 days. An SLA is an SLO with explicit consequences, usually a refund or penalty, promised to a customer. The test that separates the last two: if missing the number triggers a contractual consequence it is an SLA, and if it only triggers an internal conversation it is an SLO. SLAs are set deliberately looser than SLOs so you have a buffer before money changes hands.',
+    },
+    {
+      q: 'Why is a 100% reliability target a mistake?',
+      a: 'Three independent reasons. It is physically impossible, because even redundant components have a nonzero chance of failing at the same time. It is self-defeating, because a service that is never allowed to be below 100% can never be changed, since every deploy carries risk. And it is uneconomic, because each extra nine costs roughly ten times the previous one in allowable downtime and far more in engineering effort, for reliability the user usually cannot perceive over their own phone, WiFi, and ISP. The right target is the lowest one that keeps users happy, not the highest one you can reach.',
+    },
+    {
+      q: 'What is an error budget and how do you use it?',
+      a: 'An error budget is one minus your SLO. A 99.9% target gives you a 0.1% budget, the amount of failure you are allowed to spend over the window. When budget remains, the team can spend it on risk: fast rollouts, experiments, feature launches. When it is exhausted, a pre-agreed policy reallocates effort to reliability, typically a release freeze for everything except security and P0 fixes. The point is that the freeze is triggered by data, not by an engineer winning an argument.',
+    },
+    {
+      q: 'What is burn rate and why alert on it instead of the raw error rate?',
+      a: 'Burn rate is how fast you are spending the error budget relative to sustainable. A burn rate of 1 exhausts the budget exactly at the end of the window, and anything above 1 is unsustainable. Alerting on the raw error rate crossing the SLO threshold flaps constantly and has a terrible reset time, because a brief blip crosses and uncrosses the line repeatedly. Burn-rate alerting fires on how fast budget is draining over a window, so a fast catastrophic burn pages immediately while a slow leak opens a ticket for the next business day.',
+    },
+    {
+      q: 'Should the error budget reset on the first of the month?',
+      a: 'Prefer a rolling window, such as the trailing 28 days, over a calendar reset. A calendar reset does not match how users remember reliability, and it creates a use-it-or-lose-it cliff at the end of each month where a team races to spend leftover budget before it expires. A rolling window keeps the incentive smooth and means a bad incident keeps costing you for exactly as long as a user would still remember it.',
+    },
+  ],
+}
+
+Every reliability conversation that goes badly starts the same way. Someone asks how reliable the service should be, and the honest answer in the room is "as reliable as possible." It sounds responsible. It is the most expensive sentence in engineering, and it quietly guarantees you will never ship anything again.
+
+Here is what that answer commits you to. "As reliable as possible" has no number, so it can never be satisfied, which means every proposed change can be objected to on reliability grounds and there is no data to settle the objection. The careful engineer wants to slow down. The product lead wants to ship. Both are arguing about values, neither can be proven right, and whoever has more political capital that week wins. That is not a reliability strategy. That is a standing fight with no end condition.
+
+SLOs exist to end that fight by turning "reliable enough" into a number, and error budgets exist to make that number something two teams can spend instead of argue over. This piece is about how to pick the number honestly, why the obvious target of 100% is a trap, and how the budget converts an unwinnable values argument into ordinary accounting.
+
+## The chain: indicator, objective, budget, agreement
+
+Four terms get used interchangeably and they are not the same thing. Getting them precise is the whole foundation, so it is worth being pedantic for a paragraph.
+
+A **service level indicator**, or SLI, is a measurement of how the service is doing. The canonical form is a ratio: good events divided by valid events, times 100, on a scale where 100% means nothing is broken. "The fraction of checkout requests that returned a 2xx in under 300 milliseconds" is an SLI. It is a number you can graph, and it goes down exactly when something users care about gets worse.
+
+A **service level objective**, or SLO, is the target you commit to for that indicator. "99.9% of checkout requests succeed in under 300 milliseconds, measured over a rolling 28 days" is an SLO. It is internal. It is the line you are promising yourselves you will stay above.
+
+An **error budget** is one minus the SLO. A 99.9% objective leaves a 0.1% budget. That 0.1% is the quantity of failure you are explicitly allowed to spend over the window before anyone is allowed to be upset about it. This is the load-bearing idea of the entire discipline, and we will spend most of the piece on it.
+
+A **service level agreement**, or SLA, is an SLO with consequences attached, and it faces outward at a customer. The test that cleanly separates the two comes straight from Google's SRE practice: ask what happens if the number is missed. If there is an explicit consequence, a refund or a penalty clause, it is an SLA. If the only consequence is an internal conversation, it is an SLO. And the SLA is deliberately set looser than the internal SLO. If you promise customers 99.9% in writing, you run your own team to 99.95% internally, so the alarm goes off and you start fixing things well before you are anywhere near owing anybody money.
+
+The chain runs one direction. The indicator measures pain, the objective sets the line, the budget is the room below the line, and the agreement is what it costs you outside the company if you blow through it all.
+
+## Why 100% is the wrong target, in three separate ways
+
+The instinct to aim for perfect reliability is so strong that one argument against it never sticks. You need three, because each one defeats a different objection, and a serious skeptic will keep moving the goalposts until all three are gone.
+
+**It is physically impossible.** Even with redundant components, there is a nonzero probability that two or more fail at the same moment. You can drive that probability down with more redundancy, but you cannot drive it to zero, and the cost of each additional nine of confidence climbs faster than the risk it removes. The hardware will not let you promise 100%, so promising it is already a lie before you write any code.
+
+**It is self-defeating.** Say you somehow build a service that is genuinely 100% reliable today. The instant you do, you have created an obligation you can only ever fall short of, because every change you might make from here, every deploy, every config edit, every dependency bump, carries a nonzero chance of breaking something. A service pinned at 100% is a service that can never be touched again. The pursuit of the final fraction of a nine does not just cost money. It blocks all shipping, permanently, which is the opposite of why the service exists.
+
+**It is uneconomic.** Walk up the ladder and the price of each nine is brutal. This is the table everyone should have memorized, because it makes the cost concrete:
+
+| Availability | Name | Downtime per year | Per 30-day month |
+| --- | --- | --- | --- |
+| 99% | two nines | ~3.65 days | ~7.3 hours |
+| 99.9% | three nines | ~8.77 hours | ~43.8 minutes |
+| 99.95% | | ~4.38 hours | ~21.9 minutes |
+| 99.99% | four nines | ~52.6 minutes | ~4.38 minutes |
+| 99.999% | five nines | ~5.26 minutes | ~26 seconds |
+
+Each nine cuts allowable downtime by roughly ten times, and the engineering effort to earn it climbs far faster than that. Going from 99.9% to 99.99% means your entire year's downtime budget shrinks from nearly nine hours to under an hour, which rules out whole categories of cheap solution and forces expensive, conservative ones. And here is the part that should stop the conversation: the user is sitting behind a phone, a home router, and an ISP that are each less reliable than your 99.99%. The reliability you are bankrupting yourself to add is invisible underneath the unreliability of everything between your edge and their eyes. Five nines is so demanding that you can barely measure it; one second of downtime spread over thirty years already drops an eleven-nines claim to nine.
+
+The conclusion all three arguments point at is the same, and it is genuinely counterintuitive: the right reliability target is the *lowest* number that keeps your users happy, not the highest number you can technically reach. More nines past the point users notice is pure waste, paid for in deploy velocity and engineering hours, returned as nothing anyone can feel.
+
+## The error budget is a shared currency, and that is the whole trick
+
+Now the payoff. Define the budget as one minus the SLO and something quietly profound happens to the org chart.
+
+The argument we started with, ship faster versus stay safe, was unwinnable because the two sides were trading in different currencies. Product measures in features and speed. Reliability measures in incidents and sleep. There is no exchange rate, so the debate never resolves on merits, only on who pushes harder.
+
+The error budget invents the exchange rate. It is one number, denominated in allowable failure, that both teams spend against. When budget remains, the development team has earned the right to spend it on risk: aggressive rollouts, live experiments, a feature launch on a Friday. The budget is theirs to burn, and burning it on shipping is the legitimate, intended use. When the budget is exhausted, the policy automatically swings effort toward reliability until it recovers. Nobody had to win the argument, because the argument was replaced by a balance.
+
+The most important property of this is that it is **depersonalized**. The release freeze is not triggered by a senior engineer finally getting their way in a meeting. It is triggered by a number crossing zero. That distinction is what makes the whole thing survive contact with human politics. The reliability advocate is no longer the person saying no, which means they stop being the obstacle everyone routes around, and the developer who wanted to ship is not being overruled by a colleague, they are out of budget, the same way you are out of money. SoundCloud's engineering team, writing about running this in production, frames the budget as the decision framework itself, and that is exactly right. The number decides. The people implement.
+
+This only works if you actually do it, which sounds obvious and is the most common point of failure. An error budget that everyone agrees to ignore the moment it gets inconvenient is not a budget, it is a chart. The discipline is in honoring the freeze when the freeze is annoying.
+
+## Choosing an SLI that turns red when, and only when, users hurt
+
+The fastest way to tell a senior reliability engineer from a junior one is to watch what they optimize. A junior optimizes the SLI to stay green, because green dashboards feel like success. A senior optimizes it to go red at exactly the moment users are suffering and at no other moment. A green dashboard during a customer-visible outage is not a relief. It is a defect in your SLI, and it is the worst kind, because it is the one that will let an outage run unmonitored while everyone relaxes.
+
+Two distinctions do the heavy lifting in picking an indicator that tells the truth.
+
+**Specification versus implementation.** The specification is the user-facing promise: "the home page loads in under 100 milliseconds." The implementation is how you actually measure that, and there are several, each with a different cost and a different fidelity to real experience. You can measure at the load balancer, which is cheap and entirely under your control but blind to anything that breaks between your edge and the user's screen. You can measure with real user monitoring in the browser, which captures the truth of what people experienced but is noisier and partly outside your control. You can run synthetic probes, which are clean and predictable and not real traffic. One specification, many implementations. The rule that falls out: measure as close to the user as you can afford, because *where* you measure silently decides which failures your SLO can even see. A great many "the dashboard was green during the outage" stories are really stories about measuring at the load balancer when the failure lived in the client.
+
+**Good events over valid events, not uptime over wall-clock time.** Defining availability as "the fraction of minutes the server process was running" is a trap, because the box can be up while every request it serves returns a 500. Define it instead as successful requests over total valid requests, and the indicator goes red precisely when users are getting bad responses, which is the only thing availability was ever supposed to mean. The denominator matters too: *valid* events, not *all* events, so you can legitimately exclude load-test traffic and requests from out-of-scope clients from the math without lying about what real users saw.
+
+For most request-driven services, the starter kit of indicators is the **four golden signals**, and they are worth knowing as a default before you go inventing your own:
+
+- **Latency**, the time to serve a request, with one non-obvious rule: measure successful and failed requests *separately*. A slow error is worse than a slow success, and if you let fast 500s into your latency histogram they will make your latency look great while the service is actively failing.
+- **Traffic**, the demand on the system, such as requests per second. This is your context for everything else.
+- **Errors**, the rate of requests that failed, whether explicitly (an HTTP 500), implicitly (a 200 carrying the wrong content), or by policy.
+- **Saturation**, how full the most-constrained resource is. This one is special because it is a *leading* indicator. Latency and errors tell you the service is already hurting. Saturation tells you "the database fills its disk in four hours," which is a warning you can still act on before any user notices. Most systems degrade well before 100% utilization, so set your saturation targets below the actual limit.
+
+And once you have an SLI, validate it against reality before you trust it. A staff engineer does not believe an indicator until its dips line up with real incidents and support tickets, which you can make quantitative with a rank correlation. If your SLI stayed green through a known outage, the SLI is wrong, full stop, and no amount of pretty graphing fixes that.
+
+If you have read [Metrics, Logs and Traces](/blog/observability-three-pillars), this is where the metrics pillar earns its keep: SLIs are the specific, user-facing metrics you have decided are worth promising against, and the golden signals are the same symptom-versus-cause distinction applied to the question of what is even worth alerting on.
+
+## Setting the target without lying to yourself
+
+Two failure modes show up the moment you go to pick the actual number.
+
+The first is setting the target from your current performance. It feels safe and data-driven: measure what you do today, declare that the SLO. It is a quiet trap. If today's reliability is the product of heroics, of people manually babysitting deploys and getting paged at 3 a.m., then enshrining it as the SLO commits you to sustaining those heroics forever, and bakes the burnout into the contract. The target should come from what users actually need, not from what your tired on-call rotation happened to deliver last quarter.
+
+The second is over-precision. Google's worked game-service example is instructive: the measured availability was 97.123%, and the SLO they set was 97%. They rounded *down*, on purpose. The extra decimals are noise, they imply a confidence you do not have, and rounding down gives you a small honest margin instead of a target you are already failing by a rounding error.
+
+When you suspect the right target but genuinely cannot meet it yet, do not set it and immediately start violating it. Run it as an **aspirational SLO**: measure it, report it, and explicitly do not enforce it. Close the gap until the number is real, and only then give it teeth. An SLO you are knowingly missing on day one teaches everyone to ignore SLOs, which is a far more expensive lesson than a quarter spent catching up to an aspiration.
+
+One more constraint people forget: your SLO is bounded above by your dependencies. If a critical service you call is run at 99.9%, you cannot credibly promise 99.99% on top of it, and you cannot assume your dependencies fail independently, because replicas share fate, sit in common failure domains, and lean on shared infrastructure. This is the reliability face of the same coupling that makes [replication](/blog/replication-strategies) hard and that [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) formalize: the consistency and availability you can offer are capped by what the layer beneath you offers, and by the latency floor that the speed of light and your slowest replica impose.
+
+## Why averages lie, and percentiles are the price of the truth
+
+A quick but load-bearing detour, because the single most common way an SLI hides user pain is through the average.
+
+Report mean latency and you have built a number that is structurally incapable of seeing your worst experiences. Picture a service serving 100 milliseconds for 99% of requests and 5 seconds for the unlucky 1%. The mean barely moves off 100 milliseconds, and that 1% of users having a genuinely broken experience is completely invisible behind it. The average is the great concealer of tails.
+
+There is a sharper version of the same trap. A system handling 200 requests per second on even seconds and 0 on odd seconds has the exact same average load as one handling a steady 100 per second, while actually experiencing double the peak. Averages erase bursts the same way they erase tails.
+
+The fix is to state latency SLOs at percentiles: p90, p99, p99.9. "99% of requests complete in under 300 milliseconds" is a claim about the tail that an average can never make. This is the entire argument of [latency and the tail](/blog/latency-throughput-tail) cashed out as an SLO target. The reason you measure the tail is so you can promise against it, and the reason you promise against the tail is that the tail is where users actually feel slowness. The mean sits comfortably and misleadingly to the left of the line that matters.
+
+## Burn rate: the operational verb of the whole system
+
+Everything so far is static. The budget is a quantity, the SLO is a line. **Burn rate** is the thing that turns it dynamic and makes it something you can alert on.
+
+Burn rate is how fast you are spending the error budget relative to sustainable. The normalization is beautifully simple: a burn rate of 1 spends the budget exactly evenly and exhausts it precisely at the end of the window. Anything above 1 is unsustainable. That single number, "are we burning faster than 1x," is what your alerts fire on, which is far more useful than a raw error count because it is already contextualized against the budget and the window.
+
+Make it concrete with a 99.9% SLO over 30 days:
+
+| Burn rate | Sustained error rate | Budget gone in |
+| --- | --- | --- |
+| 1 | 0.1% | 30 days |
+| 2 | 0.2% | 15 days |
+| 10 | 1% | 3 days |
+| 1,000 | 100% | ~43 minutes |
+
+A total outage burns at 1,000x and torches a month of budget in about forty-three minutes. A subtle 1% error rate burns at 10x and gives you three days. These two situations want completely different responses, and that is exactly why you alert on the rate rather than the raw breach.
+
+Here is the failure mode burn rate fixes. The obvious alert is "page me when the error rate crosses the SLO threshold." It is the first thing everyone tries and it is genuinely the worst option, for two reasons. It flaps, because a brief blip crosses and uncrosses the line over and over, firing and clearing and firing again. And it has a terrible **reset time**, meaning long after an incident is over the alert keeps re-triggering on noise near the threshold. A static threshold is a smoke detector that goes off every time you make toast and keeps beeping for an hour after dinner.
+
+The known-good design is **multiwindow, multi-burn-rate** alerting, and it is worth showing the actual tiers because they are a real recommendation, not a vibe:
+
+| Severity | Long window | Short window | Burn rate | Budget consumed | Why |
+| --- | --- | --- | --- | --- | --- |
+| Page | 1 hour | 5 min | 14.4 | 2% | Catastrophic fast burn, respond now |
+| Page | 6 hours | 30 min | 6 | 5% | Serious sustained burn |
+| Ticket | 3 days | 6 hours | 1 | 10% | Slow leak, next business day is fine |
+
+Two pieces make this work. The burn-rate thresholds are reverse-engineered from how much budget you are willing to lose before you react: to burn through 2% of a 30-day budget inside a single hour, you must be burning at 0.02 times 720 hours, which is 14.4x, so that is your page threshold for the fast tier. And the short "confirmation" window, set to one-twelfth of the long one, must *also* be over threshold for the alert to fire, which collapses the reset time so the page clears shortly after the incident actually ends instead of nagging for an hour. Google Cloud's productized version simplifies this to two tiers, a fast burn around 10x over an hour and a slow burn around 2x over a day, which is a perfectly reasonable starting point that hides the algebra.
+
+Behind every alerting design is a four-way tradeoff that you cannot escape, only position yourself on: **precision** (are the alerts that fire real?), **recall** (do you catch everything you should?), **detection time** (how fast do you find out?), and **reset time** (how soon does it stop after the incident clears?). You cannot maximize all four. Tightening one loosens another. Multiwindow multi-burn-rate is the known-good point on that surface, and the reason it beats the naive threshold is that it buys good reset time and decent precision without throwing away detection time. Anyone can call this design good. A staff engineer can tell you *why each simpler version loses*, and that "why" is the whole understanding.
+
+One real-world wrinkle worth carrying: the book advises against `for:` hold-off clauses, the kind that say "only fire if this has been true for five minutes," because they hurt recall and detection time. SoundCloud, running this in production, added them back anyway as a cheap, effective defense against statistical outliers on low-traffic services. The lesson is not "the book is wrong." It is that a senior engineer knows when a local condition justifies deviating from the canon and can defend the deviation on its merits. The flip side is a hard constraint you do not get to argue with: burn-rate alerting cannot use a compliance window longer than about 24 hours, because the window math breaks down, which quietly shapes how slow-burn detection has to be built. The instrumentation that makes any of this observable, the spans and labels that tell you *which* dependency is burning your budget, is exactly the machinery covered in [distributed tracing](/blog/distributed-tracing).
+
+## The policy is the artifact; the number is just arithmetic
+
+The deepest mistake in this whole area is thinking the hard part is computing one minus the SLO. That is arithmetic. The hard part, the part that determines whether any of this is real, is the **error budget policy**: a document that PM, development, and operations sign *before* the budget is ever spent, specifying what actually happens when it runs out.
+
+A real policy is more than "freeze releases." It names the trigger for a freeze and what the freeze exempts (security patches and P0 fixes always ship). It defines a sanctioned override, the "silver bullet," that lets a critical release go out during a freeze, logged so it is a deliberate exception rather than a quiet erosion. It sets a threshold above which an incident demands a postmortem, for instance any single event that burns more than 20% of the budget. It lists what is *exempt* from the budget entirely: shared-infrastructure outages outside your control, traffic from out-of-scope users, errors later found to be miscategorized and non-impacting. And it names who breaks ties when the policy itself is disputed, which in practice escalates to the CTO. Maintenance is in scope too, because planned downtime spends from the same budget, and that is the honest version of scheduling risky work: you account for it openly instead of pretending a maintenance window is free.
+
+Without that signed document, the budget is decoration. The number on the dashboard means nothing if, the first time it hits zero and a freeze is inconvenient, the freeze gets waved off. Three preconditions have to be true before you even turn the thing on, and if any one is missing the whole apparatus is theater: the PM has to agree the target is right for the product, operations has to agree it is achievable without heroics, and the organization has to commit, in advance, to actually acting on the budget when it is spent. Tooling is the easy 20%. The negotiated, written, pre-committed agreement is the 80% that makes the tooling mean anything.
+
+A few more distinctions a staff engineer will raise, because they separate a thoughtful program from a checklist:
+
+- **Different service shapes need different indicators.** Request-driven services live on availability, latency, and quality. Data pipelines do not; they live on freshness, correctness, and coverage. Storage lives on durability. Reusing request-style SLIs on a batch pipeline measures nothing useful, because "99.9% of requests succeeded" is meaningless when there are no requests, only a job that produced stale or wrong output. If your work spans streaming and batch, the [Kafka versus queues](/blog/kafka-vs-queues) distinction maps onto this directly: the freshness SLI on a stream and the completeness SLI on a batch job are measuring fundamentally different promises.
+- **Tier your SLOs by who is paying.** Premium traffic might warrant 99.99% while the free tier sits at 99.9%, so you are not spending expensive reliability on traffic that does not fund it. Segment the indicator by tier and let the budget reflect the business.
+- **Prefer a rolling window over a calendar reset.** A trailing 28 days matches how users actually remember reliability and avoids the use-it-or-lose-it cliff at month-end, where a team races to spend leftover budget before it resets. A rolling window keeps the incentive honest and keeps a bad incident costing you for exactly as long as a user would still remember it.
+
+## The honest landing
+
+You do not get to make a service infinitely reliable, and you should be relieved, because the version of you that achieved it could never ship another line of code and would have spent a fortune buying reliability sitting invisibly underneath the user's own flaky WiFi. "As reliable as possible" is not an ambitious goal. It is an unpriced one, and unpriced goals are how teams end up frozen and resentful at the same time.
+
+So price it. Pick an indicator that goes red when users hurt and stays green only when they are fine, measured as close to the user as you can afford. Set the target from what users need, rounded down, not from the heroics you happened to pull off last quarter. Define the budget as one minus that target, and then do the part that actually matters: write the policy, get product and ops and the org to sign it before the budget is ever spent, and honor the freeze on the day the freeze is the last thing anyone wants. Alert on burn rate so a catastrophe pages you in minutes and a slow leak opens a ticket for Tuesday. Do that, and the next time someone asks how reliable the service should be, you have a number, a budget, and a signed agreement about what happens when it runs out, instead of a fight. The dashboard stops being a trophy and becomes what it was always supposed to be: an honest gauge of how much failure you have left to spend.
+
+If you are assembling the broader picture, this sits alongside [the system design interview framework](/blog/system-design-interview-framework) as the part where you decide what "good enough" even means before you architect for it, and the operational siblings worth reading next are [deployment strategies](/blog/deployment-strategies) for spending budget safely on releases and [multi-region and disaster recovery](/blog/multi-region-dr) for the failure modes that eat budget in one shot. For a concrete instance of building failure-classification and observability into a real system rather than bolting it on, the [Aladeen](/case-study/aladeen) case study walks through exactly that for an agent CLI.
+
+## FAQ
+
+<FAQ />

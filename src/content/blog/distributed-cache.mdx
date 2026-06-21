@@ -1,0 +1,139 @@
+export const meta = {
+  slug: 'distributed-cache',
+  title: 'Inside a Distributed Cache: Eviction, Sharding, Hot Keys and the Thundering Herd',
+  description:
+    'How real distributed caches work: admission beats eviction, consistent hashing is skewed, one hot key hammers one node, and the thundering herd has three fixes.',
+  headline: 'Inside a Distributed Cache: Eviction, Sharding, Hot Keys and the Thundering Herd',
+  deck: 'A cache is a staleness budget you spend on speed, and every interesting failure is the bill arriving at once.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '13 min',
+  tags: ['caching', 'distributed-systems', 'redis', 'memcached', 'consistent-hashing', 'system-design'],
+  faq: [
+    {
+      q: 'Do Redis and Memcached use true LRU?',
+      a: 'No, and that surprises people. Redis runs approximated LRU: it stores a 24-bit clock timestamp per object and, under memory pressure, samples a handful of random keys (maxmemory-samples, default 5) and evicts the oldest of the sample. Raising the sample to 10 gets very close to true LRU at modest CPU cost. True LRU would need a doubly-linked list mutated on every read, which costs memory and trashes cache lines. Memcached uses a segmented LRU with a background maintainer thread for the same reason: the real scaling wall at high QPS is lock contention on the LRU, not the eviction decision itself.',
+    },
+    {
+      q: 'Why does adding cache servers not help a hot key?',
+      a: 'Consistent hashing maps each key to exactly one node. That is the point: it gives you locality and a stable home for every key. But it means a single viral key, like a celebrity profile or a launch-day product, sends all of its traffic to one node no matter how many nodes you add, because the hash of that one key does not change. The fixes work on the key, not the cluster: split the value across N suffixed keys that hash to different nodes, or put a small in-process L1 cache in front of the shared cache so read capacity for that key scales with your app fleet instead of one cache box.',
+    },
+    {
+      q: 'What is the thundering herd and how do you stop it?',
+      a: 'When a heavily-read key expires, every concurrent request misses at the same instant and they all hit the database to recompute the same value, so the database sees a sudden N-fold spike for one key. There are three real fixes and they compose. Request coalescing (single-flight) lets one caller recompute while the rest wait and share the result, though it is per-process unless you add a distributed lock. Probabilistic early expiration has readers randomly refresh just before expiry while the old value is still valid, so no lock is needed. Leases, Facebook style, hand out one recompute token per key per ten seconds at the cache server and tell everyone else to retry or serve slightly stale data.',
+    },
+    {
+      q: 'Is consistent hashing enough to balance load across cache nodes?',
+      a: 'It balances movement, not load. Consistent hashing guarantees that adding or removing a node only remaps about 1/N of keys instead of nearly all of them, which is what saves you from a stampede on every deploy. But the load itself is provably skewed: with n nodes and n keys the busiest node is expected to hold on the order of log n over log log n keys, not a flat share. Virtual nodes smooth that out and improve the failure profile, but they do not bound it. The actual bound comes from consistent hashing with bounded loads, which caps each node at (1+epsilon) times the average and forwards overflow to the next node. Vimeo shipped exactly that in HAProxy and cut cache bandwidth about 8x.',
+    },
+    {
+      q: 'Should I always chase a higher cache hit ratio?',
+      a: 'No. Hit ratio is a proxy, and past a point chasing it backfires. A bigger working set means more eviction churn and, in managed-heap caches, more garbage-collection pressure, both of which hurt p99 even as the average improves. The honest target is usually backend load reduction at an acceptable tail latency, not raw hit percentage. A cache is also a deliberate staleness budget, so the senior move is to state the budget out loud, for example ten seconds stale on hot keys and invalidate-on-write everywhere else, rather than pretending the layer is consistent.',
+    },
+  ],
+}
+
+A cache is the easiest thing to add and the easiest thing to get wrong. You put a fast box in front of a slow one, point reads at it, and watch p99 fall off a cliff in the good direction. The demo is glorious. Then traffic gets real, and the cache starts throwing failures that have nothing to do with being slow and everything to do with the assumptions you smuggled in when you weren't looking.
+
+This is a tour of four of them: that you know what to evict, that hashing keys to nodes spreads load evenly, that every key is roughly equal, and that an expiring key is a quiet event. Each is false in a way that only shows up at scale, and each has a real answer the people who built memcache, Caffeine, and Redis already worked out. The move is the same one in [the system design interview framework](/blog/system-design-interview-framework): name the constraint, then earn the design against it. The frame underneath all four: a cache is a staleness budget you spend on speed, and every interesting failure is that bill coming due at once.
+
+## Eviction is the wrong question
+
+Say "LRU evicts the least recently used item, LFU the least frequent" and you've described two policies that are both wrong, for opposite reasons, and skipped the idea that actually moved the field. LRU treats recency as a proxy for "will be used again soon," which holds right up until a scan walks through it: one sequential pass over a million cold rows you'll never read again evicts your entire hot working set, because every cold row is, briefly, the most recently used thing in the cache. LRU got fooled by a burst that carried no signal. LFU has the opposite disease: it never forgets, so an item that was hot last year outranks one that's hot right now, and it needs an unbounded per-key counter plus an O(log n) heap to find the minimum. Neither tracks the thing you actually want, which is probability of future reuse.
+
+Here is the reframe that separates senior from junior, straight out of the [TinyLFU paper](https://arxiv.org/abs/1512.00727) (Einziger, Friedman, Manes). The interesting decision in a modern cache is what to admit, not what to evict. TinyLFU sits in front of the eviction policy as an admission filter: when a new item wants in and the cache is full, it compares the newcomer's estimated frequency against the eviction candidate's and only admits it if it looks more valuable than what it would displace. The paper's finding is blunt: once you have good admission, "LFU cache eviction yields only a marginal benefit." The policy underneath barely matters.
+
+The production embodiment is W-TinyLFU, the policy inside Caffeine, and its proportions are load-bearing. A **Window (eden)** holds **1%** of capacity as a plain LRU, where new keys land first so a recency burst can prove itself before the frequency filter judges it. The **Main** region holds the other **99%** as a Segmented LRU: **80% protected** (proven items), **20% probationary** (admitted but unproven). The flow: a key enters the Window; when the Window evicts, its victim *challenges* the Main region's eviction candidate, the count-min sketch decides the duel by estimated frequency, and the survivor enters probation. A second hit promotes it to protected; protected overflow demotes back to probation. The split is not fixed: Caffeine runs hill-climbing on the observed hit rate to retune the window-versus-main ratio at runtime, so the same cache self-tunes between recency-skewed and frequency-skewed workloads with no config change.
+
+The magic trick is the frequency counter. You keep no per-key counter (the memory blowup that sinks classic LFU); you keep a **4-bit Count-Min Sketch at roughly 8 bytes per entry**, about 8 MB for our million-entry cache, with counters saturating at 15. Aging happens by halving: a global counter ticks on every access, and when it hits the sample size, *every counter in the sketch is divided by two at once*, which buys bounded memory, forgetting, and continued ability to tell hot from merely warm. A Doorkeeper Bloom filter in front gives keys touched exactly once a 1-bit footprint, which on Zipfian web traffic is most of them.
+
+Across the DS1, search, and SPC1-like traces the paper reports "TLRU and W-TinyLFU outperform all other policies" throughout the cache-size range, beating ARC and LIRS, and Caffeine's benchmarks put it within about 1% of Belady's optimal. The landing: a cheap frequency filter in front of any eviction policy captures most of the benefit, stays O(1), needs no non-resident ghost entries, and costs a tiny fixed footprint.
+
+## What production actually runs (and why it's an approximation)
+
+Now the part that catches people who only read the papers: Redis does not run true LRU, Memcached does not run textbook anything, and in both cases the approximation is a feature.
+
+Redis stores a **24-bit LRU clock per object** and, under memory pressure, **samples `maxmemory-samples` random keys** (default **5**) and evicts the oldest in the sample rather than maintaining a global order. Bump it to **10** and the docs call it "very close to true LRU," a clean CPU-versus-accuracy dial. Why approximate at all? Because true LRU needs a doubly-linked list whose pointers get mutated on every read, which burns memory and scatters writes across cache lines on a hot path.
+
+Redis LFU (4.0+) reuses the same 24 bits: an **8-bit logarithmic Morris-style counter** plus an 8-bit "last decrement time." The `lfu-log-factor` knob makes a clean worked example, straight from the Redis docs:
+
+| log-factor | after 100 hits | 1K | 100K | 1M |
+| --- | --- | --- | --- | --- |
+| 0 | 104 | 255 | 255 | 255 |
+| 1 | 18 | 49 | 255 | 255 |
+| **10** | **10** | **18** | **142** | **255** |
+| 100 | 8 | 11 | 49 | 143 |
+
+Read the factor-10 row: it takes on the order of a million accesses to saturate an 8-bit counter, so one byte discriminates popularity across several orders of magnitude. The companion knob `lfu-decay-time` (default one minute) decays the counter when sampled so "hot last week" loses to "hot now."
+
+A staff-level point hides in the policy menu. Redis `maxmemory-policy` is a two-dimensional choice, eviction *scope* crossed with eviction *rule*: `noeviction`, `allkeys-{lru,lfu,random}`, or `volatile-{lru,lfu,random,ttl}`. The `volatile-*` family only evicts keys that carry a TTL, a genuine footgun: if your hot data has no TTL and you choose `volatile-lru`, writes start failing with out-of-memory errors even though the instance looks full of evictable data. It's full of keys it promised never to evict.
+
+Memcached solves a different problem first: fragmentation. Its **slab allocator** carves memory into **1 MB pages**, assigns each to a **slab class** of fixed chunk size growing by a **default factor of 1.25** (80 B, 104 B, 136 B, up), and drops each item into the smallest chunk that fits, wasting the slack (a 90-byte value burns about 13% in the 104-byte class). That buys zero external fragmentation and O(1) alloc/free, at the cost of **slab calcification**: a page is never reassigned, so when your value-size distribution shifts, pages strand in the wrong class and you evict live data while memory sits half-empty one class over. Eviction itself is a **segmented LRU** (since 1.5) with four queues, **HOT** (new), **WARM** (hit twice, "active"), **COLD** (the eviction frontier), and **TEMP** (short-TTL, never bumped), shuffled by a **background maintainer thread** so, in the maintainers' words, "LRU locks are no longer used on most item reads." The headline win there isn't a smarter eviction order; it's that the hot read path stops taking an LRU lock, because the real scaling wall at high QPS is lock contention. Caffeine reaches the same conclusion with striped ring buffers that replay accesses asynchronously. The eviction *algorithm* and its *concurrency implementation* are two separate problems, and at scale the second bites harder.
+
+## Sharding: consistent hashing balances movement, not load
+
+You have more data than one node holds, so you shard. The naive map is `hash(key) mod N`, and it works until N changes. Go from 10 nodes to 11 and you remap roughly **91%** of keys, because the only ones that stay put are where `hash % 10` equals `hash % 11`. Mass remap means mass cache miss means every one of those reads stampedes the database at once: you added a node to handle load and triggered an outage doing it.
+
+Consistent hashing fixes the blast radius. Map both keys and nodes onto a ring; a key belongs to the first node clockwise from it. Add a node and you remap only the arc between the newcomer and its successor, about **1/N** of keys, roughly **9%** for 10 to 11 nodes. Hold those two numbers side by side, 91% versus 9%, because that gap is the entire reason consistent hashing exists. The ring construction and lookup are their own topic in [consistent hashing](/blog/consistent-hashing); what matters here is what it does and does not buy you.
+
+What it does not buy is balanced load, and this is the misconception that separates depth from name-dropping. A naive ring places each node at one position, giving lumpy load and an ugly failure profile: a dead node dumps its *entire* range onto one neighbor, which then falls over. **Virtual nodes** fix both by placing each physical server at many ring positions, so load smooths and a failure spreads across many survivors, at the cost of more ring metadata. But even with vnodes, plain consistent hashing is *provably* skewed: with n nodes and n keys, the busiest node is expected to hold on the order of **log n / log log n** keys, not a flat 1/n share. Vnodes cut the variance; they don't bound the worst case.
+
+The bound is a separate result, and the one a staff engineer reaches for: **consistent hashing with bounded loads** (Mirrokni, Thorup, Zadimoghaddam, Google, 2016). Cap each node at **(1 + epsilon) times the average**, and forward any key that would overflow a capped node to the next one. That guarantees a max load factor while moving only an expected constant number of keys per membership change. Not academic: Andrew Rodland shipped it in **HAProxy** at Vimeo and cut cache **bandwidth by roughly 8x**. When someone says "consistent hashing is skewed," this is the correct next sentence.
+
+One alternative is worth knowing precisely so you know when *not* to use it. **Jump consistent hash** (Lamping and Veach, Google, 2014) is about five lines, uses **O(1) memory and O(ln n) time**, and needs no vnodes. The catch is the tell: it requires buckets numbered **0 to N-1 sequentially**, so it cannot handle arbitrary node identities or removal of a node in the middle, which is why the authors call it "more suitable for data storage than distributed web caching." Reach for jump hash on a shard-count-stable store; reach for a ring with vnodes (or rendezvous/HRW hashing) when nodes come and go by identity, which is exactly what a churning cache cluster does. When you size the cluster these decisions run against, [capacity estimation](/blog/capacity-estimation) tells you how many shards you're actually defending.
+
+## The hot key: one viral object, one very unhappy node
+
+Consistent hashing guarantees one key maps to one node, which is a feature for locality and a liability the moment one key gets popular out of proportion to the rest. A single viral object, `product:iphone-launch` on launch morning, a celebrity profile, the tweet everyone is quote-tweeting, sends *all* its traffic to *one* node, and adding nodes does nothing because the hash of that key doesn't move. You can have a hundred-node cluster melting one node while ninety-nine idle.
+
+The fixes escalate, and the order matters:
+
+1. **Key splitting / replication.** Write the value under N suffixed keys, `k:hot#1` through `k:hot#N`, which hash to different nodes, and have readers pick a replica at random. Read load spreads N-ways immediately. The cost is **N times the write fan-out and N times the invalidation surface**: every update touches all N replicas, and for a moment they can disagree.
+2. **An in-process L1 cache.** Put a tiny bounded LRU *inside the application process*, in front of the shared cache (your L2). Reads to a hot key never leave the box. This is the fix with the most reach, because read capacity for that key now scales with your **application fleet**, not one cache node. Add app servers and you add hot-key read capacity for free. The cost is a **second consistency tier**: each app server's local TTL can serve slightly stale data, so invalidation now needs pub/sub or short TTLs to stay sane.
+3. **Replicate at the cache tier.** Facebook's regional pools keep popular keys replicated so no single server is the bottleneck, while less-popular keys stay single-copy to save RAM. That's an explicit **memory-versus-throughput dial** you turn per key class.
+
+And the part juniors skip: **detection**. You cannot fix a hot key you cannot see. Real systems sample the request stream (Redis ships a `--hotkeys` mode; proxies run count-min sketches) to *identify* hot keys before deciding which to split or pin in L1. The full answer to "how do you handle hot keys" starts with "first I find them."
+
+## The thundering herd has three real fixes, and they compose
+
+Here is the quiet event that isn't quiet. A heavily-read key expires, every concurrent request for it misses in the same instant, and they all hit the database to recompute the *same value*. The database, which was serving zero reads for that key because the cache absorbed them, takes an N-fold spike. This is the cache stampede, the thundering herd, dog-piling; one animal, three names. Picture a viral key at 1,000,000 requests per second when it expires: without protection that's about a million database hits crammed into the miss window. Three legitimate fixes, and a senior answer names all three and knows they stack.
+
+**Request coalescing (single-flight).** Allow exactly one caller to recompute a given key; every other concurrent caller waits and shares the one result. Go's `golang.org/x/sync/singleflight` is the reference: one in-flight call per key, everyone else deduped onto it. The nuance that earns it: single-flight is **per-process**, so across a 1,000-server fleet you can still get up to 1,000 concurrent recomputes, one per box, unless you escalate to a **distributed lock** (Redis `SET NX PX`). The moment you do, you've signed up for a lock's failure modes: the holder can die mid-recompute and stall everyone, so now you need a timeout and a fencing token. You traded a stampede for a lock, and locks have their own weather.
+
+**Probabilistic early expiration (XFetch).** The elegant one, from Vattani, Chierichetti, and Lowenstein at VLDB 2015, needs no lock. Instead of everyone expiring at the same instant, each reader, as expiry nears, *randomly volunteers to recompute early* with a probability that rises toward the deadline. The recompute happens while the old value is *still cache-valid*, so it's invisible to users and only one unlucky reader pays. The trigger stores the measured recompute cost, call it delta, alongside the value and fires when:
+
+```
+now - delta * beta * ln(rand()) >= expiry
+```
+
+with beta around 1 (raise it to refresh more eagerly). Two details make this paper, not a blog summary. The proven result: *uniform* early-expiration is suboptimal and the **exponential** distribution is provably optimal. And weighting by delta means **expensive-to-compute keys volunteer earlier**: a value that costs 8 seconds to rebuild starts refreshing sooner than one that costs 2, so long recomputations never pile up at the deadline. The cache prioritizes its own most expensive work with no coordination.
+
+**Leases (Facebook, NSDI 2013).** The third fix is a unification, and naming both its jobs is the tell that you read the paper. On a miss, memcache hands the client a **64-bit lease token bound to the key**, doing double duty. First, **stale-set prevention**: a slow reader holding an old value tries to `set` it just after a writer deleted the key, but that concurrent delete **invalidated the token**, so the stale `set` is rejected and fresh data survives. Second, **herd control**: memcache issues a token only **once per ~10 seconds per key**, and every other concurrent misser is told to **retry shortly** (by which point the first client has populated the value) or, if the app allows, to serve **stale data up to 10 seconds old**.
+
+That second job is request-coalescing implemented *at the cache server* rather than in your application, which is why it scales across the fleet for free where single-flight doesn't. Back to the viral key at a million requests per second: the 10-second one-token rule turns a million database hits into roughly one recompute every 10 seconds while everyone else retries or serves stale. The herd hits a wall.
+
+These are not competitors. A serious endpoint coalesces *and* expires probabilistically *and* leans on leases, surrounded by defensive companions: **TTL jitter** so you never expire 10,000 keys in the same second, **serve-stale-while-revalidate**, and **negative caching** for the sibling problem. Keep the three failures distinct, because they have different fixes: **stampede** (one hot key expires; coalescing/leases), **penetration** (requests for nonexistent keys sail past the cache to the database; cache the "not found" or front it with a Bloom filter), and **avalanche** (many keys expire at once or a node dies; TTL jitter and failover pools). The discipline of watching the tail behind all this is [latency and the tail](/blog/latency-throughput-tail), and the same coalescing instinct shows up wherever a single resource gets hammered, including the [rate limiter](/blog/rate-limiter) and the read-heavy [URL shortener](/blog/url-shortener), both of which lean hard on caching.
+
+## Writes, and the consistency you quietly give up
+
+The read path gets the attention, but the write path decides what "wrong" your cache is allowed to be. Three policies, three different things you trade:
+
+| Policy | Mechanics | What you trade | When a senior picks it |
+| --- | --- | --- | --- |
+| **Write-through** | Write cache and store synchronously; ACK only after both land | Slowest writes | Read-after-write must hold and write latency is acceptable |
+| **Write-back** | Write cache, ACK immediately, flush to the store async (batched, coalesced) | You can lose acknowledged data if the node dies before flush; direct DB reads lag stale | Write-heavy, loss-tolerant or separately-durable paths (counters, sessions) |
+| **Write-around** | Write straight to the store, bypass the cache; cache fills on next read | Cache stays stale until the next read or TTL; first read after write always misses | Write-once, read-rarely data that would just pollute the cache |
+
+The cross-cutting point sits under the table. A distributed cache is, almost always, an **eventually-consistent** layer in front of your store. The dominant pattern, Facebook's default, is **look-aside**: read cache, fall through to the database, populate; on write, update the database and **invalidate** (delete) the cache entry. That invalidation race is precisely why leases exist. And a rule sits inside the rule: **invalidate-on-write beats update-on-write** under concurrency, because two racing updates can land in the cache in the wrong order while the database has them right, leaving the cache confidently serving the value that lost. Deleting the key sidesteps the ordering problem entirely, because the next read re-fetches the truth; it's easier to invalidate than to update. Caching does not hand you linearizability, and pretending otherwise is how subtle bugs ship. This is the same [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) tradeoff in different clothes: even with no partition, you trade consistency for latency on purpose.
+
+I've made these calls in production. In [NomadCrew](/case-study/nomadcrew) the live-location reads run through a cache with an explicit short staleness budget, because a location three seconds old is fine and a slow map is not. In [IntelliFill](/case-study/intellifill) the expensive work was recomputed document extractions, the textbook case for probabilistic early refresh, and the same read-path discipline runs through [Aladeen](/case-study/aladeen), [Mecanum](/case-study/mecanum), and [Audex](/case-study/audex). Invalidate-on-write rather than update-in-place is the same instinct that makes [event-driven RBAC](/blog/event-driven-rbac) and [idempotent webhooks](/blog/idempotent-webhooks) safe under concurrency: when ordering is hard, prefer the operation that converges regardless of order.
+
+## The honest landing
+
+A cache is not a free speedup with a hit-ratio gauge. It is a staleness budget you spend deliberately, and the four hard problems are all the budget coming due. Eviction is really "what gets admitted," because a cheap frequency filter in front of any policy captures most of the win. Sharding via consistent hashing balances *movement*, not *load*, and the real bound is bounded-load or rendezvous hashing. A hot key is a topology problem, fixed by moving capacity into the app fleet with an L1 cache. And an expiring key looks quiet until it stampedes, which is why coalescing, probabilistic refresh, and leases exist and compose.
+
+Under all four is one habit that marks the senior engineer: state the staleness budget out loud. "Ten seconds stale on hot keys, invalidate-on-write everywhere else, negative-cache the misses, jitter the TTLs." A cache designed to a stated budget is a tool; a cache quietly hoping to be consistent is an incident with a countdown on it. And the metric you actually defend is not raw hit percentage; past a point, chasing it just trades p99 for a prettier average. The number that matters is backend load removed at an acceptable tail.
+
+## FAQ
+
+<FAQ />

@@ -1,0 +1,151 @@
+export const meta = {
+  slug: 'llm-quantization',
+  title: 'How LLM Quantization Works: FP16 to INT4, GPTQ, AWQ, and the Accuracy Trade',
+  description:
+    'Why 4-bit models barely lose accuracy until they hit a cliff. The outlier problem, how GPTQ, AWQ, and GGUF k-quants answer it, and how a senior picks a quant.',
+  headline: 'How LLM Quantization Works: FP16 to INT4, GPTQ, AWQ, and the Accuracy Trade',
+  deck: 'Naive rounding destroys a large model because of one percent of its numbers, and the whole field is three different ways to protect them.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '19 min',
+  tags: ['llm', 'quantization', 'gptq', 'awq', 'gguf', 'inference', 'machine-learning'],
+  faq: [
+    {
+      q: 'Does INT4 quantization cut a model accuracy by four times?',
+      a: 'No. Memory shrinks roughly linearly with bit width, but accuracy does not track it. The curve is a long plateau and then a cliff: a well-quantized model holds quality from FP16 down to about 4-bit, then degrades sharply below roughly 3-bit. A 4-bit model typically loses very little on average-case English while using a quarter of the memory. The mistake is assuming the two scale together, which would make 4-bit unusable when in practice it is the default.',
+    },
+    {
+      q: 'What is the difference between GPTQ and AWQ?',
+      a: 'They are opposite philosophies aimed at the same problem. GPTQ fixes rounding error after the fact: it quantizes weights one at a time and uses second-order (Hessian) curvature to nudge the remaining weights so the layer output stays close to the original. AWQ prevents the error before rounding: it finds the roughly one percent of weights tied to large activation channels and scales them onto finer-resolution buckets using an invertible transform, so the math is unchanged. GPTQ needs the Hessian and a calibration set it can overfit. AWQ needs no backpropagation, so it generalizes across domains more safely.',
+    },
+    {
+      q: 'Why is weight-only INT4 faster if the math still runs in FP16?',
+      a: 'Because token generation is bound by memory bandwidth, not arithmetic. Producing each token streams the entire weight set from VRAM through the compute units, so the bytes moved per token is the latency budget. Storing weights at 4-bit instead of 16-bit roughly quarters the bytes moved, even though they are dequantized to FP16 right before the multiply. The speedup comes from moving fewer bytes, not from faster math. Only weight-and-activation schemes like SmoothQuant actually run the multiply in low precision.',
+    },
+    {
+      q: 'What does Q4_K_M mean in a GGUF filename?',
+      a: 'It encodes three things. Q4 is the nominal bit width, about 4 bits per weight on average. K means the k-quants family, which groups weights into 256-weight super-blocks whose per-block scales are themselves quantized, a second level of compression. M is a medium mix, meaning the more sensitive tensors (such as the attention value projection and certain feed-forward and output layers) are kept at higher precision than the rest. The true cost lands near 4.5 bits per weight once the quantized scales and the higher-precision tensors are counted, so the nominal bit count is not the file size.',
+    },
+    {
+      q: 'Is perplexity a reliable way to tell if a quant is lossless?',
+      a: 'No, it is the forgiving metric. Held-out perplexity often barely moves under 4-bit quantization while downstream behavior degrades earlier: multi-step reasoning, code generation, and rare-token or non-English output regress before a single perplexity number reflects it. The honest framing is that quantization is nearly free on average-case English and measurably not free on the hard tail. Benchmark the actual task you care about, not the metric that is easiest to keep flat.',
+    },
+  ],
+}
+
+A 70-billion-parameter model in full precision does not fit on the GPU you can rent. That single fact is why quantization exists, and most explanations skip past it straight to bits.
+
+So start with the arithmetic, because it is the whole motivation. A parameter in FP16 takes two bytes, so the weights weigh roughly twice the parameter count. Seventy billion parameters is 140 GB, and the largest single accelerators top out at 80 GB of VRAM, so a 70B model in FP16 needs two cards wired together before you have run a single token. Quantize those weights to 4-bit and you land near 35 GB, half a byte per parameter plus a little for the scales, which fits on one 48 GB card and runs on a 24 GB consumer GPU with offload. Quantization is not a tweak you reach for at the end. It is the gate that decides which GPU the model loads on at all, and whether it loads on anything you can afford.
+
+| Model | FP16 (2 B/param) | INT8 (~1 B/param) | INT4 (~0.5 B/param) |
+| --- | --- | --- | --- |
+| 7B | 14 GB | 7 GB | ~3.5 GB (runs on a laptop) |
+| 70B | 140 GB (needs 2x 80 GB) | 70 GB (one 80 GB card) | ~35 GB (one 48 GB card) |
+| 405B | 810 GB | ~405 GB | ~203 GB |
+
+That table justifies the entire field. Everything below is about paying the smallest accuracy cost to move down those columns, and the surprise that makes quantization interesting rather than mechanical is that the cost is not what you would guess. Cutting the bits in half does not cut the accuracy in half. It barely moves accuracy at all, until it falls off a cliff. Understanding why means understanding what a low-bit number actually is, and what one percent of the model does to everything around it.
+
+## Why fewer bytes per weight means a faster token
+
+There is a misconception to clear before the formats, because it shapes every decision that follows: people assume lower bits means faster math. For the common case, weight-only quantization, that is wrong. The multiply still runs in FP16. The weights are dequantized back to floating point immediately before the matrix multiply, and the arithmetic happens at full precision.
+
+So where does the speed come from? From bandwidth. The load-bearing fact most tutorials miss: generating a token from an LLM is bound by memory bandwidth, not compute. Every token streams the entire weight set from VRAM through the compute units and back; the GPU spends most of its time waiting on bytes, not doing FLOPs. So the bytes moved per token is the real latency budget, and halving the bytes per weight roughly halves the bytes moved per token. Throughput scales with the compression ratio, even though the math never got faster.
+
+GPTQ reports end-to-end inference speedups over FP16 of about 3.25 times on an A100 and 4.5 times on an A6000, with weights stored at 3 to 4 bits and the matmul still in FP16. The win is entirely in moving fewer bytes. If you have read [how LLMs work](/blog/how-llms-work), this is the decode loop made expensive: every generated token re-reads all the parameters, so anything that shrinks the parameters shrinks the per-token cost, which is why [LLM inference serving](/blog/llm-inference-serving) at fleet scale is bound by bandwidth and not compute. Note the two problems this separates: whether the model loads at all (pure memory) and how fast each token comes out (bandwidth). Weight-only INT4 wins both, and never touches the third axis, raw compute throughput, which is exactly the seam where weight-and-activation methods live.
+
+## What a low-bit number can and cannot represent
+
+To see why naive rounding fails, you need the right mental model for the formats, and it comes down to one split: range versus precision.
+
+A float splits its bits between an exponent (range) and a mantissa (precision). FP16 spends its 2 bytes with a narrow 5-bit exponent, which is why it overflows and underflows so easily. BF16 spends the same 2 bytes but gives 8 bits to the exponent and only 7 to the mantissa, keeping FP32's full dynamic range while throwing away precision. That is why training favors BF16: gradients span an enormous range of magnitudes, and a number you cannot represent at all is worse than one you represent a little coarsely.
+
+Here is the model that makes the rest click: floating point is dynamic range, integer is a uniform grid. A float's exponent lets one format represent both 0.0001 and 50000 by sliding a decimal point. INT4 has no exponent. It is sixteen evenly spaced levels, equal gaps from bottom to top. Quantizing weights to INT4 means forcing a bell-curve distribution onto sixteen fixed buckets. For the dense middle of the bell that is fine. For the tails it is catastrophic, because the rare large values either get clipped or drag the whole grid wider to reach them. That tension between a smooth distribution and a rigid grid is the entire problem, and every method here is a way to relieve it.
+
+One family attacks the grid itself. NF4, the NormalFloat-4 format from QLoRA, places its sixteen levels at the quantiles of a normal distribution instead of spacing them evenly, so the buckets are dense exactly where the weights are dense; it beats uniform FP4 on precision, and fine-tuning a 4-bit NF4 model can match 16-bit full fine-tuning. The lesson outlives the format: if your numbers are not uniformly distributed, a uniform grid wastes most of its levels on values that almost never occur.
+
+## The one percent that poisons everything
+
+Here is the conceptual heart of all of it, and the single idea that separates someone who has read about quantization from someone who understands it.
+
+Not all the numbers behave. In a large transformer, a tiny fraction of the activation features carry extreme magnitudes, and they break naive quantization in a way that has nothing to do with averages. The LLM.int8() work measured this precisely. Around the 6.7-billion-parameter scale, a phase shift kicks in: below it, large-magnitude features are scattered and benign; at and above it, they become coordinated, systematic, across essentially all layers and roughly 75% of sequence positions.
+
+The magnitudes are absurd. The paper shows ordinary feature values around minus 0.10, minus 0.23, 0.08, with an outlier dimension right next to them reading minus 67.0, up to about 20 times larger than typical activations. And they are rare: at 6.7B, roughly 150,000 outlier values per sequence, but confined to only 6 feature dimensions out of thousands. About 0.1% of the features.
+
+Now watch what those few dimensions do to rounding. Zeroing out that 0.1% drops top-1 attention softmax mass by more than 20% and degrades perplexity by 600 to 1000%; they carry a large share of what the model is doing. And here is the mechanism that makes them lethal, the sentence to remember out of this whole article: a single huge value forces the quantization scale to stretch to cover it, which crushes the resolution left for every other value that shares that scale. One outlier of 67 in a block with a dozen weights near 0.1 forces the scale to span 67, so the small weights all collapse onto the same one or two buckets and become indistinguishable. The outliers do not merely lose their own precision. They poison the precision of everything they are quantized alongside.
+
+A refinement a careful engineer keeps in mind: this emergence tracks perplexity, not raw parameter count. The original work is explicit that the phenomenon is gradual and correlates with how well-trained the model is, not simply how big. A strong smaller model can show it; a weak larger one might not. So "more parameters means more outliers" is the wrong rule. "Better models concentrate more behavior into these features" is closer.
+
+This reframes the whole field. Quantization is not "round the weights to 4 bits and accept the loss." Round-to-nearest is the trivial baseline everyone beats, and the reason it needs beating is this 0.1%.
+
+## Three answers to one problem
+
+Isolate it. Compensate for it. Protect against it. The three methods that matter are three different answers to the outlier problem, and seeing them as three responses to one threat is the difference between memorizing acronyms and understanding the space.
+
+### Isolate the outliers: LLM.int8()
+
+The most direct answer: if 0.1% of the dimensions are the problem, pull them out and handle them separately. LLM.int8() does this in two parts. First, vector-wise quantization, a separate scale per row-column inner product instead of one scale per tensor, so a wild value in one row cannot wreck the resolution of another. Second, the real trick, mixed-precision decomposition: detect the handful of outlier dimensions, run those in a 16-bit matmul, run the other 99.9% in INT8, and recombine. The outliers keep full precision in their own lane; everything else gets the memory savings of 8-bit.
+
+The result was striking for its time: load a 175B checkpoint trained in 16 or 32-bit, run it in INT8 with no measurable degradation, and halve the inference memory. The tradeoff a senior names out loud: the 16-bit side-path and per-vector scaling add overhead, so historically LLM.int8() saved memory more than it saved time. It was the thing that let a model fit, not a latency win, worth knowing before you reach for it.
+
+### Compensate for the error: GPTQ
+
+The second answer is subtler: do not isolate the outliers, let the rounding happen, then repair the damage. GPTQ descends from Optimal Brain Quantization, and the core idea is patient: quantize the weights in a layer one at a time, and after rounding each one, adjust all the remaining unquantized weights to absorb the error you just introduced. You are not minimizing the error on any single weight. You are minimizing the error on the layer's output, which is what actually matters.
+
+The compass for which adjustments matter most is second-order information, the Hessian, which encodes the curvature of the loss with respect to the weights, meaning which errors hurt the output and which are harmless. Quantize a weight to its nearest grid point and you introduce a small error; naive rounding leaves it there, but GPTQ nudges the neighboring weights, weighted by the Hessian, so the layer's output moves back toward where it was. Round-to-nearest leaves every error uncorrelated and additive; GPTQ makes them cancel.
+
+The reason GPTQ matters is that the original Optimal Brain approach was far too slow for a 175B model, and GPTQ made it tractable with three engineering moves: a fixed column order so the inverse Hessian is shared across all rows and computed once; a Cholesky decomposition with damping, because directly inverting the Hessian is numerically unstable; and lazy batched updates that keep the work bandwidth-bound on the GPU instead of stalling on compute. The payoff: quantize 175B in about 4 GPU-hours to 3 or 4 bits with negligible degradation, and even reach 2-bit with usable accuracy. An optional knob, act-order, quantizes the highest-importance columns first for harder models, trading kernel speed for accuracy.
+
+### Protect the salient weights: AWQ
+
+The third answer is the most counterintuitive, and it hinges on one non-obvious observation. AWQ starts from the same premise, that weights are not equally important and protecting about 1% of them sharply reduces error, but it locates that 1% in a way nobody expects. The salient weights are not the largest weights. They are the weights multiplied by the largest-magnitude activation channels. Saliency is read from the activation distribution, not weight magnitude. This is the single most-missed point about AWQ, and missing it means missing what the method does.
+
+Once you know which channels are salient, the move is elegant: AWQ applies a per-channel scaling that is mathematically invertible. Scale the salient channel's weights up before quantizing so they land on finer-resolution buckets, then fold the inverse scale into the adjacent operation so the computation is unchanged. The algebra is the whole point. Take a salient channel of weights `[0.02, 0.03]` riding on large activations, scale them by 8 to `[0.16, 0.24]` so they occupy different buckets instead of rounding to the same one, and divide the matching activation by 8. The product is identical, because `(8 * W) * (x / 8) = W * x`, but the error on those weights drops by roughly 8 times. You bought precision where it matters and paid nothing in the math.
+
+The practical selling point versus GPTQ is what AWQ does not do. It uses no backpropagation and no reconstruction against a calibration set, so it cannot overfit that set and it generalizes across domains and modalities. The reference TinyChat runtime reports more than 3 times over HuggingFace FP16 on desktop and mobile GPUs. GPTQ repairs errors after the fact using the Hessian and risks overfitting whatever you calibrated on; AWQ prevents the errors up front with a transform that changes nothing about the function. Two different bets, and the calibration-overfitting question is the one a staff engineer asks first when choosing.
+
+## Weight-only versus weight-and-activation
+
+There is a fork underneath all of this that decides which speedups you even get: the difference between a bandwidth win and a compute win.
+
+GPTQ, AWQ, NF4, and the GGUF k-quants are all weight-only, often written W4A16: the weights live in 4-bit, get dequantized to FP16, and the matmul runs in FP16. Activations stay full precision, which is why accuracy is comparatively easy to hold, and the payoff is memory plus bandwidth. This dominates LLM inference today.
+
+SmoothQuant and LLM.int8() are weight-and-activation, W8A8: both operands are quantized, so the matrix multiply itself runs in INT8 on tensor cores. That buys compute throughput, the one thing weight-only cannot give you. The catch is that activations are the hard thing to quantize, because they are where the outliers live. SmoothQuant's fix is to migrate the difficulty: activation outliers are hard but weights are easy, so it applies an equivalent per-channel transform that scales the outlier mass out of the activations and into the weights, smoothing the activations into a shape INT8 can handle. It reports up to 1.56 times speedup and 2 times memory reduction at negligible accuracy loss. Notice it is the same invertible-transform idea as AWQ, pointed at the activation side of the same outlier problem. The field keeps rediscovering that trick because it is the one move that costs nothing mathematically.
+
+Hardware also dictates the format. Consumer GPUs still lack fast INT4 matmul, so there is often no fast 4-bit multiply to run even if you wanted true 4-bit math; you store at 4-bit for the bandwidth and compute at 16-bit because that is what the silicon does quickly. Format choice is downstream of the chip you run on, the same way [latency and the tail](/blog/latency-throughput-tail) is downstream of what your slowest component does under load.
+
+## GGUF and the local-inference quant zoo
+
+Everything so far has been datacenter framing. The other half of the world runs models locally, on a laptop CPU or an Apple GPU, and that world is built on GGUF and llama.cpp, with its own family of quantization schemes.
+
+GGUF, the GGML Universal File, is a single self-contained binary: a header, a flexible key-value metadata store holding the architecture, hyperparameters, and tokenizer, and then the tensor data. The design choice that matters is that it is memory-mappable. The operating system pages weights in from disk on demand rather than loading the whole file into RAM up front, which lets you run a model larger than your RAM and cold-start quickly. Same instinct as choosing mmap over an eager load anywhere: lazy demand paging wins when the working set is smaller than the whole.
+
+The naming looks cryptic until you decode it, and the decode is how you pick a file. In `Llama-3-70B-Q4_K_M.gguf`, the Q4 is the nominal bits per weight, about 4; the `_K` means the k-quants family, hierarchical and better than the legacy `Q4_0` and `Q4_1`; the `_M` is the mix, small, medium, or large. The k-quants design (authored by Iwan Kawrakow, not the project's lead maintainer, a credit worth getting right) uses super-blocks of 256 weights, and the clever part is that the per-block scales are themselves quantized, often to 6 bits. That is a second level of quantization compressing the metadata the first level produced, the same double-quantization idea QLoRA uses on its constants. It is why the real cost of `Q4_K` is about 4.5 bits per weight, not 4.0: the extra half-bit is the scale overhead. Anyone who tells you `Q4_K_M` is exactly 4 bits is reading the label, not the file.
+
+The `_M` mix is the most interesting part, because it is the same "protect what matters" principle from AWQ and LLM.int8(), applied per tensor. A medium mix deliberately keeps the more sensitive tensors, the attention value projection, certain feed-forward layers, the output and embedding layers, at higher precision than the rest. It is heuristic rather than activation-derived, a hand-tuned list of which tensors hurt most when crushed rather than a measured saliency, but the instinct is identical: spend the precision budget where the damage would be worst. The same 70B is about 70 GB at near-lossless `Q8_0`, near 40 GB at the default `Q4_K_M`, and about 26 GB at visibly degraded `Q2_K`.
+
+## The trade, and how a senior actually decides
+
+The entire field is a three-way Pareto surface: accuracy against size against speed, and you do not get all three.
+
+The shape of the accuracy axis is the thing to internalize, and the most common misconception worth killing. People assume accuracy falls linearly with bits, that 4-bit means a quarter of the quality. It does not. The curve is a plateau and then a cliff. Quality stays nearly flat from FP16 down to about 4-bit, then falls off sharply below roughly 3-bit. Q4 sits right at the knee, which is why it is everyone's default: the last point before the drop. Going from 4-bit to 8-bit buys very little accuracy for double the memory; going from 4-bit to 2-bit saves memory and falls off the cliff.
+
+The second thing a senior refuses to be fooled by: perplexity is the forgiving metric. A 4-bit quant can leave held-out perplexity nearly unchanged while downstream task accuracy, code generation, and rare-token or non-English behavior degrade noticeably. "Perplexity barely moved, so it is lossless" is a trap. Quantization is nearly free on average-case English and measurably not free on the hard tail, and the only way to know is to benchmark the task you care about, not the number that is easiest to keep flat. The average looks fine and the tail is where the regressions hide, which is the same fault line the determinism work in the [Audex](/case-study/audex) case study lives on, where a barely-measurable average shift is still a correctness problem on the cases that matter.
+
+So here is how the decision actually gets made, as a picker rather than a principle:
+
+| Situation | Reach for | Why |
+| --- | --- | --- |
+| Fits with room to spare | `Q5_K_M` / `Q6_K`, or FP16 if it fits | No reason to pay accuracy you do not have to |
+| Tight fit, want quality | `Q4_K_M` (the sweet spot) | The knee of the curve, last point before the cliff |
+| Desperate for fit | `Q3_K_M`, and accept degradation | Real quality loss, but the model loads and runs |
+| Below Q2 | Only when experimenting | Past the cliff; behavior is unreliable |
+| GPU serving, want throughput | GPTQ or AWQ 4-bit | GPU kernels, bandwidth win; AWQ if calibration-overfit worries you |
+| W8A8 compute headroom on the right silicon | SmoothQuant | The one path that speeds the matmul itself |
+
+Three things this table does not show that a staff engineer raises anyway. The KV cache is the other half of the memory bill, and weight quantization does nothing about it; at long context or high batch it can dominate VRAM, and quantizing it is a separate axis. Group size is a hidden dial: per-tensor, per-channel, and per-group scaling trade accuracy against metadata overhead, which is exactly the knob k-quants formalizes with its super-block structure. And the frontier is moving from isolate and compensate toward eliminate: recent work rotates or Hadamard-transforms activations to spread the outliers out before quantizing, attacking the root cause. The taxonomy here is the current map, not the final one.
+
+The thing to carry out of all this: quantization looks like a compression setting and behaves like a systems decision. You are protecting a critical 0.1% of the model from a uniform grid that would crush it, and buying speed from bandwidth rather than arithmetic. Get those two ideas right and the rest, GPTQ versus AWQ, weight-only versus W8A8, which `Q4_K_M` to download, is picking the right tool for which GPU you have and which tail you cannot afford to break.
+
+## FAQ
+
+<FAQ />

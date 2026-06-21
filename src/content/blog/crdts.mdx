@@ -1,0 +1,164 @@
+export const meta = {
+  slug: 'crdts',
+  title: 'CRDTs: How Distributed Systems Agree Without a Leader',
+  description:
+    'Conflict-free replicated data types let replicas accept writes offline and still converge, with no leader and no consensus. How they work, what they cost, and where they break.',
+  headline: 'CRDTs: How Distributed Systems Agree Without a Leader',
+  deck: 'They converge without a leader by making merge order stop mattering, and you pay for that in metadata you can never quite throw away.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['crdts', 'distributed-systems', 'eventual-consistency', 'local-first', 'collaboration', 'system-design'],
+  faq: [
+    {
+      q: 'What problem do CRDTs actually solve?',
+      a: 'They let many replicas accept writes independently, even while offline or partitioned, and guarantee that once they exchange updates they reach the same state without a leader, a lock, or a consensus round. The guarantee is called strong eventual consistency: replicas that have delivered the same set of updates have equal state, not just will eventually after some arbitration. That removes the coordination round trip from the write path, which is what makes them useful for collaborative editing, multi-region writes, and local-first apps.',
+    },
+    {
+      q: 'What is the difference between state-based and operation-based CRDTs?',
+      a: 'State-based (CvRDT) replicas ship their whole state and merge by computing a least upper bound on a semilattice, so duplicate, reordered, and lossy delivery are all harmless. Operation-based (CmRDT) replicas ship individual operations that are designed to commute, but they require a reliable causally-ordered broadcast underneath. The original paper proves the two families are equivalent in power, so the choice is an engineering one about bandwidth versus delivery guarantees, not a difference in what they can express.',
+    },
+    {
+      q: 'Can a CRDT counter safely track a bank balance?',
+      a: 'No, and Redis says so in its own documentation. A CRDT guarantees that all replicas converge to the same number, not that the number respects an invariant like balance >= 0. Two replicas can each independently approve a withdrawal that is valid locally, and when their states merge the converged balance goes negative. Invariants that must hold across replicas still require coordination. CRDTs buy you convergence, not application correctness.',
+    },
+    {
+      q: 'Why do CRDTs use so much memory?',
+      a: 'Because the math that guarantees convergence usually forbids true deletion. To make a remove commute with a concurrent add, you keep a tombstone or a unique tag recording what was deleted, and that metadata grows with the number of operations, not the size of the live data. Garbage collecting it safely requires knowing every replica has seen the delete, which is itself a coordination problem. Run-length encoding, delta-state CRDTs, and event-graph designs all exist to attack this tax.',
+    },
+    {
+      q: 'Are CRDTs the final answer for collaborative editing?',
+      a: 'No. As of the Eg-walker work published at EuroSys 2025, the frontier is moving away from carrying CRDT metadata at rest. The newer approach stores plain operations plus their causal graph and materializes a CRDT only transiently during a merge, then discards it, which cuts steady-state memory by roughly an order of magnitude. CRDTs remain a principled, well-understood point on the design space, but treating them as the end state is already dated.',
+    },
+  ],
+}
+
+Every system that agrees on something has a place where the agreeing happens. A primary database that orders writes. A Raft leader that appends to a log. A lock service that hands out one token at a time. That place is doing real work, and it is also a bottleneck, a single point of latency, and the thing that has to be reachable before anyone can make progress. Put two of those systems on opposite sides of an ocean, or one of them on a laptop on a train going into a tunnel, and the coordination round trip stops being a few milliseconds of overhead and becomes the difference between a working app and a spinner.
+
+The usual answer to "where does agreement live" is consensus, and [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) tell you the bill. If you want every replica to see the same thing at the same time, you give up availability under partition, and even when the network is healthy you pay latency to coordinate. Conflict-free replicated data types are the other answer. They let every replica accept writes locally, with no leader and no lock, and they guarantee that once those replicas swap updates they land on identical state. No rollback, no arbitration, no "and then we run an election to decide who was right."
+
+The interesting part is that this is not a trick or a weaker promise dressed up. It is a precise guarantee with a precise price. This piece is about both: how the convergence actually works, why a plain counter is not a CRDT, where they run in production, and the metadata tax that the entire field is currently trying to stop paying.
+
+## The bargain, stated once and precisely
+
+The thing a CRDT gives you is called **strong eventual consistency**, and the word that matters in it is "have," not "will."
+
+Ordinary eventual consistency promises that replicas which received the same updates will *eventually* reach the same state, after some background process arbitrates the conflicts. That "eventually" hides a consensus round, a last-writer arbiter, or a human merging a fork. Strong eventual consistency promises something stronger and stranger: replicas that have delivered the same set of updates *have* equal state, immediately, with no arbitration step at all. There is no moment where two replicas saw the same writes but disagree and are waiting to be reconciled. The reconciliation is baked into the data type.
+
+The formal definition adds **strong convergence** to eventual consistency, and the original 2011 paper by Shapiro, Preguiça, Baquero, and Zawirski proves the headline result that makes all of this worth caring about. A strongly-eventually-consistent replica is always available for reads and writes regardless of network conditions, it tolerates up to n minus 1 simultaneous crashes, and, in their words, "remarkably, SEC does not require to solve consensus." That last clause is the whole magic trick. Consensus is expensive and, under the FLP result, impossible to guarantee in a fully asynchronous network with even one crash. CRDTs sit on the AP side of CAP and step around the consensus tax entirely.
+
+You do not get that for free. The price is twofold, and honest articles name both. First, your operations are restricted to the ones you can make commute, which is a real constraint on what the data type can express. Second, you pay in metadata that, as we will see, is genuinely hard to ever delete. Coordination-free convergence, bought with a bounded vocabulary of operations and a pile of bookkeeping. Keep that sentence in your head, because the rest of the article is just unpacking it.
+
+## Why a plain counter is not a CRDT
+
+Start with the simplest thing you can imagine replicating: a counter. Three servers, each wants to increment it, and you want them to agree on the total without coordinating on every bump.
+
+The naive design is one integer per replica and a merge rule of "take the max." Watch it break. Replica A increments to 5. Concurrently, replica B increments to 3. They sync. The merge takes max(5, 3) and gets 5. The three increments that produced B's value are simply gone. Max does converge, every replica will agree the answer is 5, but it converges to a wrong number. Convergence alone was never the hard part.
+
+The fix reveals the actual machinery. A grow-only counter, the **G-Counter**, stores not one integer but a *vector* of per-replica counts. Each replica may only ever increment its own slot. The merge is element-wise max, and the value you read is the sum of the vector.
+
+```
+Start:   A=[0,0,0]   B=[0,0,0]   C=[0,0,0]
+A +5  -> A=[5,0,0]
+B +3  -> B=[0,3,0]      (concurrent with A)
+
+C receives both and merges element-wise max:
+   max([5,0,0], [0,3,0]) = [5,3,0]   value = 5 + 3 = 8   correct
+```
+
+Now nothing is lost, because A's increments live in slot A and B's live in slot B, and max over independent slots cannot make one clobber the other. The reason this works is the reason every state-based CRDT works: the set of possible states forms a **join-semilattice**, a partial order where any two states have a single well-defined **least upper bound**, and merge computes exactly that upper bound. An operation that is a least upper bound is automatically commutative, associative, and idempotent. Those three properties are precisely what make a hostile network harmless. Commutative means delivery order does not matter. Associative means batching does not matter. Idempotent means a message delivered twice does nothing the second time. The semilattice is not decoration. It is the thing that turns "the network reordered, duplicated, and batched my updates" into "so what."
+
+Once you see why the counter needs a vector, the rest of the design space opens up. You cannot decrement a G-Counter, because subtracting would move state *down* the lattice and break monotonicity. So a **PN-Counter** is just two G-Counters, one tracking increments and one tracking decrements, with the value being the difference. The recurring shape of CRDT design is right there: when an operation will not fit the lattice, you do not force it, you bolt on a second structure that does.
+
+## Two families that turn out to be one
+
+There are two ways to build these things, and the distinction matters operationally even though it dissolves in theory.
+
+**State-based CRDTs**, the convergent or CvRDT family, are what the counter above is. Replicas periodically ship their *entire state* to each other and merge by least upper bound. The merge is idempotent and commutative, so the transport underneath can lose messages, duplicate them, and reorder them freely. You need almost nothing from the network. The cost is bandwidth, because you are shipping whole states.
+
+**Operation-based CRDTs**, the commutative or CmRDT family, ship individual *operations* instead. An increment travels as the operation "increment," not as the resulting state. This is far cheaper on the wire, but it leans on a strong assumption: the operations must commute, *and* they must be delivered exactly once over a reliable, causally-ordered broadcast. That broadcast is the hidden dependency, and we will come back to how much it costs.
+
+Here is the result that reorganizes how a senior engineer thinks about the choice. The 2011 paper proves the two families are **equivalent**. A state-based object can emulate an operation-based one and vice versa. Neither can express anything the other cannot. So the decision between them is never about capability. It is an engineering call: state-based when your network is unreliable and bandwidth is cheap, operation-based when you can afford to build causal delivery and you need small messages. There is also a middle road, **delta-state CRDTs**, which ship small join-irreducible fragments of state that merge like states but travel like operations, and that is the modern default for state-based systems precisely because it refuses the false binary.
+
+This is the same instinct that runs through [replication strategies](/blog/replication-strategies): the question is rarely "which mechanism is more powerful," it is "which failure modes can I tolerate and what am I willing to pay." A sibling piece on [consensus and Raft](/blog/consensus-raft) covers the *other* answer to coordination, the one where you accept a leader and an election in exchange for linearizable order. CRDTs and consensus are the two ends of that spectrum, and most real systems use both, in different places, for different data.
+
+## The set that climbs a ladder of failures
+
+Counters are a warm-up. Sets are where CRDT design gets honest, because "add and remove" turns out to hide a genuinely hard problem, and the standard data types are best understood as rungs on a ladder of fixes.
+
+A **G-Set** is grow-only: you can add, merge is union, and you can never remove. Clean, useless for anything that changes.
+
+A **2P-Set** adds removal by keeping a second set of tombstones, the removed elements. But the lattice is one-directional, so a removed element can never be re-added. Remove once and it is gone forever. Often that is wrong.
+
+The real answer is the **OR-Set**, the observed-remove set, and its trick is the single most clarifying idea in CRDTs. Every add is tagged with a unique id. A remove does not delete an element by name. It deletes the specific *tagged adds it has actually observed*. Watch what that buys you when an add and a remove race:
+
+```
+Replica 1:                 Replica 2:
+add("x")  -> x@a1          add("x")  -> x@a2     (concurrent, distinct tags)
+                           remove("x")           (sees only x@a2, deletes a2)
+
+--- replicas sync ---
+R1: { x@a1 }     R2: { x@a1 }      x is in the set    ADD WINS
+```
+
+The remove on replica 2 could only cancel the tag it had seen, `a2`. It never saw `a1`, so `a1` survives the merge, and the element stays. Concurrent add beats concurrent remove, not because someone declared a priority, but because a remove is structurally incapable of cancelling an add it never observed. That is what "observed-remove" means, and it is why this is also called an add-wins set.
+
+Here is the part that separates understanding CRDTs from listing them. The fact that add wins is **a design choice, not a law**. The paper is explicit that for a concurrent add and remove of the same element, the add could win, the remove could win, the replica with the highest id could win, or the state could reset to a default, and *all of these satisfy strong convergence equally*. Every one of them converges. The question of *which* converged value is correct is not a math question. It is a product question. Convergence is mechanical; the meaning of the value you converge to is something you have to decide for your application, and no theorem will decide it for you. This is the same lesson that runs through [idempotency and the exactly-once lie](/blog/idempotency-exactly-once): the machinery can guarantee that a duplicate does no harm, but it cannot tell you what the *right* outcome of a conflict is. That judgment is yours.
+
+If you want proof that there is no free lunch hiding somewhere, look at a graph CRDT. Concurrently adding an arc between two vertices while another replica removes one of those vertices threatens the basic invariant that arcs only connect existing vertices. The paper enumerates the only three options: the remove wins and you silently drop the arc, the add wins and you have to resurrect the deleted vertex, or you delay the remove until the concurrent adds finish, which requires synchronization and destroys the entire reason you used a CRDT. There is no fourth door. "There is no perfect choice" is not a failure of the design. It is the shape of the problem.
+
+## The taxes nobody puts in the demo
+
+Demos show you a counter ticking up and two cursors editing the same document. Production shows you the bill. There are four recurring taxes, and a staff engineer prices all of them before reaching for a CRDT.
+
+**Tombstones, and the metadata that outlives the data.** The semilattice almost always forbids true deletion, because a genuine delete would move state down the lattice and let a concurrent operation that did not see the delete silently undo it. So you do not delete. You mark deleted, with a tombstone or a unique tag, and that metadata grows with the number of *operations*, not the amount of live data. A set that has had a million adds and a million removes can be empty and still enormous. This is the defining cost of the whole approach, and it never fully goes away.
+
+**Garbage collection is consensus wearing a disguise.** You can only safely reclaim a tombstone once you are certain *every* replica has seen the corresponding delete, because if even one replica still has the original add and has not seen the remove, dropping the tombstone lets that add come back from the dead on the next merge. But "has every replica seen this" is itself a distributed agreement problem. The coordination you so cleverly removed from the write path reappears, uninvited, in garbage collection. The optimized OR-Set and delta-state CRDTs exist largely to fight this specific battle.
+
+**Interleaving, where convergence is not the same as correctness.** Two people type "Hello" and "World" at the same position in a document. A naive character-level sequence CRDT can converge to "HWeolrllod." Every replica agrees on that string, so it is perfectly convergent, and it is also garbage. This is not a convergence bug. It is a *specification* bug, a flaw in what the concurrent behavior was defined to mean, and it is exactly why competing sequence algorithms like RGA, YATA, and Fugue exist and disagree. The lesson is sharp: a CRDT's concurrent behavior is a new specification you have to design and test, not something you get for free from its single-replica behavior.
+
+**Move is genuinely unsolved in the clean case.** There is no obviously-correct commutative "move this list item." Concurrent moves of the same element, or a move racing a delete, have no merge that satisfies everyone, and the naive implementation of move as delete-then-reinsert *duplicates* the element under concurrency. Kleppmann needed an entire dedicated paper for a highly-available move on replicated trees. If your data model leans on reordering, budget for this; it is not a footnote.
+
+## Where they actually run
+
+This is not theory looking for a home. CRDTs ship in real systems, and the honest ones tell you their limits.
+
+**Riak KV** offers production CRDTs as first-class data types: counters, sets, maps, registers, flags. You turn on sibling resolution, and the database merges concurrent writes using observed-remove semantics with context tokens, so an application that goes through Riak's data types gets convergence without writing merge logic by hand.
+
+**Redis Active-Active** uses operation-based CRDTs to replicate across regions, and its documentation is refreshingly blunt about the boundary. A CRDT counter, Redis says plainly, cannot model a bank account balance, because concurrent merges can drive it negative. This is the most important caveat in the entire field, and it generalizes far past Redis. A CRDT guarantees that all replicas agree on a value. It does *not* guarantee that the value obeys an invariant like "balance never goes below zero." Two replicas can each locally approve a withdrawal that is valid given what each can see, and the merged result violates the global constraint. If you need a [payment system](/blog/payment-system) to never double-spend, the convergence of a CRDT is not enough, and you reach for coordination, sagas, or a ledger with real serialization. A sibling piece on [distributed transactions and sagas](/blog/distributed-transactions-sagas) covers that other half of the problem, where you genuinely cannot avoid agreeing on order.
+
+**Yjs and Automerge** are the editing CRDTs, the ones powering collaborative documents and local-first apps. They are not interchangeable. They use different sequence algorithms, YATA versus RGA, encode to different binary formats, and historically had wildly different performance. They both converge to *valid* states, but not to the same *bytes*, and you cannot mix them in one document.
+
+The philosophy underneath the editing CRDTs is **local-first software**, the Ink & Switch idea that the copy of the data on your device should be the primary one and the cloud should be a sync relay, not the authority. That inverts the usual model and gives you offline-by-default, no spinners, and real multi-device editing. CRDTs are the primitive that makes it buildable. This is the same coordination problem that shows up in [NomadCrew](/case-study/nomadcrew), where group travelers edit a shared trip while some of them are on a plane with no signal, and the app has to behave when they all reconnect at once. The constraint is not academic. It is what happens when your users are mobile and the network is not a given.
+
+## The performance reckoning, and the frontier
+
+For years, "CRDT" was a synonym for "slow and memory-hungry," and the reputation was earned. An early version of Automerge needed on the order of a gigabyte of memory and several hours to load a document representing a 100-kilobyte paper. That number is what made people dismiss the whole approach.
+
+Then Seph Gentle ran the experiment that reframed everything. He took one real editing trace of 260,000 edits and ran essentially *the same algorithm* through three different in-memory data structures:
+
+| Implementation | Time | Memory | Why |
+| --- | --- | --- | --- |
+| Automerge, tree of characters | 291 s | 880 MB | pointer chasing, near-quadratic inserts, cache misses |
+| Yjs, flat array + run-length encoding + position cache | 0.97 s | 3.3 MB | humans type in runs, so "hello" is stored as one item |
+| Diamond, Rust, B-tree indexed by position | 0.056 s | 1.1 MB | logarithmic lookup, a few thousand allocations total |
+
+That is a five-thousand-fold spread, and the algorithm barely changed. RGA and YATA have essentially identical performance when implemented over identical structures. The entire difference came from *representation*: storing a run of sequential same-author keystrokes as one object instead of one-per-character, indexing by position with a B-tree instead of walking a linked list, caching the last access. Gentle's framing is the one to keep: the CRDT is the black-box merge *behavior*, and the in-memory data structure is a completely separate white-box *choice*. Conflating them is what produced a decade of "CRDTs are slow." They were not slow. One implementation was.
+
+This is a tail-latency story as much as a throughput one. The difference between a 50-millisecond load and a 6-hour load is not felt as an average; it is felt as the moment a user decides your app is broken. The same reasoning in [latency, throughput, and the tail](/blog/latency-throughput-tail) applies directly: the representation you choose determines whether the 99th-percentile document opens at all.
+
+And the field is not standing still. The current frontier is, pointedly, trying to *delete* the metadata that CRDTs spent ten years accumulating. **Peritext** solved commutative rich-text formatting, the overlapping bold and italic spans that naive approaches mangle. **Delta-state CRDTs** shrink what travels on the wire. The sharpest turn is **Eg-walker**, published at EuroSys 2025, which abandons carrying CRDT metadata at rest entirely. It stores plain operations plus their causal graph, materializes a CRDT *only transiently during a merge*, and throws it away afterward, cutting steady-state memory by roughly an order of magnitude. The thesis is blunt: the tombstones and tags should not live in your document at rest at all. An article that presents CRDTs as the permanent end state of collaborative data is, as of 2025, already dated.
+
+There is a quieter connection worth naming, too. The same problem of merging concurrent updates without a leader shows up far from text editors. Replicated caches, presence systems, multi-region feature flags, and the coordination layers underneath distributed AI systems all reach for these structures when a round trip to a leader is too expensive. The shift toward edge and on-device computation in [how LLMs work](/blog/how-llms-work) and [LLM inference serving](/blog/llm-inference-serving) pushes more state to the leaves of the network, and state at the leaves wants to merge without phoning home, which is exactly the CRDT shape. A sibling piece on [model quantization](/blog/llm-quantization) covers a different way of pushing intelligence to the edge; CRDTs are how the *data* out there agrees.
+
+## The honest landing
+
+CRDTs are not magic, and they are not the last word. What they are is a clean, provable answer to one specific question: how do you let many replicas write independently and still converge, without anyone in charge. The answer is to make merge order stop mattering, either by computing least upper bounds on a semilattice or by designing operations that commute, and the deep result is that those two roads lead to the same place.
+
+The price is real and you should price it before you commit. You get convergence, not invariants, so a balance that must stay non-negative or a username that must stay unique still needs coordination a CRDT cannot provide. You get a restricted vocabulary of operations, because anything that does not commute does not fit. And you get metadata that grows with operations and resists garbage collection, because the same reasoning that makes a delete dangerous makes reclaiming its tombstone a coordination problem in disguise. The way a senior engineer decides is not "CRDTs are cool, let's use them." It is: single writer, no CRDT needed; a cross-replica invariant, CRDT alone insufficient; any-order convergence with bounded metadata you can afford, now a CRDT earns its place.
+
+Use them where that calculus comes out right, which is collaborative editing, offline-first apps, presence, and multi-region state with no hard cross-replica invariant. Reach for [consensus and a leader](/blog/cap-pacelc-consistency-spectrum) where you genuinely cannot escape agreeing on order. And hold the field's own honesty in view: the smartest people building these things spent a decade adding metadata to guarantee convergence, and are now spending the next one figuring out how to throw most of it away. That is not a knock on CRDTs. It is what a healthy, principled part of distributed systems looks like while it is still moving.
+
+## FAQ
+
+<FAQ />

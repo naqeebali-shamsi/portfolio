@@ -1,0 +1,152 @@
+export const meta = {
+  slug: 'deployment-strategies',
+  title: 'Blue-Green, Canary, and Progressive Delivery: Shipping Without Downtime',
+  description:
+    'Recreate, blue-green, canary, and progressive delivery, ranked by what they cost and what they catch. How to pick the rollout that fails small instead of failing loud.',
+  headline: 'Blue-Green, Canary, and Progressive Delivery: Shipping Without Downtime',
+  deck: 'A deploy strategy is not about avoiding bugs. It is about controlling how many users meet the bug before you can pull it back.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['deployment', 'progressive-delivery', 'canary', 'blue-green', 'kubernetes', 'sre', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between blue-green and canary deployment?',
+      a: "Blue-green keeps two full environments and flips all traffic from the old version to the new one at once. The cutover is instant and rollback is an instant flip back, but every user meets the new version at the same moment, so a bad release hits everyone. Canary routes a small slice of traffic to the new version first, watches its metrics, and ramps up only if they hold. Canary trades blue-green's instant blast for a slower rollout that limits how many users a bad release can reach.",
+    },
+    {
+      q: 'What is progressive delivery?',
+      a: 'Progressive delivery is canary releasing with the manual judgment removed. Instead of a human watching dashboards and deciding whether to ramp the next traffic increment, a controller compares the new version against the baseline on defined metrics (error rate, latency, saturation) and automatically promotes, holds, or rolls back. It turns a release from an event someone babysits into a control loop with a measurable abort condition.',
+    },
+    {
+      q: 'Do you still need feature flags if you have canary deployments?',
+      a: "Yes, because they solve different problems. A canary controls which build is running for a slice of traffic; a feature flag controls whether a code path inside a build is active, independent of deploy. Flags let you decouple deploy from release, dark-launch code that ships disabled, target a feature to internal users or one cohort, and kill a feature in seconds without a rollback. The deploy gets the binary onto servers safely; the flag governs who actually experiences the change.",
+    },
+    {
+      q: 'Why does a deployment strategy depend on database migrations?',
+      a: 'Because the moment two versions of your code run at once, which every safe strategy creates, they share one database. A migration that drops or renames a column the old version still reads will break the old version the instant it lands, no matter how careful the traffic shifting is. The constraint is to keep the schema compatible with both the old and new code at the same time, using expand-and-contract: add the new shape, backfill, ship code that uses it, and only remove the old shape once nothing reads it.',
+    },
+    {
+      q: 'What metrics should gate an automated canary analysis?',
+      a: "Gate on the symptoms a user would feel, not on internal proxies. The durable set is the error rate (the share of requests failing), latency at a high percentile like p99 rather than the average, and saturation of the resource that runs out first (CPU, memory, connection pool, queue depth). Compare the canary against the baseline running at the same time rather than against yesterday, so a traffic spike or a noisy neighbor moves both and does not trip a false rollback.",
+    },
+  ],
+}
+
+Every outage postmortem has the same first sentence, give or take a noun. "At 14:32 we deployed a change." The change was reviewed. It passed CI. It worked in staging. And then it met production traffic, which is the one environment you cannot fully reproduce, and something that no test exercised went wrong for everyone at once.
+
+That last clause is the whole problem. Not that the bad change existed. Bad changes are a constant; you will ship one this quarter no matter how good your tests are. The problem is the phrase *for everyone at once*. A deployment strategy is the machinery that decides how many users meet a regression before you can take it back, and how fast taking it back actually is.
+
+This piece walks the strategies from blunt to surgical, recreate to blue-green to canary to fully progressive delivery, and is honest about what each one costs and what it cannot save you from. The strategies are not a ladder where higher is better. They are a set of trades, and the senior move is matching the trade to the workload in front of you.
+
+## What you are actually buying
+
+Strip the marketing off and every deployment strategy is spending money and complexity to buy down two numbers.
+
+The first is **blast radius**: when a release is bad, what fraction of traffic hits it before you notice. Recreate gives you a blast radius of everyone. A 1% canary gives you, at the moment of detection, roughly one percent. That single number is most of why one strategy is safer than another.
+
+The second is **time to recover**: once you know a release is bad, how long until no user is touching it. This is the one teams underweight. A gorgeous canary that takes twenty minutes to fully roll back is worse, on a bad day, than a crude setup you can revert in fifteen seconds. Recovery speed is not a footnote to the rollout; on the day it matters it is the only thing that matters.
+
+Hold those two numbers in mind, because every strategy below is just a different price for moving them. And neither one improves unless you can *see* the release going bad, which means none of this works without the kind of instrumentation in [Metrics, Logs and Traces](/blog/observability-three-pillars). A deploy strategy with no telemetry is a parachute you never checked.
+
+## Recreate: the strategy you grow out of
+
+Stop the old version. Start the new one. For the seconds or minutes in between, the service is down.
+
+It is worth naming because it is the honest baseline and, for some workloads, still the right answer. A nightly batch job that nobody is waiting on does not need zero-downtime machinery; the operational cost of canarying it would be pure waste against work that is not on the critical path. Recreate has exactly one virtue, which is that only one version of your code ever runs at a time. That sounds minor. It is the single biggest source of accidental complexity in every strategy that follows, and you will spend the rest of this article paying for having given it up.
+
+Where recreate fails is obvious and unforgiving: any user-facing service, where "down for ninety seconds during every deploy" means you either deploy rarely (which makes each deploy bigger and riskier, the exact wrong direction) or you accept regular small outages. Both are roads to the same place. The fix is to never take the service down, which is where the next two strategies live.
+
+## Blue-green: instant cutover, instant rollback
+
+Run two complete production environments. Blue is live and serving every request. Green is identical infrastructure sitting idle. You deploy the new version to green, smoke-test it against real production dependencies while no users are on it, and when you are satisfied you flip the router so all traffic moves from blue to green in one motion. Blue stays warm. If green misbehaves, you flip back.
+
+What blue-green buys is excellent and specific. The cutover is effectively instantaneous, so there is no downtime window. Rollback is the best of any strategy here: blue is still running, fully warmed, one router change away, so recovery is seconds and it is a flip you have already tested in the forward direction. For a release where the failure mode you fear is "the new version is fundamentally broken," nothing reverts faster.
+
+But look hard at the blast radius, because the brochure glosses it. The flip is atomic, which means *every* user moves to green at the same instant. If green has a bug that staging did not surface, and the entire reason production exists is that it surfaces bugs staging does not, then 100% of your traffic meets that bug the moment you cut over. Blue-green gives you a superb undo. It does nothing to limit who gets hurt before you reach for it. Your protection is entirely *time to recover*; your *blast radius* is unchanged from recreate.
+
+The other cost is literal. Two full production environments means roughly double the infrastructure for the overlap, and "roughly double" is a real line item at scale, even if green only runs hot around deploys. And the instant you have two environments talking to one database, you inherit the schema problem that the back half of this article is about. There is no version of blue-green that escapes it.
+
+Reach for blue-green when rollback speed is the thing you care about most and you can afford the duplicate footprint: regulated systems where a bad release must vanish immediately, or releases where you would rather take a brief all-users risk than run a long ramp. When limiting *who* gets hurt matters more than how fast you can undo, you want a canary.
+
+## Canary: let a few users meet the bug first
+
+The name comes from the bird miners carried underground. The canary collapsed before the gas reached a level that would hurt the people, and that early, cheap, local signal is the entire idea. You route a small fraction of production traffic, 1%, then 5%, to the new version while everyone else stays on the stable one. You watch how the canary behaves. If its metrics hold, you widen the slice; if they degrade, you route that slice back and you have hurt one user in a hundred instead of every user.
+
+This is the first strategy that attacks blast radius directly instead of just recovery time. If the bad version only ever sees 1% of traffic before your checks catch it, then 1% is the blast radius, by construction. You have made the expensive discovery, the one only production can hand you, on the smallest sample that will still reveal it.
+
+Two things have to be real or a canary is theater.
+
+**You need a population that genuinely resembles production.** One percent of traffic, not one percent that happens to be health checks and bots. If your canary slice is unrepresentative, it will stay green through the exact conditions that will break the other 99%, and you will promote a release the canary told you was fine right into an incident. The signal is only worth acting on if the sample looks like the whole.
+
+**You need to compare against the right baseline.** The instinct is to alarm when the canary's error rate crosses some fixed line. The sharper method, and the one progressive-delivery tools formalize, is to run the old version as a *baseline alongside* the canary and compare the two while they take traffic simultaneously. Why bother? Because absolute thresholds lie. A latency spike from a noisy neighbor or a regional traffic surge moves both versions together; judged against a fixed number the canary looks guilty, judged against its baseline it is plainly innocent. You are asking the only question that matters, "is the *new* code worse than the old code, *right now, under the same conditions*," and nothing else answers it cleanly.
+
+The cost canary asks of you is not money but judgment. Someone, or something, has to decide at each step whether the metrics are good enough to widen the slice, and that decision needs honest signal underneath it. Which raises the question canary cannot answer on its own: who is doing the deciding, and can they do it at three in the morning?
+
+## Progressive delivery: take the human out of the ramp
+
+A canary that a tired engineer babysits through five manual traffic bumps, squinting at Grafana and deciding by feel whether 5% is safe, is barely better than no canary. The judgment is exactly where fatigue, optimism, and "it is probably fine" creep in. Progressive delivery is the canary pattern with that judgment moved into a control loop.
+
+A controller, Argo Rollouts and Flagger are the common Kubernetes ones, drives the rollout against a declared policy. Send 5% of traffic. Hold for ten minutes. Pull the new version's error rate, p99 latency, and saturation, compare them against the baseline taking traffic at the same time, and only if every metric stays inside its bound, advance to 25%. Repeat to 50, to 100. If any metric breaches at any step, the controller halts and rolls back on its own, with no page, no human, no debate.
+
+The shift here is conceptual, and it is the part worth internalizing. A release stops being an *event* a person performs and supervises, and becomes a *control loop with a defined abort condition*. You are not asking an engineer "does this look okay to you." You are stating, in advance and in code, "this release is allowed to proceed only while it stays this good, and it must give itself up the moment it does not." That second framing is the one that survives a 3 a.m. rollout, because the abort condition does not get sleepy and does not talk itself into shipping.
+
+This is also where the deployment story and the reliability story fuse. The bounds the controller enforces, what error rate is tolerable, what p99 is too slow, are your service level objectives, expressed as a gate that can actually stop a deploy. Your error budget is not a quarterly chart anybody admires after the fact; it is the live threshold that promotes or kills *this* rollout. A team that has done the work to define good SLOs gets automated deployment gating almost for free, because the hard part was always agreeing on what "good" means, not wiring up the comparison.
+
+One caution, because automation has a failure mode of its own: the controller is only as honest as its metrics. Gate on p99 latency and the *median* can quietly rot. Watch only the symptoms you thought to declare and the ones you forgot stay invisible. Pick the metrics that genuinely stand in for a user being unhappy, and lean on the percentile discipline from [latency and the tail](/blog/latency-throughput-tail), because an average hides exactly the slow requests a canary most needs to catch.
+
+## The constraint underneath all of it: two versions, one database
+
+Here is what the four strategies were quietly not telling you. Blue-green, canary, and progressive delivery all share one structural fact that recreate alone escapes: **for some real window, two versions of your code are running at the same time.** During a canary ramp, v1 and v2 serve live requests side by side for as long as the rollout takes. During a blue-green overlap, both environments are up. And they are not isolated. They talk to the same database.
+
+That is the constraint that breaks more "zero-downtime" deploys than any router misconfiguration, and it lands hardest exactly when you thought the careful traffic-shifting had you covered. The schema cannot be valid for the new code only. It has to be valid for the old and new code *simultaneously*, for the entire overlap.
+
+Make it concrete. Your migration renames `user_name` to `full_name`. Whatever traffic strategy you run, the instant that migration lands, every still-running instance of the old code queries a column that no longer exists and starts throwing. Your canary did not protect you, because the canary governs *which binary serves a request*; it has no opinion about the schema sitting underneath both binaries. You did everything the rollout asked and still took an outage, because the real coupling was below the layer you were being careful about.
+
+The discipline that resolves this is **expand and contract**, and it is non-negotiable for any of the safe strategies. You never make a breaking schema change in one step. You split it across deploys so the database is compatible with both code versions at every instant.
+
+1. **Expand.** Add the new column `full_name` *alongside* the old one. Add it nullable or with a default so the change can absorb writes from old code that still does not know it exists. The schema now satisfies both versions.
+2. **Backfill and dual-write.** Copy existing `user_name` data into `full_name`, and ship code that writes both columns. Now the two are kept in sync no matter which version of the application handled the request.
+3. **Migrate reads.** Once `full_name` is fully populated and trustworthy, ship the version that *reads* from it. Run your whole blue-green or canary dance on this step, since this is the one that changes behavior.
+4. **Contract.** Only after every running instance reads `full_name`, and you are certain nothing touches `user_name`, do you drop the old column. This is a separate, later deploy, with its own rollback window.
+
+Each step keeps the schema readable by both the version before it and the version after it, which is the precise property your overlapping deploy requires. It is slower and it is more deploys, and people resent it right up until the first time they skip it. The cost of expand-and-contract is patience; the cost of skipping it is the outage that the entire traffic-shifting apparatus was supposed to prevent, arriving from underneath. Treat any single migration that breaks the old code as a production incident you have scheduled in advance.
+
+This is the same shape of problem as [idempotency and the exactly-once lie](/blog/idempotency-exactly-once): the failure does not come from the operation you are watching, it comes from the second concurrent actor you forgot was in the room. There it was a duplicate event; here it is the previous version of your own service.
+
+## Where feature flags fit, and why they are not the same tool
+
+Sooner or later someone asks why you need canaries at all when you have feature flags, or the reverse. They sound interchangeable and they are not, and conflating them is how teams end up with neither doing its job.
+
+A **deployment** governs *which build is running on the servers.* A **feature flag** governs *whether a code path inside that build is active,* and it can be toggled at runtime without deploying anything. The cleanest way to hold the distinction: a deploy moves the binary; a flag decides whether a particular behavior inside the binary is switched on, for whom, right now.
+
+That gap is exactly what lets you **decouple deploy from release.** You can ship code to production with a feature flagged off, a *dark launch*, so the new path is present, exercised by your infrastructure, warming caches and revealing integration problems, while no user can see it. Then you turn it on as a separate act, on its own timeline, for an audience you choose: internal accounts first, then a single cohort, then everyone. And when it misbehaves you flip the flag off in seconds, with no rollback, no redeploy, no router dance.
+
+Notice how the two compose, because the combination is the actual senior setup. The canary made *deploying the binary* safe by limiting who runs the new code. The flag makes *releasing the behavior* safe by limiting who experiences the new feature, independent of which build they are on. You use the canary to get the artifact onto the fleet without an outage, and the flag to govern who actually meets the change once it is there. Different layers, different blast radii, different undo mechanisms. The deploy answers "is this build healthy on real traffic." The flag answers "should this specific behavior be live, and for which users." A team that runs both has separated *can we run this code* from *should users see this feature*, and those genuinely are two questions.
+
+## How to choose
+
+The strategies stack from blunt to surgical, and the right stopping point is wherever the workload's actual risk lives, not the most sophisticated option you could justify on a slide.
+
+| Strategy | Blast radius | Time to recover | Real cost | Choose it when |
+| --- | --- | --- | --- | --- |
+| Recreate | Everyone (with downtime) | Redeploy the old version | Nearly none; only one version ever runs | Batch jobs, internal tools, anything with no live users to disappoint |
+| Blue-green | Everyone, the instant you cut over | Seconds: flip back to blue | Double the infrastructure for the overlap | Rollback speed dominates and you can pay for two environments |
+| Canary | Only the canary slice | Route the slice back, then full revert | Telemetry plus the judgment to ramp | Limiting *who* meets a bug matters more than instant undo |
+| Progressive delivery | The current automated increment | Controller rolls back on a metric breach | Real SLOs and a controller to enforce them | High deploy frequency where no human should be babysitting ramps |
+
+Two honest correctives on the table. First, more sophisticated is not more correct; the right choice is the cheapest strategy whose blast radius and recovery time you can actually live with for *this* service, and forcing progressive delivery onto a nightly batch job is just cost with no buyer. Second, every row below recreate is lying by omission if you have not solved the database problem, because expand-and-contract is the precondition that makes any of these safe, not an enhancement you bolt on later. The schema discipline is load-bearing under the entire table.
+
+And all four rows assume the same foundation: you can see the release going bad fast enough for the blast-radius number to mean anything. The instinct to ship behind a small, observed, reversible increment is the same instinct that runs through [the system design interview framework](/blog/system-design-interview-framework): control the blast radius, make the failure reversible, and never bet the whole system on a step you cannot take back.
+
+## The honest landing
+
+You will deploy a bad change. Not might; will. Every strategy in this article concedes that upfront and is honest about it, which is exactly what makes them useful, because none of them is trying to sell you a deploy that cannot fail. They are arguing over what happens in the minutes after the failure you already know is coming: how many users meet it, and how fast you make it stop.
+
+So pick for the failure, not the success. Recreate when nobody is watching. Blue-green when the rollback has to be instant and you can pay for the spare environment. Canary when you would rather hurt one user in a hundred than all of them. Progressive delivery when you deploy often enough that the abort condition has to live in code instead of in a tired engineer's judgment. And under all of them, without exception, keep the database compatible with both versions at once, because that is the trapdoor that opens underneath teams who got everything in the table right and forgot what was holding it up.
+
+The strategy is not what stops the bug. It is what decides whether the bug is a line in a dashboard or a sentence in a postmortem.
+
+## FAQ
+
+<FAQ />

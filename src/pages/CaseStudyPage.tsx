@@ -7,6 +7,7 @@ import AnimatedArchitecture from '@/components/CaseStudy/AnimatedArchitecture';
 import ExternalLink from '@/components/atoms/ExternalLink';
 import { Navbar } from '@/components/Navbar/Navbar';
 import { CustomCursor } from '@/components/CustomCursor';
+import Seo from '@/components/Seo';
 
 const fadeUp = {
   hidden: { opacity: 0, y: 30 },
@@ -62,6 +63,30 @@ const screenDescriptions = [
   { name: 'Invite', desc: 'Shareable links and direct invitations. New members inherit role-appropriate permissions the moment they accept. The matrix-based auth system configures access automatically based on trip phase and role.' },
 ];
 
+const nomadcrewJsonLd = {
+  '@context': 'https://schema.org',
+  '@type': 'TechArticle',
+  headline: 'NomadCrew: Building Real-Time Group Travel Coordination in Go',
+  description:
+    'How NomadCrew’s real-time group-travel platform was engineered in Go and React Native: a fine-grained WebSocket hub, matrix-based authorization, penny-perfect expense splitting, and database-enforced location privacy.',
+  image: 'https://naqeebali.me/og-image.png',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  author: { '@type': 'Person', name: 'Naqeebali Shamsi', url: 'https://naqeebali.me' },
+  publisher: { '@type': 'Person', name: 'Naqeebali Shamsi', url: 'https://naqeebali.me' },
+  mainEntityOfPage: 'https://naqeebali.me/case-study/nomadcrew',
+  url: 'https://naqeebali.me/case-study/nomadcrew',
+  keywords: [
+    'Go', 'Gin', 'WebSockets', 'React Native', 'Expo', 'PostgreSQL', 'Redis', 'CASL',
+    'real-time systems', 'concurrency', 'group travel', 'expense splitting',
+  ],
+  about: [
+    { '@type': 'Thing', name: 'Real-time systems' },
+    { '@type': 'Thing', name: 'Concurrency' },
+    { '@type': 'Thing', name: 'Authorization' },
+  ],
+};
+
 export default function CaseStudyPage() {
   useEffect(() => {
     window.scrollTo(0, 0);
@@ -69,6 +94,13 @@ export default function CaseStudyPage() {
 
   return (
     <div className="min-h-screen bg-bg text-text overflow-x-hidden">
+      <Seo
+        title="NomadCrew: Real-Time Group Travel Coordination, Built in Go | Naqeebali Shamsi"
+        description="A technical case study on building NomadCrew: real-time group-travel coordination in Go and React Native. WebSocket concurrency, matrix-based authorization, penny-perfect expense splitting, and database-enforced location privacy."
+        canonical="https://naqeebali.me/case-study/nomadcrew"
+        type="article"
+        jsonLd={nomadcrewJsonLd}
+      />
       <CustomCursor />
       <Navbar />
 
@@ -151,7 +183,7 @@ export default function CaseStudyPage() {
                 Every group trip starts the same way. Someone creates a WhatsApp group. Someone else shares a Google Sheet. A third person downloads Splitwise. Within 48 hours, the planning context is scattered across five apps, three time zones, and zero shared understanding.
               </p>
               <p>
-                The failure mode is not a lack of tools — it is a surplus of disconnected ones. Conversations happen in one app. Budgets live in another. Location sharing requires a third. <strong>No single surface holds the full picture</strong>, and decisions stall because context is always somewhere else.
+                The failure mode is not a lack of tools. It is a surplus of disconnected ones. Conversations happen in one app. Budgets live in another. Location sharing requires a third. <strong>No single surface holds the full picture</strong>, and decisions stall because context is always somewhere else.
               </p>
             </div>
           </motion.div>
@@ -163,12 +195,12 @@ export default function CaseStudyPage() {
                 ['Coordination across time zones', 'Asynchronous planning with no shared state means someone is always out of the loop.'],
                 ['Expense opacity', 'Who paid for what, who owes whom, and how to split unevenly across subgroups is a recurring source of friction.'],
                 ['No trip lifecycle', 'Existing tools treat a trip as a static document. In reality, a trip moves through phases: creation, invites, active planning, live coordination, and post-trip settlement.'],
-                ['Permission complexity', 'Group dynamics are not flat. Admins, members, and guests need different levels of access \u2014 and those permissions shift as the trip evolves.'],
+                ['Permission complexity', 'Group dynamics are not flat. Admins, members, and guests need different levels of access, and those permissions shift as the trip evolves.'],
               ].map(([title, desc]) => (
                 <li key={title} className="flex items-start gap-4">
                   <span className="mt-2 block h-2.5 w-2.5 shrink-0 rounded-full bg-accent" />
                   <p className="font-body text-base" style={{ color: 'var(--text-secondary)' }}>
-                    <strong style={{ color: 'var(--text-primary)' }}>{title}</strong> — {desc}
+                    <strong style={{ color: 'var(--text-primary)' }}>{title}</strong>: {desc}
                   </p>
                 </li>
               ))}
@@ -222,7 +254,7 @@ export default function CaseStudyPage() {
               Built for the Messy Reality of Group Travel
             </h2>
             <p className="font-body text-lg max-w-2xl mb-12" style={{ color: 'var(--text-secondary)' }}>
-              A mobile-first experience across <strong>12 feature modules</strong> — from trip creation through settlement.
+              A mobile-first experience across <strong>12 feature modules</strong>, from trip creation through settlement.
             </p>
           </motion.div>
 
@@ -354,7 +386,7 @@ export default function CaseStudyPage() {
               Not a chat app. Not a shared spreadsheet. Not another travel planner.
             </p>
             <h2 className="font-heading text-3xl md:text-5xl font-bold tracking-heading max-w-4xl mx-auto leading-tight" style={{ color: 'var(--text-primary)' }}>
-              The best group trip is the one where nobody gets left behind — in the planning or on the ground.
+              The best group trip is the one where nobody gets left behind, in the planning or on the ground.
             </h2>
             <div className="mt-12 flex flex-wrap justify-center gap-4">
               {caseStudy.repoUrl && (

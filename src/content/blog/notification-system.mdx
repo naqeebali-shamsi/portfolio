@@ -1,0 +1,137 @@
+export const meta = {
+  slug: 'notification-system',
+  title: 'Design a Notification System: Push, SMS, and Email at Fan-Out Scale',
+  description:
+    'One event becomes millions of deliveries across push, SMS, and email. How to fan out at scale without dropping a 2FA code or sending a like notification twice.',
+  headline: 'Design a Notification System: Push, SMS, and Email at Fan-Out Scale',
+  deck: 'Every delivery pipeline guarantees at-least-once, and your users feel every duplicate as spam. The whole design is a negotiation between those two facts.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '17 min',
+  tags: ['system-design', 'notifications', 'distributed-systems', 'push-notifications', 'kafka', 'idempotency'],
+  faq: [
+    {
+      q: 'How do you stop a notification system from sending duplicates?',
+      a: 'You cannot stop duplicates from being generated, because the queue can redeliver, a worker can retry, and APNs, FCM, or the carrier can deliver twice on their own. What you do instead is make the effect idempotent. A dedup key built from user id, event type, and entity id is written to Redis with SET NX EX before sending; if the key already exists, you skip. APNs adds a second layer with apns-collapse-id, which merges redundant notifications on the device display. Different layers kill duplicates born at different stages.',
+    },
+    {
+      q: 'Should a notification be sent from inside the request that changed the state?',
+      a: 'No. Sending inline is the dual-write bug. The database commit can succeed while the publish to the broker fails, which loses the notification, or the publish can fire on a transaction that later rolls back, which sends a phantom notification. The fix is the transactional outbox: write the business row and an outbox row in the same transaction, then a relay or CDC stream ships committed outbox rows to the broker. The event fires if and only if the state actually changed.',
+    },
+    {
+      q: 'How do you decide whether to send a notification at all?',
+      a: 'Treat send-or-suppress as its own policy service, separate from transport, because it is the part that grows most complex. At small scale it is preferences plus quiet hours plus a frequency cap. At large scale it becomes an optimization: score each candidate by predicted value, apply frequency caps as constraints (Uber uses a daily cap and a minimum gap between pushes), and deliberately drop the lowest-value notifications. The metric you are optimizing is opt-out rate, not raw delivery count.',
+    },
+    {
+      q: 'Why are SMS delivery receipts unreliable?',
+      a: 'An SMS travels from your API through an aggregator to the carrier SMSC and finally to the handset, and the delivery receipt comes back asynchronously through that same chain. A carrier may acknowledge receipt in milliseconds but delay the actual delivery receipt by minutes, and the receipts themselves are notoriously unreliable. So SMS status is eventually-consistent and best-effort. The adapter persists the provider message id on accept, reconciles against delivery-receipt webhooks later, and treats a missing receipt as unknown rather than failed.',
+    },
+    {
+      q: 'How do you keep retries from making a notification outage worse?',
+      a: 'Retry with exponential backoff plus jitter so a fleet does not hammer a recovering provider in lockstep. Classify errors first: 429 and 5xx and timeouts are retryable, but a 410 Unregistered from APNs or UNREGISTERED from FCM is terminal, and retrying it wastes quota. A terminal token error is actually a feedback signal to delete that device token. Cap attempts at five or six, then route to a dead-letter queue with replay tooling, because a DLQ you cannot drain is just slow data loss.',
+    },
+  ],
+}
+
+A notification system is the easiest thing in the world to demo and one of the hardest to get right. The demo is a single function: an event happens, you look up a user, you call a provider, a phone buzzes. Everyone writes that in an afternoon, and it works perfectly, because in the demo the event happens once and there is one user.
+
+Production is the opposite shape. One event can be addressed to millions of people, each reachable on three channels, and the pipeline carrying it gives you exactly one guarantee: at-least-once. That guarantee is the whole story. A notification you must never drop, a security code, a fraud alert, can still be lost if you are careless, and a notification nobody wants twice, a like, a "your order shipped," can arrive twice just as easily. The entire design lives in the gap between those two failures.
+
+This piece is about fanning one event out to push, SMS, and email without dropping the message that matters and without spamming the one that does not. It assumes you have read [the system design interview framework](/blog/system-design-interview-framework) and can do [capacity estimation](/blog/capacity-estimation), because the first thing this design needs is a number.
+
+## The number that forces the architecture
+
+Start with the blast radius, because it decides everything downstream. Take an event addressed to ten million recipients across three channels. That is up to thirty million individual deliveries from one logical event. To know whether that is a real problem or a hypothetical one, you need a sense of how fast a serious delivery layer actually moves.
+
+Uber's real-time push platform is the cleanest public benchmark: its current generation holds 1.5 million or more concurrent connections and sustains 250,000 or more messages per second at 99.99 percent server-side uptime. Run the thirty-million-delivery event against that 250,000-per-second ceiling and it takes about two minutes of full-throttle worker time to drain. That single arithmetic step is the whole argument for the architecture. You cannot do thirty million deliveries inside the request that triggered them, because the request would hang for two minutes and the trigger source would have given up long ago. Fan-out goes through a durable queue and a worker pool, every time, with no exception for "small" events, because the event you assumed was small is the one that fans out to a whole workspace.
+
+So the spine is fixed before we draw a single box: an event lands, gets persisted durably, and is drained asynchronously by workers that expand it into per-user, per-channel deliveries. The interesting design is everything that hangs off that spine.
+
+## Fire the event exactly when the state changes
+
+The first temptation is the one that quietly corrupts the whole system: sending the notification from inside the request handler that changed the state. A user gets assigned a ticket, so right there in the assignment handler you fire the push. It reads naturally and it is wrong, for a reason that has nothing to do with scale.
+
+It is a dual-write. You are writing to two systems that cannot commit together, your database and your message broker, with no transaction spanning both. Two failure modes fall out, and both are bad. The commit succeeds and the publish fails, so the state changed but nobody was told. Or the publish succeeds and the transaction rolls back, so you sent a notification about a ticket assignment that never happened. The first is a silent lost notification. The second is a phantom, a notification about a world that does not exist.
+
+The fix is the transactional outbox. In the same transaction that does the business write, you insert a row into an `outbox` table describing the notification you intend to send. They commit or roll back together, so the intent-to-notify is now exactly as durable as the state change itself. A separate relay, or a change-data-capture stream tailing the database log, reads committed outbox rows, publishes them to the broker, and marks each one done. AWS states the rule plainly: do not send out an event notification if the transaction is rolled back. The outbox makes that rule mechanical instead of aspirational.
+
+This is the same shape as [idempotency and the exactly-once lie](/blog/idempotency-exactly-once) at the producer end. The outbox makes the publish reliable. It does not make delivery exactly-once, and believing it does is the most common way this design goes wrong.
+
+## Name the guarantee out loud, then defend it
+
+Here is the load-bearing claim, the one a senior engineer says in the first five minutes of the review: end-to-end delivery is at-least-once and cannot be made exactly-once, because the providers themselves retry outside your control. APNs retries, FCM retries, the carrier can deliver an SMS twice, and none of that is reachable by a queue you own. So the honest move is to stop preventing duplicate delivery and make the duplicate harmless instead. Exactly-once delivery is a myth. Exactly-once effect is achievable, and it is a smaller, different claim.
+
+The mistake here is reaching for a FIFO or exactly-once queue and believing duplicates are now gone. They are not. AWS is explicit that even a FIFO queue only fixes your broker leg; SQS standard guarantees at-least-once and warns the same message might be delivered more than once, so the consumer must be idempotent. The duplicate that hurts you is born downstream of any queue you control, at the provider or on the device, where your FIFO ordering means nothing.
+
+So idempotency lives at the worker, because the worker is the one place that sees every delivery attempt. The mechanism is a dedup key, composed from the event's identity: `hash(user_id : event_type : entity_id : time_bucket)`. Before sending, write it with `SET key 1 NX EX <ttl>`. If `NX` fails, the key already exists, so you skip. This is the same atomic claim that [idempotent webhooks](/blog/idempotency-exactly-once) lean on, one operation that both checks and claims, because a separate read-then-write leaves a race where two retries both see "not sent" and both send.
+
+The genuinely interesting part is the TTL, because the TTL is the dial that tunes the core tension. A short window catches few duplicates and rarely suppresses a legitimately new notification; a long window catches more duplicates and risks swallowing a real one. The right value differs per event type, which is why a single global dedup window is a junior tell. A reasonable ladder, as a design choice rather than gospel:
+
+| Priority | Example | Dedup TTL | What the TTL is buying |
+| --- | --- | --- | --- |
+| Critical | 2FA code, security alert | 24h | Long window because a duplicate 2FA is fine; a missed one is a lockout |
+| High | Payment received, fraud | 6h | Strong dedup; these are infrequent and high-stakes |
+| Medium | Social, mentions | 1h | Balanced; some bursts are expected |
+| Low | Marketing, digests | 15m | Short window; over-suppressing low-value notifications costs nothing |
+
+The ladder is the at-least-once-versus-annoyance negotiation written down as a table. Every row is a deliberate trade between a missed notification and a duplicate one.
+
+## Where a duplicate is born, and what kills it at each layer
+
+Duplicate suppression is defense in depth, because no single mechanism covers the whole pipeline. A duplicate is born when the queue redelivers after a worker crashed before acking, or when a worker retries a partial failure; the Redis idempotency key kills both, because the redelivered job hashes to a key that already exists. A duplicate is born when the provider retries below your visibility; for push, APNs hands you a native tool, an `apns-collapse-id` header of up to 64 bytes that makes multiple notifications with the same id display as one. A duplicate is born when the device itself re-delivers; the client dedupes on a `notification_id` it has seen before.
+
+The trap is assuming any one of these covers the others. `apns-collapse-id` is the most commonly overcounted: it collapses the on-device display and does nothing about your worker processing the same job twice, and nothing at all for SMS or email. Coalescing actually lives at four separate layers, and you have to say which you mean: on-device display collapse, pipeline dedup in Redis, digest bundling that merges "Alice, Bob, and Carol liked your post" into one notification (a content choice, not a reliability mechanism), and rate-limit shedding that drops the marginal notification entirely. Conflating them in a design review signals you have read about this rather than built it. This is the same exactly-once trap that [Kafka versus queues](/blog/kafka-vs-queues) circles: the broker gives you ordering and at-least-once, and the effect-level dedup is still your job.
+
+## The provider adapter, where a dead vendor is a route change
+
+Underneath the dedup logic sits the part that touches the outside world, and it is the part most worth abstracting. Each channel speaks a different protocol with different quirks, and you do not want those leaking up into your fan-out logic. So you define one interface, a `ChannelProvider` with `send(message) -> {accepted, providerMessageId}` and a normalized error enum, and every provider implements it. Push-over-APNs, push-over-FCM, SMS-over-Twilio, email-over-SES all look identical to the layer above. The payoff is that a dead vendor becomes a routing change instead of a code change.
+
+That payoff is not theoretical. Twilio runs two SMS aggregators in the US specifically so that when one fails it can automatically route through the second, which it did during a 2016 outage. The adapter is how you get that property at your own layer: a per-provider circuit breaker trips when a provider starts failing, and traffic reroutes to a backup. Without the abstraction a vendor outage is a deploy under pressure; with it, a config flip.
+
+The quirks the adapter normalizes are real and provider-specific. APNs is an HTTP/2 API with a hard 4096-byte payload ceiling and token-based auth using an ES256 JWT signed with a P-256 key. The token economics bite at scale: you reuse one signed token for up to an hour, so a fleet that mints a fresh token per push earns an `ExpiredProviderToken` 403 and throttling almost immediately. The fix is one token cached in memory, refreshed every fifty minutes, shared across an HTTP/2 connection pool that multiplexes many streams per connection. FCM is its own fan-out layer wearing an adapter's clothes: you POST to `…/v1/projects/{projectId}/messages:send` with an OAuth2 bearer token, and the FCM backend does topic fan-out, mints a message id, then hands off to its own transport, ATL for Android, APNs for Apple, Web Push for browsers. Modeling FCM as an adapter fronting other adapters is the right mental model, and it explains why its notification messages and data messages behave differently when the app is backgrounded, the most common cause of "works in foreground, silent in background."
+
+The error taxonomy is where the adapter earns its keep, because it decides retry behavior. A 429, a 5xx, or a timeout is retryable. A `BadDeviceToken` or a 410 `Unregistered` from APNs, or `UNREGISTERED` from FCM, is terminal, and it is more than non-retryable, it is the only reliable signal that a device is gone, so the adapter's job is to delete that token from the registry. Token hygiene is a first-class subsystem: without a feedback-driven cleanup loop, your token table fills with dead endpoints, your "sent" counts lie, and your provider quota burns on ghosts.
+
+## Retries that recover instead of pile on
+
+Once errors are classified, the retry policy almost writes itself, and getting it wrong turns a provider hiccup into an outage. The delay for attempt `n` is `min(base * 2^n, cap) + jitter`, a schedule like one second, two, four, eight, capped at a few minutes, with a ceiling of five or six attempts before the message goes to a dead-letter queue. The jitter is not decoration. Without it, every worker that hit the same provider blip retries on the same schedule and they reconverge into a synchronized wall of traffic that knocks the recovering provider straight back down. That is a retry storm, and jitter desynchronizes the herd.
+
+The DLQ admits that some messages will exhaust their retries, and it is only useful if you can act on it. A poison message, a malformed template or a payload the provider rejects, can stall an entire partition if retried forever, so bounded attempts plus a DLQ keeps one bad message from blocking the good ones behind it. But a DLQ you cannot drain is just a slower form of data loss. You need replay tooling, an operator path to fix the issue and reinject the dead messages, or the DLQ becomes a graveyard you never visit. This is the same retry-and-DLQ discipline behind [Kafka versus queues](/blog/kafka-vs-queues).
+
+## The hard part is deciding whether to send at all
+
+Everything so far is the transport problem, and the transport problem is the easy one. Slack, which has published more honest material on this than almost anyone, says so directly: the logic that decides whether to notify is the hard part, and it has only grown more complex as features pile up. So the architectural move is to isolate the policy in its own service, versioned and testable, separate from transport, and feed every candidate notification through it before it reaches a channel.
+
+At small scale the policy is a checklist: does the user's preference allow this type on this channel, is it inside their quiet hours, have they hit their frequency cap. It is also where two bugs hide. The first is treating quiet hours as "drop night-time notifications." A non-urgent notification should defer to the morning, not delete, because the user still wants the digest, and 2FA and security must bypass quiet hours entirely, because a login challenge at 2 a.m. is exactly when it matters. A single global "do not send at night" flag is wrong on both counts. The second bug is treating "10pm" as a server-side hour check. Quiet hours are per-user-locale, and DST, travel, and missing timezone data all break the naive version, which is why the durable form models them as a send-time-window constraint rather than a runtime `if hour > 22`.
+
+At large scale the policy stops being a checklist and becomes an optimization, and this is the senior insight. Uber models send-or-suppress as an integer linear program: each candidate push has a value score, frequency rules become linear constraints, and a solver picks the schedule that maximizes total value. They chose the optimization form because brute-forcing every possible schedule has factorial growth. The constraints are concrete: a daily cap such as two pushes per day, and a minimum separation such as eight hours between pushes, plus expiry and send-time windows. The value score is an XGBoost model predicting the probability a user makes an order within 24 hours of receiving a push at a given time. And the conclusion that separates this from the junior version: when buffered volume exceeds the caps, the most valuable pushes get scheduled and the rest are dropped. Dropping a low-value notification is a feature, not a bug.
+
+This inverts the instinct that more notifications mean more engagement. Past a threshold they mean the opposite, because the real metric is opt-out rate, and uncapped notifications drive opt-outs up. Uber's reported result is fewer opt-outs alongside higher relevance. The same engagement-versus-fatigue trade sits behind a [Twitter feed](/blog/design-twitter-feed) or an [Instagram timeline](/blog/design-instagram). Because the policy is now effectively a model, it needs offline evaluation and shadow testing, the other reason it cannot live tangled inside the transport code.
+
+Frequency caps handle the slow accumulation over a day. The faster sibling is rate limiting in the throughput sense, "this user or this provider is getting hammered right now," and the right primitive is a token bucket per user, which allows a controlled burst and then a sustained refill, because a fixed-window counter lets a user catch a double burst across the window boundary. The reasoning lives in [the rate limiter](/blog/rate-limiter). The detail worth keeping is that limits live at three tiers you need all of: per-user to stop a runaway loop, per-channel because your SMS budget and push capacity cost differently, and per-provider because APNs and FCM enforce their own quotas and you would rather shed load than collect 429s.
+
+## Observe the funnel, not the send
+
+The last subsystem is the one teams skip until an incident forces it: knowing what actually happened to a notification. The naive version logs a "sent" counter, and that counter lies, because at-least-once means it overcounts every duplicate and retry. The useful model is a funnel. Slack instruments the lifecycle as a named span sequence: trigger, notify, sent, received, opened, read-in-app. That is a conversion funnel, and the valuable SLOs come from it, "received within N seconds" and "percent suppressed by policy," not a raw send count.
+
+The implementation detail that makes this tractable at fan-out scale is worth borrowing. Slack gives each notification its own trace with the `notification_id` as the `trace_id`, and connects a single sender action, an `@channel` that explodes into millions of notifications, to all of those traces using span links. They keep 100 percent sampling on notification traces but only 1 percent on senders, to avoid drowning in a billions-of-spans problem, and report 30 percent faster triage as a result. A single `@channel` is a trace-explosion problem as much as a fan-out one, and the sampling asymmetry is how you keep observability affordable.
+
+The other half of observability is reconciliation, and SMS is where it bites. Delivery status for SMS is eventually-consistent and best-effort, never synchronous. The message goes API to aggregator to SMSC to carrier to handset, and the delivery receipt comes back asynchronously through that same chain, arriving seconds to minutes later and sometimes wrong. So the SMS adapter persists the `providerMessageId` the moment the aggregator accepts, consumes delivery-receipt webhooks to reconcile the final status later, and treats a missing receipt as `unknown`, not `failed`. A delivery receipt is the carrier's claimed disposition, not proof, and treating it as a hard guarantee is how dashboards end up confidently wrong. Tail latency matters here too: "received within N seconds" is a p99 question, not a p50 one, which is the whole argument in [latency and the tail](/blog/latency-throughput-tail).
+
+## How the pieces sit together
+
+Trace it once: a state change commits alongside an outbox row, a relay ships that row to Kafka partitioned by `user_id`, workers fan it out into per-user deliveries, the policy gate sends or defers or drops each one, and the channel router hands the survivors to an adapter that sends, retries with jitter, cleans up dead tokens, and emits a `providerMessageId` the reconciler uses to close the funnel.
+
+That partition key deserves one note, because ordering is easy to overdo. Partitioning by `user_id` keeps a user's notifications causally ordered, which AWS encodes as `messageGroupId = aggregateId`, but it caps per-user parallelism. Most systems need causal ordering for a given entity, not global ordering, and forcing global ordering quietly kills throughput. A senior design names the weakest ordering that is still correct.
+
+The same fan-out-and-fan-in spine, idempotency at the consumer and a queue absorbing the burst, sits behind a surprising amount of infrastructure. It is how the live-location pipeline in [NomadCrew](/case-study/nomadcrew) keeps a group's positions flowing without melting under a surge, and it rhymes with the write-path design in [the URL shortener](/blog/url-shortener) once you squint at where the durable-write boundary sits.
+
+## The honest landing
+
+You do not get to make delivery exactly-once. The providers retry, the carriers re-send, and the network stays unreliable for as long as networks are networks, which is forever. What you control is everything around that fact. You fire the event from an outbox so it tracks the state change instead of racing it. You push idempotency to the worker and tune the dedup TTL per event type, because the dial between a missed notification and a duplicate one sits at a different point for a 2FA code than for a marketing blast. You hide the providers behind an adapter so a dead vendor is a route change. You retry with jitter so recovery does not become a stampede. And above all you treat the decision to send as the hard part it is, because a system that delivers everything reliably and annoys everyone into opting out has solved the easy problem and failed the real one.
+
+Get the unglamorous parts right, the outbox row, the atomic dedup claim, the token cleanup loop, the deferral-not-drop on quiet hours, and the 2FA code lands at 2 a.m. while the like notification does not arrive twice. Skip them, and you ship the afternoon demo to production and get paged when it meets its first real event.
+
+## FAQ
+
+<FAQ />

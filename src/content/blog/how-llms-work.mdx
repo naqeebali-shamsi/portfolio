@@ -1,0 +1,189 @@
+export const meta = {
+  slug: 'how-llms-work',
+  title: 'How an LLM Actually Works: Transformer Inference for System Designers',
+  description:
+    'Your LLM bill is a memory-bandwidth bill. A systems view of transformer inference: prefill vs decode, the KV cache, the roofline, and why batching is near-free.',
+  headline: 'How an LLM Actually Works: Transformer Inference for System Designers',
+  deck: 'An LLM at inference is a bandwidth-bound streaming loop with a quadratic cost term and a cache that quietly decides your per-token price.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '16 min',
+  tags: ['llm', 'transformers', 'inference', 'gpu', 'systems-design', 'kv-cache'],
+  faq: [
+    {
+      q: 'Why is LLM inference memory-bandwidth-bound instead of compute-bound?',
+      a: 'It depends on the phase. Generating one token at small batch sizes means reading every weight in the model out of GPU memory (tens to hundreds of gigabytes) while doing almost no arithmetic with each weight. The arithmetic intensity collapses to roughly one operation per byte moved, against a hardware ridge point near 200 ops per byte on an A100. You spend your time waiting on memory, not on math. Prefill, which processes the whole prompt in one parallel pass, is the opposite: it saturates the tensor cores and is compute-bound.',
+    },
+    {
+      q: 'What is the KV cache and why does it limit how much you can batch?',
+      a: 'The KV cache stores the Key and Value projections of every token seen so far, so generating the next token reads them instead of recomputing them. That turns the per-step cost from quadratic to linear in sequence length. But it also consumes a large, growing chunk of GPU memory: roughly 800KB to 1MB per token for a 13B model. After weights are loaded, the leftover memory caps how many concurrent sequences you can hold, so KV-cache capacity, rather than raw compute, sets your batch size and therefore your dollars per token.',
+    },
+    {
+      q: 'Why does batching barely hurt latency for LLM decode?',
+      a: 'Because decode is bandwidth-bound, the expensive thing is reading the weights out of memory once per step. At batch size one, that single weight read produces one token. If you batch several requests, you read the weights once and amortize that read across all of them, producing many tokens for nearly the same memory traffic and nearly the same per-token latency. This holds until you cross the critical batch size (around 240 to 280 on current accelerators) and the GPU finally becomes compute-bound.',
+    },
+    {
+      q: 'Does a bigger model mean proportionally slower generation?',
+      a: 'Not exactly. Decode latency tracks weight bytes divided by memory bandwidth, not raw FLOPs. A model with twice the parameters that still fits the same memory tier and bandwidth profile is not automatically twice as slow per token at small batch sizes. This is why quantization helps so much: halving the bytes per weight roughly halves the bandwidth you must move per token, which directly speeds up the memory-bound decode phase.',
+    },
+    {
+      q: 'How does a long context window cost you?',
+      a: 'Two ways. Self-attention compares every token to every other token, so attention compute and the naive attention-memory footprint scale with the square of the sequence length. Doubling the context roughly quadruples that attention cost, which lands mostly on prefill. Separately, the KV cache grows linearly with context, so longer sequences consume more memory per request and shrink how many requests you can batch. A large context window is a systems-budget decision, not a configuration flag you flip for free.',
+    },
+  ],
+}
+
+Your LLM bill is a memory-bandwidth bill. That is the single most useful thing a systems engineer can know about transformer inference, and almost no explanation of "how LLMs work" tells you, because almost every explanation is written for someone who wants to understand attention as linear algebra. You probably do not. You want to understand why a model that fits comfortably on one GPU still costs what it costs to serve, which knob moves which number, and where the whole thing falls over.
+
+So this piece treats an LLM at inference as what it is to an infrastructure team: a streaming pipeline, bound by memory bandwidth, carrying a quadratic cost term and a cache that quietly decides your per-token economics. The math from the 2017 paper is in here, but it is supporting cast. The load-bearing ideas are about where the bytes move.
+
+## The loop is the whole thing
+
+Strip away the marketing and an LLM at inference is a fixed function you call in a loop:
+
+```
+f(tokens_so_far) -> distribution over the next token
+```
+
+You give it the tokens it has seen, it returns a probability for every possible next token, you pick one, append it, and call again with the slightly longer sequence. That is autoregressive generation. The model never thinks ahead and never edits what it already wrote. It answers the same question over and over, one token at a time, with the question growing by one token each round.
+
+A **token** is the unit the model reads and writes, roughly three-quarters of a word. The loop runs once per output token. The steps inside one iteration:
+
+```
+tokenize -> embed -> [ transformer block ] x L -> final linear -> logits -> sample -> append -> loop
+```
+
+Walking it: text becomes tokens, each token becomes a vector (the **embedding**), that stack of vectors flows through L identical transformer blocks, a final linear layer projects the result into **logits** (one raw score per word in the vocabulary), and a **sampling** step turns those scores into a chosen token. Greedy sampling takes the highest score; temperature, top-k, and top-p add controlled randomness. Then you append and go around again.
+
+Two facts about this loop set up everything that follows. First, each iteration reads the entire model to produce a single token. Second, naively, each iteration would redo the work of every previous one, because attention at step *t* looks back at all of tokens 1 through *t-1*. The first fact is why you are bandwidth-bound. The second is why the KV cache exists. Hold both.
+
+## Attention, in two paragraphs
+
+Inside each block, the mechanism that lets a token pull in information from other tokens is **self-attention**. Every token emits three vectors: a **Query** ("what am I looking for"), a **Key** ("what do I contain"), and a **Value** ("what do I pass on"). To decide how much token A should care about token B, you take the dot product of A's Query with B's Key. Do that for all pairs, scale, run a softmax so the weights sum to one, and use those weights to take a weighted sum of everyone's Values. The original formulation from *Attention Is All You Need* (Vaswani et al., 2017) is one line:
+
+```
+Attention(Q, K, V) = softmax(Q Kᵀ / √d_k) V
+```
+
+**Multi-head attention** runs several of these in parallel over different learned subspaces and concatenates the results. After attention, each token passes through a **feed-forward network** (a dense two-layer block), and that FFN holds most of the model's parameters. Remember that: during generation it is the FFN's weights, not the attention math, that dominate what you read from memory.
+
+One honest correction. The famous *Illustrated Transformer* diagram by Jay Alammar is an encoder-decoder built for translation. Modern LLMs (GPT, Llama, Mistral) are **decoder-only**: no encoder, no cross-attention, causal masking so a token attends only to tokens before it. Learn Q/K/V and softmax from those pictures, then drop the encoder from your model of how a production chat model runs. Knowing the difference is the line between a tourist's understanding and an engineer's.
+
+The cost to notice: that `Q Kᵀ` term compares every token to every other token, so for a sequence of length S the score matrix is S by S. Attention compute and its naive memory footprint scale with **S²**. Double the context, quadruple the attention cost. More on what that does to your bill shortly.
+
+## Prefill and decode have opposite bottlenecks
+
+This is the centerpiece. If you remember one thing past today: serving an LLM is two workloads stapled together, and they stress completely different hardware resources.
+
+**Prefill** is processing the prompt. All N prompt tokens enter the stack together as one big batched matrix multiply, so there is a lot of arithmetic relative to the memory you touch and the GPU's tensor cores stay busy. Prefill is **compute-bound** and runs at high utilization (90 to 95% model-FLOPs-utilization on an H100 is normal). It scales with that S² attention term, which is why a long prompt is expensive up front.
+
+**Decode** is generating the output, one token per step. To produce a single token you must still read every weight out of high-bandwidth memory (HBM), but you multiply each weight by a tiny slice of activation and move on. The ratio of useful math to bytes moved crashes. Decode is **memory-bandwidth-bound**: you are not waiting on the ALUs, you are waiting on the memory bus to hand you the next chunk of weights.
+
+The dividing line between these two regimes is a property of the hardware called the **ops:byte ratio**, and it is worth computing once so it stops being abstract. An A100 does about 312 teraFLOP/s and moves about 1.5 terabytes/s:
+
+```
+312e12 FLOP/s  ÷  1.5e12 byte/s  ≈  208 FLOPs per byte
+```
+
+That number, ~208 on an A100, is the **ridge point** of the roofline. Do more than ~208 useful FLOPs per byte pulled from memory and you are compute-bound; fewer and memory bandwidth is your limit. Prefill sits far above the line. Decode at batch size one sits *far* below it, around one op per byte, roughly two hundred times into the memory-bound regime. The DeepMind scaling book reports the same on newer silicon: the critical batch size where decode flips to compute-bound is about 240 on a TPU v5e and about 280 on an H100. Different chips, same shape.
+
+There is a clean cost primitive on top of this. One forward pass costs about **2·P FLOPs per token** (P is the parameter count, one multiply and one add per parameter), so a 70B model is about 140 GFLOP per generated token. That makes cost predictable, but notice what it does *not* tell you: at batch size one you are nowhere near using those FLOPs, because you cannot feed the tensor cores fast enough. The FLOP count sets a ceiling you are not hitting; bandwidth sets the floor you stand on. If you have read [latency and the tail](/blog/latency-throughput-tail), this is the same instinct on a GPU: the headline throughput number is real, and it is not the thing that limits you.
+
+## The KV cache: why it exists and what it costs
+
+Go back to the loop. At step *t*, attention needs the Keys and Values of all earlier tokens. The Key and Value for token 5 do not change once token 5 exists, so recomputing them at every later step is pure waste. Recomputing all prior K and V every step would make generation **O(n²)** in the sequence length, which is exactly the quadratic cliff you cannot afford.
+
+So you cache. Compute each token's K and V once, store them, and on every later step just read them back. This is the **KV cache**, and it converts the per-step attention cost from O(n²) recompute into O(n) read. It is not a nice-to-have speedup. It is the thing that makes autoregressive generation tractable at all.
+
+Here is the twist, and the bridge from architecture to economics: the cache trades compute for memory, and the memory it buys is exactly the resource that was already your bottleneck. You solved a compute problem by spending the scarce thing.
+
+Memorize the size formula, because it explains your batch ceiling. Per-token KV bytes are roughly:
+
+```
+2 (K and V)  ×  n_layers  ×  hidden_size  ×  bytes_per_float
+```
+
+Concretely, for OPT-13B from the PagedAttention paper: `2 × 40 layers × 5120 hidden × 2 bytes (fp16) = 800 KB per token`. The Anyscale writeup rounds this to "nearly 1MB of state for each token." Over a 2048-token sequence that is roughly **1.6 GB of KV cache for one request**. Per request. That is the number that ends up running your serving economics.
+
+## KV capacity, not FLOPs, caps your batch
+
+Make it concrete on a real card: a 40GB A100 serving a 13B model. Weights eat about 26GB and never move, leaving about 14GB for KV cache. At ~1MB per token, the math is brutal:
+
+- At 512 tokens per sequence: about **28 concurrent sequences**.
+- At 2048 tokens per sequence: about **7 concurrent sequences**.
+
+Read that again. The thing limiting how many users you serve in parallel, and therefore your cost per token, is not the model's FLOPs and not the GPU's compute. It is how much KV cache fits in the memory left over after the weights, and longer contexts shrink that number directly. This is the unglamorous fact behind every "why is our inference so expensive" conversation, and the LLM cousin of [capacity estimation](/blog/capacity-estimation): the constraint is a memory budget, and you back out concurrency from it. It also flips the [distributed cache](/blog/distributed-cache) intuition, where the cache is something you bolt on to relieve a database; here the KV cache is the primary constraint of the whole system.
+
+## Batching is nearly a free lunch (until it isn't)
+
+Because decode is bandwidth-bound, batching does something that feels too good to be true. At batch size one you pay a full weight-read from HBM to produce one token. Batch B requests through the same forward pass and you read the weights **once** to produce B tokens, amortizing the expensive resource across the whole batch, so you get roughly B times the throughput at roughly the same per-token latency.
+
+It is free for a checkable reason: you were wasting the compute units anyway, so you fill idle ALU cycles with other users' tokens while the same weights sit in registers. This holds until you cross the critical batch size (~240 to 280), where you saturate compute and adding requests finally costs latency like a normal system. Below that line, packing the GPU is the single biggest thing you can do for cost.
+
+This is *why* LLM serving economics revolve around concurrency. It is the same lesson as [Kafka versus queues](/blog/kafka-vs-queues): throughput on an expensive shared resource comes from amortizing a fixed cost (a weight read, a disk seek) across many units of work, not from making each unit faster.
+
+But naive batching leaves most of the win on the floor, and how it fails is instructive. **Static batching fails on the slowest member.** Group eight requests, run them together, and you cannot release the batch until the longest generation finishes. A request that wanted 20 tokens sits idle while one that wants 800 grinds on, and the GPU runs at the speed of the straggler. Head-of-line blocking, on a GPU.
+
+The fix, from the Orca paper (OSDI 2022) and popularized by Anyscale, is **continuous (iteration-level) batching**: schedule per forward pass instead of per request. The instant a sequence emits its end token, its slot frees and a queued request takes it on the next step, so the GPU stays packed with useful work instead of waiting for the batch to drain. The throughput difference is not marginal:
+
+| Scheduling | Throughput vs naive |
+| --- | --- |
+| Optimized static batching | ~4× |
+| Continuous batching | ~8× |
+| Continuous batching + paged KV | ~23× |
+
+Same model, same GPUs. The only variable is the scheduler and how it manages KV memory. Which brings us to the tax that the last row removes.
+
+## The fragmentation tax, and why vLLM mattered
+
+Continuous batching exposes a second problem. Store each sequence's KV cache as one contiguous block sized for the *maximum* possible length and you waste enormous amounts of memory: reserved-but-unused slots, internal fragmentation from over-provisioning, external fragmentation from blocks that do not fit the gaps. The PagedAttention authors measured it and the result is damning:
+
+> Only 20.4% to 38.2% of the KV cache memory is used to store actual token states in existing systems.
+
+Sixty to eighty percent of your most-constrained resource, the thing that caps your batch size and sets your cost, was being thrown away on bookkeeping. That is not a rounding error. That is the bill, doubled or tripled.
+
+PagedAttention (the technique behind vLLM, SOSP 2023) fixes it by stealing an idea from operating systems. Instead of one contiguous slab per sequence, KV cache lives in fixed-size **blocks** scattered across memory, with a page table mapping logical token positions to physical blocks, exactly like virtual memory pages a process's address space onto physical RAM. Fragmentation drops below 4%, which is most of the 2 to 4× throughput win and the bulk of why the table above jumps from 8× to 23×.
+
+The analogy earns a bonus the contiguous design could never offer: **prefix sharing**. Two requests with the same system prompt have identical KV for those leading tokens, so they can point at the *same* physical blocks copy-on-write instead of each storing a duplicate. You pay for the shared prefix once. The best systems ideas travel: the paging concept that runs your laptop now runs your inference cluster.
+
+## The knobs, and which bottleneck each one moves
+
+Once you hold the model "decode is bandwidth-bound, KV capacity caps the batch, attention is quadratic," every optimization in the field becomes legible as an attack on one of those three. A senior engineer reaches for the knob that moves the bottleneck they actually have.
+
+**GQA and MQA shrink the KV cache.** Multi-Query Attention (Shazeer, 2019) shares one Key/Value head across all query heads; Grouped-Query Attention (Ainslie et al., 2023) is the middle ground, with a few KV heads. Both cut per-token KV bytes by 4 to 8×, which directly relaxes the decode bottleneck: less to stream, more sequences fit, bigger batches. Frame these correctly. They are memory-bandwidth optimizations that happen to preserve quality, and that is why GQA is the default in Llama-2/3 and Mistral.
+
+**FlashAttention attacks the quadratic memory, not the math.** FlashAttention (Dao et al., 2022) computes *exact* attention but reorders the work, tiling so the S×S score matrix is built in fast on-chip SRAM and never materialized in slow HBM. Attention's bottleneck was always memory IO, so when someone proposes sparse attention for long context, the first question is whether they need to change the math or just stop writing the score matrix to HBM. Usually the latter.
+
+**Quantization moves the roofline.** Cut weights from fp16 to int8 or int4 and you roughly halve the bytes you move per token. In the bandwidth-bound decode regime that is close to a proportional throughput win. This is why "bigger model, same speed" is sometimes literally true: the cost is bytes, and you made the bytes smaller.
+
+**Disaggregated serving splits the two phases onto different hardware.** A single homogeneous pool always underuses the resource one phase is starved for, so the DeepMind scaling book and production systems split them: a compute-tuned pool for prefill, a bandwidth-and-capacity-tuned pool for decode, KV handed across. This also means you must measure the two phases separately, reporting MFU (model-FLOPs-utilization) for prefill and MBU (model-bandwidth-utilization) for decode rather than one blended "GPU utilization" that hides whichever phase is your real constraint. That is exactly the failure the agent-CLI observability work in [Aladeen](/case-study/aladeen) exists to prevent: you cannot tune a bottleneck you averaged away.
+
+**Speculative decoding buys multiple tokens per weight-sweep.** A small draft model proposes K tokens; the big model verifies all K in one batched forward pass. Because decode is bandwidth-bound, verifying K tokens costs about the same weight-read as generating one, so you trade a little verify compute for several saved weight reads. It is the batching insight pointed inward at a single sequence.
+
+When you know which resource is the constraint, the right optimization is usually obvious and the wrong one is usually the popular one. Same discipline as picking a [consistency model under CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) or choosing a [replication strategy](/blog/replication-strategies): the named technique is downstream of correctly identifying what is binding.
+
+## The misconceptions worth killing
+
+A few beliefs that sound right and will steer you wrong:
+
+**"The GPU is compute-bound, so buy more FLOPs."** For decode at realistic batch sizes you are bandwidth-bound; more HBM bandwidth and capacity buys far more than more TFLOPs.
+
+**"Attention is the expensive part of every step."** During decode the FFN and projection matmuls dominate, and attention over the cached KV is cheap; attention only dominates during prefill and long context, where it is quadratic.
+
+**"The KV cache is just a speed optimization."** It makes generation O(n) instead of O(n²), and it is simultaneously the memory constraint that caps your batch and dictates your cost. Load-bearing in two directions at once.
+
+**"Larger batches always hurt latency."** In the bandwidth-bound decode regime, batching adds throughput at near-constant per-token latency up to the critical batch size, because you reuse one weight-read across the batch.
+
+**"Context window is a setting you flip."** It is a real cost: quadratic attention at prefill, linear KV growth at decode. A bigger window is a capacity decision with a price tag.
+
+## Where this leaves a system designer
+
+The reframe, compressed: an LLM at inference is a bandwidth-bound streaming loop where one token is one full sweep of the weights out of memory; the KV cache keeps that loop from being quadratic, and the memory it eats caps how many requests you batch, which sets your cost per token. Every famous optimization attacks one of three constraints: the bandwidth, the cache, or the quadratic. The pattern is the same once you have the lens: find the scarce resource, amortize the fixed cost across as much work as you can, and do not pay for the quadratic when a linear read will do.
+
+This changes the questions you ask when designing around an LLM. You stop asking "is the model fast enough" and start asking "what is my batch ceiling at my context lengths, and what fragmentation am I eating." A [capacity estimate](/blog/capacity-estimation) for an LLM feature turns on the KV-bytes-per-token figure and the leftover-memory math, the same way request size and fan-out drive a [Design Twitter](/blog/design-twitter-feed) estimate. The ack-fast discipline behind [idempotent webhooks](/blog/idempotent-webhooks) is the same shape as decoupling a slow LLM call from a fast request path, and the [system design interview framework](/blog/system-design-interview-framework) instinct holds: name the bottleneck before you reach for a technique. I have leaned on exactly this building real systems, where the multi-agent pipeline in [IntelliFill](/case-study/intellifill) lives and dies by token economics across chained calls and the real-time hub in [NomadCrew](/case-study/nomadcrew) is the streaming-fan-out problem an LLM token stream rhymes with.
+
+The next time someone shows you a transformer diagram and says "attention lets the words look at each other," nod, then ask the question that actually predicts the invoice: what is reading the weights, how often, and out of which memory.
+
+## FAQ
+
+<FAQ />

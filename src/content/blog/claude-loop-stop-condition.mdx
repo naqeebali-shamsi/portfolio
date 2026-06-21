@@ -1,0 +1,118 @@
+export const meta = {
+  slug: 'claude-loop-stop-condition',
+  title: 'The Stop Condition Is the Feature: Running Claude Code Loops Like You Mean It',
+  description:
+    "Claude Code\'s /loop re-runs a prompt on a schedule or self-paces between one minute and one hour. Starting one is trivial. The engineering is the budget, the stop condition, the verification, and the observability you bolt on before you walk away.",
+  headline: 'The Stop Condition Is the Feature: Running Claude Code Loops Like You Mean It',
+  deck: "A loop that runs is a demo. A loop you can walk away from needs four things the CLI does not give you: a budget, a real stop condition, an independent check, and a way to see what happened.",
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '11 min',
+  tags: ['claude-code', 'ai-agents', 'automation', 'developer-tools', 'llm-ops'],
+  faq: [
+    {
+      q: 'What is the difference between /loop and /goal in Claude Code?',
+      a: '/loop is time-driven: it re-runs a prompt on a fixed interval, or in self-paced mode it picks a delay between one minute and one hour after each pass. /goal is condition-driven: it runs turn after turn with no scheduled gap, and a small fast model checks a completion condition after every turn and returns yes or no with a reason. Use /loop to poll something that changes over time, like a deploy or a PR. Use /goal to drive a task to a named end state, like tests passing, and bound it with a clause such as "or stop after 20 turns".',
+    },
+    {
+      q: 'Does Claude Code /loop have a cost or budget cap?',
+      a: 'No native dollar or token cap. The 7-day expiry bounds how long a recurring loop lives, not how much it spends, and a fixed-interval loop keeps firing the whole time. /goal will show you turns and token spend, but showing is not stopping. So the budget has to be something you encode yourself: a turn cap in the goal condition, an external wrapper, or simply not leaving a fixed-interval loop running while you sleep.',
+    },
+    {
+      q: 'Can a Claude Code loop verify its own work?',
+      a: 'Only weakly, and that is the trap. The /goal completion evaluator does not call tools, so it can only judge what Claude has already surfaced in the conversation. It reads the agent\'s report rather than re-running the work. A loop that convinces itself the tests passed can satisfy its own stop condition. Real verification means an independent check the loop cannot fake: a fresh process, a CI gate, or a reviewer that did not write the code.',
+    },
+    {
+      q: 'Are Claude Code loops durable across restarts?',
+      a: 'No. Loops are session-scoped. They live in the current conversation, and a fresh conversation clears them. They restore on --resume or --continue if unexpired, but if you restart Claude Code outside that they are gone. For unattended, durable scheduling the docs point you to Routines (cloud, minimum one-hour interval), Desktop scheduled tasks (local, survives restarts), or GitHub Actions. Treating /loop as production automation is the most common misuse.',
+    },
+  ],
+}
+
+Everyone posting the `/loop` command this week is making the same pitch. Claude Code can run itself now. Set it and forget it. The forget-it part is exactly where the money goes.
+
+That is the honest version of the feature. Starting a loop takes ten seconds. Knowing when it should stop, what it is allowed to spend, and whether the work it claims to have done is real, that is the actual engineering, and almost nobody automates it.
+
+This piece is about the four things you owe a process before you hand it your terminal and walk away. First, a fast and accurate read of what `/loop` actually is, because half the posts get it wrong, and getting it right is the whole basis for trusting anything I say next.
+
+## What /loop actually is
+
+`/loop` is a bundled skill in Claude Code, confirmed against the docs as of June 2026. It re-runs a prompt or a slash command automatically while your session stays open. It is a scheduling primitive that lives in the CLI, not a model capability, and it has three forms.
+
+`/loop 5m check the deploy` is the fixed-interval form. Claude converts the interval to a cron expression, confirms the cadence and an 8-character job ID, and keeps firing every five minutes until you stop it or until the 7-day expiry hits. A fixed loop never ends on its own.
+
+`/loop check the deploy`, with no interval, is the self-paced form. After each pass Claude chooses the next delay itself, somewhere between one minute and one hour, based on what it just observed. Short waits while a build is finishing or a PR is active, longer waits when nothing is pending. It prints the delay it picked and the reason. And it can end the loop itself by declining to schedule the next wakeup once the task is, in the docs' words, "provably complete."
+
+Bare `/loop` with no prompt runs a built-in maintenance routine at a self-chosen interval: continue unfinished work from the conversation, tend the current branch's PR, then run cleanup passes when nothing else is pending. Worth pointing at: that prompt is deliberately restrained. It will not start new initiatives, and irreversible actions like pushing or deleting only proceed when they continue something the transcript already authorized. You can replace it with your own by dropping a `.claude/loop.md` file.
+
+One detail that separates a real understanding from a headline read: for a self-paced loop, Claude may reach for the Monitor tool instead of re-prompting. The Monitor tool runs a background script and streams its output line by line, so the agent reacts to events as they happen. Re-running an entire prompt every interval is the wasteful way to watch something. Polling is the lazy mental model. Eventing is the one an engineer reaches for, and the tool already supports it.
+
+Stopping a loop is a keypress. Press `Esc` while it is waiting for the next wakeup and the pending fire clears. Under the hood it all runs on three tools, `CronCreate`, `CronList`, and `CronDelete`, so "what scheduled tasks do I have" and "cancel the deploy check job" work in plain English too. Set `CLAUDE_CODE_DISABLE_CRON=1` and the whole machinery goes away.
+
+That is the feature. It is genuinely good. Now the part the demos skip.
+
+## The loop is the easy ten percent
+
+The loop is the trivial part. The hard ninety percent is the four conditions you would never let a junior engineer skip if you handed them your credit card and a terminal and left for the weekend.
+
+A budget. A definition of done. A way to check the work that the worker cannot game. And a way to see what happened while you were gone. The CLI gives you the loop. You supply those four, and skipping any one of them is how a convenience turns into a slow leak.
+
+### Budget
+
+`/loop` has no native dollar or token cap. This is the single most important sentence in the post, so sit with it. The 7-day expiry bounds how long a recurring loop lives. It does not bound how much that loop spends in those seven days, and a fixed-interval loop fires the entire time regardless of whether there is anything to do.
+
+Do the arithmetic on the canonical example. `/loop 5m check the PR` wakes twelve times an hour. Left running overnight against a fat context window, that is a few hundred full prompt executions while CI sat idle and nothing changed. No alert. No line item until the bill arrives.
+
+`/goal`, the sibling command, will show you turns and token spend as it runs. That is real and useful, and I will give it full credit in a moment. But showing is not stopping. A counter on the dashboard does not halt anything when it crosses a number you care about. So the budget has to be something you encode. The cleanest lever is a turn cap written into the goal condition itself, a clause like "or stop after 20 turns" that puts a hard ceiling on the blast radius. Failing that, an external wrapper, or the oldest control there is: do not leave a fixed-interval loop running while you sleep.
+
+### Stop condition
+
+This is the whole ballgame, and it is where the `/loop` versus `/goal` distinction earns its keep.
+
+`/loop` is time-driven. It wakes on a clock. `/goal` is condition-driven. It runs turn after turn with no scheduled gap, and after every turn a small fast model evaluates whether a completion condition holds and returns a yes or no plus a reason. If "done" is a state you can actually name, tests green, the queue empty, a file under N lines, then a timer is the wrong instrument. You want the condition.
+
+Most people reach for `/loop` because it is the one in the headlines, point it at a finished task, and then wonder why the agent keeps cheerfully "working." The task was done an hour ago. The clock did not know that, because a clock cannot know that. A condition can.
+
+### Verification
+
+Here is the subtle trap, and the most valuable paragraph in the piece. The `/goal` completion evaluator does not call tools. It can only judge what Claude has already surfaced in the conversation.
+
+Read that again with a skeptical eye. The verifier reads the agent's homework. It does not redo the homework. So if the agent says "I ran the tests and they passed," and the agent is wrong, or the agent skipped a step, or the agent hallucinated a green checkmark, the evaluator sees a confident report and signs off. A loop that talks itself into "done" satisfies its own stop condition and keeps right on going, or worse, stops and tells you it succeeded.
+
+This is not a knock on the design. Re-running tools inside the evaluator would make it slow and expensive, and the cheap-evaluator tradeoff is reasonable. The point is what it means for you: self-judgment is not verification. Real verification is an independent check the loop cannot fake. A fresh process that re-runs the suite. A CI gate the agent does not control. A reviewer that did not write the code. The discipline I have settled on in my own multi-agent work is that the reviewer is never the author, and the checker runs in a context the worker cannot reach into and edit. A loop that grades its own exam will pass every time.
+
+### Observability
+
+When a loop has been running unattended for an hour, three questions decide whether you are fine or in trouble. What did each iteration actually do. What did each one cost. Where did it start going sideways, and how long ago.
+
+The native surfaces are a start. The self-paced loop prints its chosen delay and reasoning every pass. `CronList` shows you the scheduled tasks. `/goal` shows turns and spend. These are useful, and they are not a system. They are scattered across the transcript and the task list, and reconstructing "what happened over the last forty minutes" from them after the fact is its own chore. Knowing what an autonomous loop did, after it did it, is a real problem, and it is the gap I keep running into in my own work, which is part of why agent session observability is a thing I have been building toward rather than something I can point at as solved.
+
+## A mental model to keep
+
+Treat an autonomous loop like a contractor you cannot supervise.
+
+You do not hand a contractor the keys to your house and leave for a week without four things settled. A budget, so the job cannot quietly cost ten times the quote. A definition of done, so you both know when it is finished. An inspection by someone other than the contractor, so "it's done" means something. And a way to see what was done while you were out. The CLI hands you the contractor. You bring the budget, the definition of done, the inspection, and the camera.
+
+The shorter version, the one to actually remember: the interval is trivia. The exit condition is the design.
+
+## One task, two operational characters
+
+Take the example everyone uses, babysitting a PR, and run it both ways.
+
+The naive move is `/loop 5m check the PR`. It wakes every five minutes forever. It burns tokens while CI sits idle. It has no idea what "done" means, so it never stops, and the 7-day expiry is the only thing that eventually puts it out of its misery. If you forget it exists, it quietly spends for a week.
+
+The engineered move is `/goal CI on this PR is green and all review threads are resolved, or stop after 15 turns`. Now it runs only when there is a turn to run, instead of on a blind timer. It stops on a real end state, green and resolved, the moment that state is true. The turn cap bounds the worst case so a stuck loop cannot run away. And the evaluator surfaces its reasoning each turn, so you can read why it thinks the work is not done yet. Same task. Completely different behavior under the hood, and only one of them is safe to walk away from.
+
+I am keeping that qualitative on purpose. I am not going to invent a dollar figure or a token count I did not measure, because the structural claim, there is no native budget cap, is more honest and ages better than any horror story I could manufacture.
+
+## The honest landing
+
+A few things skeptics overstate, so let me be fair. Self-paced `/loop` is not unbounded. It can stop itself when work looks provably complete, and the maintenance prompt is genuinely conservative about irreversible actions. `/goal` does have a real cost-visibility story, and its evaluator runs on a cheap fast model, so the checking itself is not the expense. The gap is enforcement and independence, not visibility. And one asterisk worth knowing: on Bedrock, Vertex, and Microsoft Foundry the behavior differs, a no-interval `/loop` runs on a fixed ten-minute schedule and `loop.md` is not read.
+
+`/loop` and `/goal` are well-designed primitives, and they are a real step up from the brute-force `while true` agent loops people hand-rolled for the last year. The gap I have described is not a flaw to dunk on. It is the layer every serious user has to supply on top, and that layer, the budget, the stop condition, the independent check, the visibility, is the actual work. The command is ten seconds. The engineering is everything you wrap around it.
+
+Claude Code ships fast, so check `claude --version` and the current scheduled-tasks page before you copy any syntax from here. The mechanics move. The discipline does not.
+
+## FAQ
+
+<FAQ />

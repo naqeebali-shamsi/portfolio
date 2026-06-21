@@ -1,0 +1,139 @@
+export const meta = {
+  slug: 'cost-optimization',
+  title: "Cloud Cost Optimization: A Senior Engineer's Lens on the Bill",
+  description:
+    "Where cloud money actually leaks and how a senior engineer cuts it without breaking reliability. Right-sizing, the data-transfer tax, commitments, unit cost.",
+  headline: "Cloud Cost Optimization: A Senior Engineer's Lens on the Bill",
+  deck: 'Cost is a non-functional requirement you trade against reliability and velocity, not a virtue you chase to zero.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['cloud', 'cost-optimization', 'finops', 'aws', 'architecture', 'system-design'],
+  faq: [
+    {
+      q: 'What is the most common surprise on an AWS bill?',
+      a: "Data transfer, and specifically the NAT gateway. Same-AZ traffic over private IPs is free, but cross-AZ is about 0.01 USD per GB each direction, and anything routed through a NAT gateway adds about 0.045 USD per GB on top. The classic incident is S3 traffic defaulting through the NAT instead of a free S3 gateway endpoint. Geocodio paid 907.53 USD in a single day this way for roughly 20 TB of NAT processing. The compute line is visible and everyone watches it. The transfer line is the one nobody reads until it spikes.",
+    },
+    {
+      q: 'Should I always use Spot instances to save money?',
+      a: 'Only for work that is stateless, interruptible, and checkpointable. The headline Spot discount of 60 to 90 percent is real, but it is a discount on interruptible capacity, not on compute in general. AWS can reclaim a Spot instance on about two minutes notice. If you put a stateful database or a latency-critical request path on Spot, the recovery cost from restarts, warmups, and queue backlog can quietly claw the discount back. The discipline is to measure cost-after-interruption rather than headline price, and always keep an on-demand baseline underneath.',
+    },
+    {
+      q: 'Does a lower cloud bill mean better engineering?',
+      a: 'No. Cost is a tradeoff, not a virtue. Cutting reliability headroom to shave 10 percent off the bill can be a net-negative decision. The metric that actually matters is unit economics, the cost per customer or per request or per tenant, not total spend. A healthy growing business often sees its total bill rise while cost-per-unit falls, which is the correct direction. Driving total spend down while the business grows can mean you are starving capacity.',
+    },
+    {
+      q: 'When should I stop optimizing cloud cost?',
+      a: 'When the marginal saving drops below the marginal engineering cost. Engineer-hours are not free. If a week of senior time saves 200 USD per month, the payback is measured in years, which is rarely worth it. The senior move is to do the cheap structural fixes first, gateway endpoints, scheduled shutdowns of non-prod, reserved capacity on a measured floor, and then stop. FinOps calls this incremental and value-bounded. Optimizing everything is its own anti-pattern.',
+    },
+    {
+      q: 'Is repatriation off the cloud cheaper than staying on it?',
+      a: 'Sometimes, and the answer is specific to your scale and your unit economics. 37signals projected over 10 million USD in savings across five years by leaving AWS, buying about 700K USD of servers and 1.5M USD of storage that costs under 200K USD per year to run. But repatriation headline numbers routinely ignore the people, real estate, and resilience costs the cloud was quietly absorbing. The senior question is not which side is right in general, it is where your own crossover point sits.',
+    },
+  ],
+}
+
+The cloud bill is the one production system nobody reviews until it pages them. It accrues silently, line by line, while everyone is shipping features, and the first time most teams read it closely is the month it doubles. By then the leak has been running for weeks.
+
+That gap is where the money goes.
+
+The instinct, when the number finally gets attention, is to start cutting. Turn off the thing nobody is using, pick a smaller instance, delete some old snapshots. It feels productive. It is also the junior move, because it skips the only step that tells you whether you are cutting waste or cutting capacity. This piece is about the other lens: where cloud money actually leaks, how a senior engineer closes the leaks without breaking the things the spend was buying, and why the goal was never a smaller bill in the first place.
+
+## Cost is a non-functional requirement
+
+Start with the framing, because it changes every decision downstream. Werner Vogels, who has watched more cloud bills than anyone alive, puts cost first among his Frugal Architect laws: make cost a non-functional requirement. It sits alongside availability, latency, and security as a property of the system you judge continuously while it runs, not a number you reconcile once a quarter after Finance asks.
+
+That sounds like a platitude until you notice what it rules out. If cost is an NFR, then "we saved 30 percent" is an incomplete sentence the same way "we made it faster" is incomplete without saying what you traded. Vogels is blunt about the direction this points: the goal is to maximize value, not to minimize cost. Architecting is a series of tradeoffs, and cost is traded against resilience and performance like everything else. Sometimes the correct call is to spend more.
+
+This is also why the second instinct after "cut things" is wrong. Total monthly spend is the wrong number to optimize. A healthy business's bill grows, because it is serving more customers. The metric that survives contact with a growing business is unit economics, the cost per customer or per request or per tenant. Spend can go up while cost-per-unit goes down, and that is the win. CloudZero builds an entire practice on this single inversion, and it is the difference between an engineer who reports "the bill went up 20 percent" in a panic and one who reports "we added 40 percent more customers at 15 percent lower cost each." The first is reading the wrong gauge.
+
+If you have done [capacity estimation](/blog/capacity-estimation) for a system design, you already have the mental machinery. The same back-of-envelope that tells you how many machines a workload needs at peak tells you what it costs, and the same p90 numbers that size for load are the ones that size for spend.
+
+## You cannot optimize what you cannot see
+
+Vogels's fourth law is the one teams skip and then regret: unobserved systems lead to unknown costs. Before you cut anything, you attribute. Tag resources to owners, products, and customers, so that when a number moves you can say which workload moved it and who is accountable. AWS makes the same point as the last of its five Well-Architected cost principles: attribute expenditure to revenue streams and individual workload owners, so the people with the lever to optimize can actually feel the spend.
+
+This is not bureaucracy, and dismissing it as bureaucracy is the single most expensive mistake in the discipline. Without attribution you cannot tell waste from value, so every optimization becomes a guess that nobody owns. The pattern is consistent across orgs: someone runs a cleanup sprint, the bill dips, and a month later the same waste is back, because the cleanup fixed symptoms while nobody owned the cause. FinOps names this directly, optimization without ownership context, and it is why the hard part of cost work is organizational rather than technical. The dashboard is the easy purchase. Making an owner feel their spend is the actual unlock.
+
+The same instinct you bring to [metrics, logs, and traces](/blog/observability-three-pillars) for reliability applies to cost. Cost is just another signal, and the mechanism that catches a cost anomaly at 2 a.m. is the same shape as the one that catches a latency regression: a baseline, a threshold, and an alert that names the owner. Geocodio's five-figure incident, which we will get to, was caught by exactly this, AWS Cost Anomaly Detection flagging a spike before it ran for a full month.
+
+## Where the money actually leaks
+
+Three leaks dominate almost every bill. None of them is the thing people stare at.
+
+### Idle and over-provisioned compute
+
+This is the visible one, and it is still badly mismanaged. AWS's own right-sizing guidance is concrete: an instance whose max CPU and memory stay under 40 percent over four weeks is a right-sizing candidate, and halving its size is a clean cut on that resource. The discipline that separates senior from junior here is the measurement window. Right-size against p90 or p95 utilization over weeks, not against a single snapshot you happened to catch at 3 p.m. on a Tuesday. A snapshot tells you nothing about the spike at midnight when the batch job runs, and right-sizing into that spike is how you trade a few dollars of headroom for a latency incident.
+
+Kubernetes makes the gap worse, because the waste hides one layer down in resource requests. Pods reserve what their requests declare, so a request set to worst-case reserves worst-case forever, even though most pods use 20 to 30 percent of the CPU they ask for. The documented gap between requested and actual CPU runs as high as 8x. The fix is two moves: set requests at p90 actual with limits at two to three times that, then [bin-pack](/blog/autoscaling) the pods onto fewer, fuller nodes and let a descheduler rebalance as things drift. A first right-sizing pass typically lifts node utilization 20 to 40 percent. The tradeoff to name out loud: tighter requests mean less burst headroom per pod, so you are betting that your p90 estimate holds under the next traffic surge. When it does not, pods get throttled or evicted, which is why you measure before you tighten and watch closely after.
+
+### The data-transfer tax nobody reads
+
+Here is the leak that produces the war stories, because it stays invisible until it spikes. The bytes moving around your network have prices, and the prices are not intuitive.
+
+```text
+Within an AZ, over private IPs   : free
+Cross-AZ, each direction         : ~0.01 USD/GB  (so ~0.02 round trip)
+NAT gateway data processing      : ~0.045 USD/GB  (on top of transfer)
+Internet egress, first tier      : ~0.09 USD/GB  (after 100 GB/mo free)
+S3 / DynamoDB gateway endpoint   : free  (bypasses the NAT entirely)
+```
+
+(Re-confirm the exact current tiers against the AWS pricing calculator at build time, because AWS adjusts them. The shape is what matters here, and the shape is stable.)
+
+Read that table once and a whole class of incident becomes obvious. Geocodio ran into the canonical version: their S3 sync traffic was routing through the NAT gateway at 0.045 USD per GB, and one day it moved 20,167 GB. The bill for that single day was 907.53 USD, with the month already past 1,000 USD, and AWS Cost Anomaly Detection is what flagged it. The root cause was a default. S3 traffic took the NAT path because nobody had told it to take the free one. The fix was an S3 gateway VPC endpoint, which AWS describes as completely free, no hourly charges and no data-transfer charges, and the whole repair was effectively a two-line Terraform change adding the endpoint and its route. A five-figure annualized leak, closed by routing the same bytes down a free path instead of a taxed one.
+
+The cross-AZ version is subtler and more deliberate. A chatty service doing 10 TB a month of inter-AZ traffic pays roughly 200 USD a month in pure network fees for chatter that would cost zero inside a single AZ. You can reclaim most of it with topology-aware routing or same-AZ read replicas. But be honest about what the AZ boundary is for: multi-AZ exists for availability, and collapsing to a single AZ to dodge the transfer fee is a reliability decision wearing a cost costume. It can be the right call. It is never an accounting one, and treating it as one is how a "cost optimization" quietly removes the redundancy that was the whole point. The deeper truth is that egress pricing is designed to make your data sticky. Treat it as an architectural force, the gravity that shapes where you put data, where you compute, and whether multi-cloud is even economically sane. The same forces that drive [database sharding](/blog/partitioning-sharding) decisions, keeping related data and its compute close, double as cost forces, because co-located data does not cross a priced boundary.
+
+### The forgotten long tail
+
+The third leak is pure neglect. Unattached EBS volumes survive instance termination unless someone set "delete on termination." Orphaned snapshots accrue. Since early 2024, AWS charges about 0.005 USD per hour, roughly 3.65 USD a month, for every Elastic IP you allocated and never associated. Each item is small. In aggregate, orphaned resources are widely cited as 20 to 30 percent of wasted spend in large orgs, and the reason is structural: nobody owns the resource a deleted thing left behind, which loops straight back to attribution being the precondition for everything.
+
+## Match the purchase model to the workload's shape
+
+Once you have measured, the next lever is how you buy. The mistake is treating every workload as one shape and reaching for one discount.
+
+| Workload shape | Buy this | Why, and the trap |
+| --- | --- | --- |
+| Steady baseline, long-lived | Reserved Instances or Savings Plans | 30 to 75 percent off, but it is a 1 to 3 year liability. Commit to a measured floor, not a guess. |
+| Stateless and interruptible | Spot | 60 to 90 percent off, but you must design for the 2-minute eviction and measure cost-after-interruption. |
+| Spiky and unpredictable | On-demand plus autoscaling | No commitment, you pay the premium for flexibility and let capacity track demand. |
+| Variable top on a steady base | RI/SP on the floor, autoscale above | Commit to what you always run, flex the rest. The common right answer. |
+
+The Spot trap deserves its own paragraph, because "Spot is 90 percent cheaper, use it everywhere" is the most expensive piece of folk wisdom in cloud cost. Spot is cheaper interruptible compute, and the word that matters is interruptible. AWS reclaims the instance on a two-minute notice. For a stateless batch worker that checkpoints to durable storage, that is fine, the job restarts and you keep the discount. For a stateful service or a latency-critical path, the recovery cost from restarts, JVM warmups multiplied by restart frequency, queue backlog, and cascading evictions silently eats the savings. The discipline is to instrument cost-after-interruption, not headline price, keep an on-demand baseline underneath so a capacity reclaim cannot take you fully down, and flush state to durable storage on the eviction notice. Teams running Spot at scale without measuring recovery are flying blind on whether their savings are even real.
+
+The commitment trap is quieter. Reserved Instances and Savings Plans feel like free money, 30 to 75 percent off, and they are a 1 to 3 year liability against a baseline. Commit to a baseline you have not measured and over-commitment becomes its own waste, capacity you are contractually paying for and not using. The order is fixed: right-size first, then commit to the floor that remains, then autoscale the variable part above it. Commit before you right-size and you lock in your own waste for three years.
+
+This is the same workload-shape thinking that runs through [the system design interview framework](/blog/system-design-interview-framework). You do not pick a technology and then find a workload for it. You characterize the workload, its shape over time, its tolerance for interruption, its baseline versus its peak, and the purchase model falls out of that. The autoscaler that follows demand for [autoscaling](/blog/autoscaling) reliability is the same autoscaler that keeps you off the on-demand premium during the trough.
+
+## Managed services are a priced choice, not free convenience
+
+AWS's fourth principle is to stop spending on undifferentiated heavy lifting, let the provider own the racking and patching. This is genuinely good advice and it is also where a particular kind of waste creeps in, because "managed" gets mentally filed under "free convenience."
+
+It is not free. RDS, Fargate, and Lambda all carry a premium over the self-managed equivalent, and the premium is real and recurring. The senior treatment is to price it as a line item and compare it against the total cost of self-managing, which crucially includes the engineer-time you would otherwise spend babysitting infrastructure. Most of the time the managed premium wins, because the engineers you are not paying to patch a database are worth more than the markup. But "most of the time it wins" is a conclusion you reach by pricing it, not a default you assume. The failure mode is reaching for the managed service reflexively and being surprised later when a fleet of small managed databases costs more than the team that could have run two large self-managed ones. Decide it consciously, the way you would decide [LSM-tree vs B-tree](/blog/lsm-tree-vs-btree) for a storage engine, by knowing the cost of each path rather than defaulting to the familiar one.
+
+## The cost of optimizing is itself a cost
+
+Here is the nuance that separates a staff engineer from an enthusiastic one: engineer-hours are not free, and they are usually your most expensive resource. If a week of senior time saves 200 USD a month, the payback is measured in years, and you have spent a scarce, expensive resource chasing a cheap one.
+
+So the work is bounded. Do the cheap structural fixes that pay back in weeks, gateway endpoints that close a NAT leak, scheduled shutdowns of non-prod, reserved capacity on a measured floor, and then stop. AWS's own consumption-model example is almost embarrassingly cheap to capture: a dev and test fleet used about 8 hours a weekday but left running 24/7 burns 168 hours to use 40, so stopping it when idle is roughly a 75 percent saving on that fleet, a 4,000 USD non-prod bill dropping to about 1,000 USD, for the cost of a scheduler. That is the kind of fix you do. A three-week re-architecture to shave 5 percent off a service that is not on a growth path is the kind you defer. FinOps calls the right posture incremental and value-bounded, and it is the same judgment as knowing when a system is fast enough and further latency work is not worth the complexity.
+
+There is a deeper reason the work never fully finishes, and it is Vogels's seventh law: unchallenged success leads to assumptions. Last quarter's perfect right-sizing is this quarter's waste, because the workload moved. Right-sizing decays. It is a recurring job with a feedback arrow, measure, attribute, right-size, commit to the floor, autoscale the top, re-measure, not a milestone you hit once and frame on the wall.
+
+## The honest macro picture
+
+Zoom out, because the biggest cost decisions are architectural and they do not have a universal answer. a16z made the loud case that cloud cost can reach roughly 50 percent of cost of goods sold at scale, and estimated that this suppresses something like 500 billion USD of market value across the broader software universe. Their thesis lands as a line worth remembering: you are crazy if you do not start in the cloud, and crazy if you stay on it at scale. Infrastructure spend, they argue, has to be a first-class metric.
+
+37signals took that seriously and left, projecting over 10 million USD saved across five years, buying about 700K USD of Dell servers and 1.5M USD of Pure Storage, 18 petabytes, that costs under 200K USD a year to run against a roughly 3.2 million USD annual AWS bill. Real money, real hardware, real savings.
+
+And then the counterweight, because a senior engineer holds both. Corey Quinn's rebuttal is that repatriation headline numbers routinely ignore the people, the real estate, and the resilience the cloud was quietly absorbing, the on-call rotation for hardware, the data-center contracts, the redundancy you now have to build yourself. Put the three together, a16z's paradox, 37signals's exit, Quinn's nuance, and they converge on one conclusion: there is no universal answer, only your unit economics at your scale. "Cloud bad" and "cloud good" are both junior positions. "Where is our crossover, given our actual cost-per-customer and our actual ops capacity" is the staff-grade one. And it connects to the reliability work you would do for [multi-region and DR](/blog/multi-region-dr) anyway, because the redundancy the cloud sells you is precisely the cost line repatriation forces you to rebuild and own.
+
+## How a senior decides
+
+Strip away the tactics and a posture remains. Measure before you cut, because cutting blind is as likely to remove capacity as waste. Attribute spend to owners, because optimization without ownership decays back to baseline within a month. Optimize the unit cost, not the total, because a growing business should see its bill grow. Treat every cut as a tradeoff and name what it costs, the headroom, the blast radius, the availability margin, so the saving and the risk are weighed in the same sentence. Push cost into the loop the way you push tests, tag at provision time, surface cost diffs in pull requests, alert on anomalies, so the bill stops being a quarterly surprise and becomes a signal you read continuously. And know when to stop, because the engineer-hours you spend optimizing are the most expensive resource in the equation.
+
+The reflex to chase a smaller bill is the one to distrust. The bill was never the goal. The goal is the most business value per dollar, which sometimes means spending more, often means leaving a workload exactly as it is, and always means knowing which of your bytes are crossing a priced boundary at 2 a.m. Get that lens right and the cloud bill stops being the system that pages you and becomes one more thing you engineer on purpose.
+
+## FAQ
+
+<FAQ />

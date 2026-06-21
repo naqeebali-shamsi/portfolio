@@ -1,0 +1,200 @@
+export const meta = {
+  slug: 'design-twitter-feed',
+  title: 'Design Twitter/X: Timeline Fan-Out and the Hybrid Push/Pull Model',
+  description:
+    'A home timeline is a fan-out problem, not a storage one. How push, pull, and the hybrid that fixes the celebrity hot key actually work, with the numbers.',
+  headline: 'Design Twitter/X: Timeline Fan-Out and the Hybrid Push/Pull Model',
+  deck: 'The architecture is a function of the graph, and the celebrity is where every pure strategy goes to die.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '15 min',
+  tags: ['system-design', 'distributed-systems', 'twitter', 'fan-out', 'caching', 'scalability'],
+  faq: [
+    {
+      q: 'What is fan-out in a social timeline, and why is it the hard part?',
+      a: 'Fan-out is delivering one write to many destinations: when you post, the tweet has to reach every follower\'s home timeline. It is the hard part because Twitter ingests only about 4,600 tweets per second, which is trivial, but with an average of 75 followers per tweet that becomes roughly 345,000 writes per second into home-timeline caches. The load lives in the edges of the follow graph, not in storing the tweets themselves, so the system is read-heavy and write-amplified at the same time.',
+    },
+    {
+      q: 'What is the difference between fan-out-on-write and fan-out-on-read?',
+      a: 'Fan-out-on-write (push) materializes every follower\'s timeline at post time by writing the tweet id into each follower\'s list, so reads are a cheap O(1) lookup. It pays the cost once and amortizes it across many reads, which suits a 50:1 read:write workload. Fan-out-on-read (pull) stores the tweet once and assembles the timeline at read time by gathering recent tweets from everyone you follow and merge-sorting them. Push makes writes expensive and reads cheap; pull makes writes cheap and reads expensive. Neither is naive; each is correct for a different graph shape.',
+    },
+    {
+      q: 'Why does the hybrid push/pull model exist?',
+      a: 'Pure push breaks on celebrities. An account with 31 million followers means 31 million inserts per tweet, and just reaching the first million followers takes about 3.5 seconds at the median, so the write path saturates and replies can arrive before the tweets they reply to. The hybrid stops fanning out high-follower accounts entirely and instead merges their freshly pulled recent tweets into each reader\'s precomputed timeline at read time. Push handles the long tail of normal users; pull handles the head of the follower distribution.',
+    },
+    {
+      q: 'Is there a magic follower threshold that flips push to pull?',
+      a: 'No. The commonly cited 10,000-follower cutoff is folklore. The real boundary is an economic break-even: push an account if the cost of fanning out its writes is less than the aggregate cost of merging its tweets live on every read. That line moves with cache hit rates, how active the followers are, and the hardware, so any hard number should be treated as illustrative rather than a constant.',
+    },
+    {
+      q: 'Why did Facebook choose pull when Twitter mostly pushes?',
+      a: 'Graph shape decides it. Facebook\'s friend graph is bidirectional and bounded at around 5,000 friends, and the feed is heavily ranked by machine learning at read time rather than shown chronologically. When you must rank at read time anyway, precomputing a chronological list buys almost nothing, so Facebook runs an aggregator-and-leaf scatter-gather pull. Twitter\'s follow graph is unidirectional and unbounded into the tens of millions, which makes write fan-out the bottleneck for celebrities and pushes it toward push plus a hybrid.',
+    },
+  ],
+}
+
+Open your home timeline and the app feels like it is reading a list. It is not. By the time those tweets reached you, the hard work was already done, minutes or hours ago, scattered across thousands of machines, the instant each of the people you follow hit post. You are looking at the answer to a question that was computed in advance and left waiting for you to show up. That is the whole trick, and it is also the whole trap.
+
+The instinct when someone says "design Twitter" is to reach for storage. Where do the tweets go, how do we shard them, what database holds 500 million posts a day. Wrong target. Ingest is trivial. The load that actually melts is delivery: turning one person's single write into millions of other people's reads, fast, and not falling over when one of those writers has thirty million followers.
+
+This piece is about that delivery problem, the two pure strategies for it, why both fail, and the hybrid that real systems converge on. If you have not read [the system design interview framework](/blog/system-design-interview-framework), the short version is that you start by finding the load parameter that dominates everything else. For a social feed, that parameter is fan-out.
+
+## The load is fan-out, not tweets
+
+Here is the reframe that separates people who have built this from people who have only diagrammed it. Martin Kleppmann puts it cleanly in *Designing Data-Intensive Applications*, and it is worth memorizing because it reorganizes the entire problem.
+
+Twitter ingests roughly 4,600 tweets per second on average, with peaks above 12,000. As a write rate, that is nothing. A single Postgres box on a good day handles that. If storing tweets were the job, this would not be an interview question.
+
+But each tweet has to be delivered to everyone who follows the author, and the average tweet reaches about 75 followers. So the real write load is not 4,600 per second. It is:
+
+```
+Tweets ingested:        ~4,600 tweets/sec  (avg)   ; >12,000/sec at peak
+Avg followers/tweet:    ~75
+Home-timeline writes:   4,600 x 75  =  ~345,000 writes/sec   <- the real load
+Reads (home timeline):  ~300,000 QPS
+Read:write ratio:       ~50:1
+```
+
+One logical write became 345,000 physical writes. That is write amplification, and it is the actual shape of the system. Twitter is read-heavy, around 300,000 read QPS against roughly 6,000 write QPS, but every one of those writes detonates into seventy-five more. The workload is read-dominated and write-amplified at once, which sounds contradictory until you see that the amplification is the price you pay to make the reads cheap.
+
+That tension is the entire design space. Everything below answers one question: when do you pay the fan-out cost, at write time or at read time?
+
+## Fan-out-on-write: precompute the answer
+
+The first strategy pays the cost up front. It is called fan-out-on-write, or push, and the mental model is precomputation: when you post, the system immediately writes your tweet into every follower's home timeline, so that when a follower opens the app, their timeline is already sitting there, assembled.
+
+Concretely, on post, the fan-out service looks up your followers in the social graph, then for each follower it appends a small entry to that follower's timeline list. Twitter's production version of this stores each home timeline as a Redis list, and the entry it pushes is not the tweet. It is a 20-byte tuple: an 8-byte tweet id, 4 bytes of flags, and an 8-byte author id. The append is a server-side `RPUSHX`, fanned out to roughly 4,000 destinations at a time, and each timeline is replicated three times.
+
+A read then becomes almost free. Grab the already-materialized list of ids for this user and you have the skeleton of their timeline in one lookup. Twitter reported this path served a poll-based home timeline at 1 millisecond at the median and 4 milliseconds at the 99th percentile, at over 300,000 QPS. The expensive merge-and-sort happened at write time, once, and every reader since has been collecting the dividend.
+
+This is the right default for Twitter's workload precisely because of that 50:1 ratio: you pay the fan-out cost a single time on write and amortize it across the fifty-odd reads that follow. When reads vastly outnumber writes, moving work from the read path to the write path is almost always the trade you want. The same logic drives why [the distributed cache](/blog/distributed-cache) sits in front of nearly every read-heavy service: precompute, store, serve cheap.
+
+But notice what you have actually built. You have not stored timelines. You have stored an index of ids, and the tweet bodies live somewhere else entirely.
+
+## The index is not the content
+
+This is the storage mistake that quietly sinks a lot of designs in interviews, so it is worth stating flatly: the timeline cache stores tweet ids, not tweets.
+
+Each Redis entry is 20 bytes. The actual tweet text, the author's display name and avatar, the like and retweet counts, none of that is in the timeline. The timeline is a skeleton. To turn it into something a human can read, you hydrate it: take the list of ids, fan out a multiget to the services that own the real objects, and stitch the results together. At Twitter, tweet bodies come from a service called Tweetypie, user objects from one called Gizmoduck. The cache holds the index; hydration assembles the content.
+
+```
+Redis timeline (skeleton)        Hydration (multiget)           Result
+[ id, id, id, ... <=800 ]  --->  Tweetypie  (tweet bodies)  --->  assembled
+                                  Gizmoduck  (user objects)        timeline
+```
+
+Why this matters beyond pedantry: it is what keeps fan-out affordable. If push wrote full tweet bodies into thirty million followers' timelines, you would be copying the same kilobyte of text thirty million times and the memory cost would be absurd. By fanning out only a 20-byte id, the duplicated data per follower is tiny, and the one canonical copy of the tweet lives in exactly one place. Storing references and resolving them late is a recurring move in systems design, and it is the same instinct behind how [the URL shortener](/blog/url-shortener) keeps a compact key and resolves to the real target on demand.
+
+It also means a single timeline is bounded and cheap. Twitter caps each home timeline at about 800 entries, so the maximum a user's materialized timeline costs is roughly 16 KB. You are never scrolling back three years; the cache holds the recent window and forgets the rest.
+
+## Two things push refuses to do
+
+Push is elegant for the common case, and then reality sends two bills it cannot pay.
+
+The first bill is inactive users. Fan-out-on-write delivers to every follower, but most followers are not looking. If you fan a tweet out to someone who has not opened the app in 30 days, you spent writes to materialize a timeline nobody will read. Twitter's answer is to materialize timelines only for active users, those who logged in within the last 30 days, and to reconstruct a dormant user's timeline on demand when they return. That trims the waste, but it converts the problem into a different one: a rebuild storm. When a dormant user comes back, you have to reconstruct their ~800-entry timeline by pulling from everyone they follow, right then, which is a burst of read work exactly when you were not expecting it.
+
+The second bill is the one that actually breaks the model, and it deserves its own section.
+
+## The celebrity is where push dies
+
+Push assumes fan-out is bounded by a sane number, and the system was designed around the 75-follower average. The follow graph, however, is a power law, and the tail of a power law does not care about your average.
+
+Consider an account with 31 million followers, the Lady Gaga or Katy Perry scale of the early 2010s. One tweet from that account, under pure push, means 31 million Redis inserts. Twitter measured this: about 3.5 seconds at the median just to reach the first one million followers, so reaching all 31 million is tens of seconds, sometimes minutes, of synchronous fan-out for a single post.
+
+```
+Celebrity followers:    ~31,000,000
+Push cost per tweet:    31,000,000 RPUSHX ops, fanned out
+Observed:               ~3.5 s @ p50 just to reach 1,000,000 followers
+                        -> tens of seconds to reach all
+                        -> write path saturates
+                        -> replies can arrive before the tweet they reply to
+```
+
+Two things go wrong, and the second is sneakier than the first. The obvious failure is throughput: the write path saturates, fan-out queues back up, and latency budget evaporates. The subtle failure is correctness. Because fan-out runs as asynchronous work across independent queues, a fast small write can overtake a slow huge one. Someone replies to the celebrity's tweet; their reply has 200 followers and fans out in milliseconds; the original has 31 million and is still grinding. Now the reply lands in timelines before the tweet it is replying to. The feed is briefly nonsensical, and no amount of retrying fixes an ordering that was never guaranteed in the first place.
+
+This is the celebrity problem, or the hot-key problem, and it is not a Twitter quirk. It is what happens whenever one node in a graph has wildly more edges than the design assumed. Designing for the mean works right up until the tail hits the same code path, and then it does not.
+
+## The hybrid: push the tail, pull the head
+
+The fix is to stop pretending one strategy fits the whole graph. You carve the heavy tail off the synchronous write path.
+
+For high-follower accounts, do not fan out at all. The celebrity's tweet is written once, to their own author timeline, and that is it. No 31 million inserts. Then, at read time, when a follower loads their home timeline, the system takes their precomputed list, the ~800 ids that came from all the normal people they follow, and merges in the recent tweets of the celebrities they follow, pulled live, then re-sorts the combined set and serves it.
+
+```
+Read for a normal user who follows some celebrities:
+  home_timeline (precomputed push, ~800 ids)
+    (merge) recent tweets of followed celebrities (pulled live at read)
+    -> re-sort by time
+    -> hydrate
+    -> serve
+```
+
+That is the hybrid: push for the long tail of normal accounts, pull-and-merge for the head of the follower-count distribution. Twitter described the payoff as balancing the read and write paths and saving tens of percent of computational resources. You spend a little more on every read, an extra fetch and a second sort, in exchange for not melting the write path every time a celebrity posts.
+
+Now, the threshold question, because someone always asks where the line is. You will see "10,000 followers" repeated as if it were a constant. It is folklore. There is no magic number. The real boundary is an economic break-even:
+
+> Push an account if the cost of fanning out its writes is less than the aggregate cost of merging its tweets live on every read that needs them.
+
+That line moves with cache hit rates, with how active an account's followers are, with the cost of memory versus compute on the hardware you run. A senior answer names the break-even and treats any specific number as illustrative. A junior answer recites 10,000 and moves on.
+
+## The hot key did not vanish, it moved
+
+Here is the nuance that separates a staff-level read of the hybrid from a merely correct one. When you stopped fanning out the celebrity, you removed a hot *write* key. You did not remove the heat. You moved it to the read side.
+
+Every one of those 31 million followers now pulls the same celebrity's recent tweets when they load their timeline. That is a hot *read* key: one list, read by millions, within the same short window after a post. If you are naive about it, a viral tweet triggers a thundering herd, millions of reads stampeding the backing store for the same freshly posted list at once.
+
+The good news is that this particular hot key is almost perfectly cacheable. The celebrity's recent-tweet list is written rarely, every few minutes at most, and read by millions. That is the ideal cache profile, and the mitigation is exactly what you would reach for in [the distributed cache](/blog/distributed-cache): cache the celebrity's recent tweets aggressively, with request coalescing or single-flight so that the first miss fetches once and everyone else waits on that single fetch instead of stampeding. The hybrid does not make the hot-key problem disappear. It converts a hard write-side problem into an easy read-side one. That conversion is the actual win, and being able to say so out loud is the tell.
+
+## Why Redis, and why the data structure became the bottleneck
+
+A quick but load-bearing detour, because "store the timeline in Redis" invites the follow-up that catches people: why Redis and not Memcached? The reason is bandwidth, not preference. Store each timeline as an opaque blob in Memcached and appending one tweet means read the whole blob over the network, modify it, write the whole blob back. At 100,000+ operations per second on objects larger than a kilobyte, that read-modify-write saturates the network card. The bottleneck is the NIC, moving the same data back and forth, not CPU or memory.
+
+Redis collapses that. A timeline is a native list, and the append is a single server-side `RPUSHX`: you ship the one new entry, the server appends it in place, done. Read-modify-write over the network becomes one in-place op. That is a concrete, measurable argument, the kind [the distributed cache](/blog/distributed-cache) unpacks when choosing a cache topology.
+
+The deeper lesson is what Twitter ran into next. Timelines vary wildly in size, and a pile of variable-length Redis lists fragments memory badly, so they built a custom structure, the Hybrid List, a linked list of ziplists, to fight that fragmentation. At the scale they were running, around 40 TB of heap and 30 million QPS per datacenter across 6,000+ instances, the data structure itself became the thing to optimize, long before the push/pull algorithm did. At scale, the interesting engineering often lives below the architecture diagram, in the memory layout and the cost per byte. The same theme runs through [LSM-trees versus B-trees](/blog/lsm-tree-vs-btree), where the choice of on-disk structure decides whether a write-heavy workload flies or thrashes.
+
+## The consistency you actually get
+
+It is tempting to treat the home timeline as an ordered log. It is not, and pretending otherwise will bite you. The contract is weaker and more honest than "consistent," so state it plainly.
+
+The home timeline offers bounded staleness, not linearizability and not even per-feed monotonic ordering across authors. The guarantee is roughly: you will see recent tweets within seconds, capped at the last ~800, in approximately-but-not-strictly causal order. We already saw the order break, a reply can be delivered before its original because the two fan out through independent queues. And a dormant user's rebuilt timeline is lossy by construction; it reconstructs only the recent window, not everything that happened while they were gone.
+
+This is a deliberate trade, and it is the trade [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) is really about. In the PACELC framing, even when there is no partition, you are choosing latency over consistency: a 4-millisecond timeline read is worth more to the product than a globally consistent ordering nobody would notice. A timeline is the canonical place where eventual consistency is the correct engineering choice rather than a compromise you grudgingly tolerate. Nobody reconciles a bank balance from their feed. The cost of a momentarily out-of-order reply is a shrug; the cost of making every read wait for global ordering is a product that feels slow, and slow loses. When you reason about [latency and the tail](/blog/latency-throughput-tail), this is the same instinct applied to a feed: protect the median and the p99, and accept a consistency model that lets you.
+
+What makes the cheap ordering possible at all is the id scheme. Twitter's Snowflake ids are 64-bit and roughly time-sortable, with the high bits encoding the timestamp. Because the id is itself the sort key, merging the push timeline with freshly pulled celebrity tweets is a cheap merge-sort on integers, no extra timestamp lookup. Lose monotonic, time-sortable id generation and that cheap merge breaks, which is a small reminder that id design and timeline design are not separate decisions.
+
+## Facebook chose pull, and was right to
+
+The fastest way to prove that architecture follows the workload, not fashion, is to look at a company that made the opposite call and was correct. Facebook's feed runs fan-out-on-read. Pull. The mirror image of Twitter's default.
+
+In Facebook's Multifeed design, when you load your feed, an aggregator scatter-gathers a request across a set of leaf servers that hold recent activity in RAM, collects the candidates, ranks them, and returns. One replica is roughly 20 aggregators plus 20 leaves. There is no precomputed per-user timeline sitting in a cache; the feed is assembled, and ranked, at the moment you ask for it.
+
+Why is pull right for Facebook and wrong as Twitter's default? Two reasons, both about the graph and the product.
+
+First, the graph shape. Facebook friendships are bidirectional and bounded, capped around 5,000 friends, so gathering recent posts from at most 5,000 friends at read time is a tractable scatter-gather. Twitter's follow graph is unidirectional and unbounded into the tens of millions, which makes write fan-out the thing that breaks. Bounded graphs make pull cheap; unbounded ones make push the bottleneck. Graph shape is destiny.
+
+Second, and this is the one people miss, the feed is ranked, not chronological. Facebook scores posts rather than showing them newest-first, and ranking forces a read-time pass no matter what, because the score depends on context that only exists at read time: how recently you looked, what you have done since, how much engagement a post has accumulated in the last hour. If you must run a ranking pass at read time anyway, precomputing a chronological list buys almost nothing, so why pay the fan-out write cost? Pull falls out naturally. The ranking is itself a read-time funnel that cannot move to write time: well over 1,000 candidates per user per day, trimmed by a lightweight Pass 0 to roughly 500, scored by a Pass 1 multi-task neural net predicting your probability of liking, commenting, and sharing, then re-ordered by a Pass 2 for diversity. All of it depends on the moment you open the app.
+
+Modern Twitter and Facebook have both converged on what is really a double hybrid: hybrid fan-out, push the tail and pull the head, with a read-time ranking funnel layered on top of whatever candidate set that assembly produced. The "For You" feed is a ranked re-sort of a candidate pool that itself came from push plus pull. Fan-out strategy and ranking are orthogonal axes, and treating them as one decision is a junior simplification.
+
+## How a senior actually decides
+
+Strip away the company names and the decision is a small, ordered set of judgments. None of them is "push good, pull bad."
+
+| Question | The move | Why |
+| --- | --- | --- |
+| What is the load parameter? | Fan-out, not ingest | 4,600 tweets/s is trivial; 345,000 timeline writes/s is the problem |
+| Bounded or unbounded graph? | Bounded -> pull viable; unbounded -> push + hybrid | Scatter-gather is cheap on 5,000 friends, brutal on 31M followers |
+| Chronological or ranked? | Ranked forces a read-time pass | If you rank at read time anyway, precomputing a list buys little |
+| What about the heavy tail? | Don't fan out celebrities; merge at read | The power-law tail kills pure push; the hybrid carves it off |
+| Where is the threshold? | Economic break-even, not a constant | 10k is folklore; the line moves with cache hits and activity |
+| What did the hot key do? | It moved write-side to read-side | Cache aggressively with single-flight, do not deny it |
+| What consistency do I promise? | Bounded staleness, stated out loud | Latency over global order; a feed is the place to trade it |
+
+You can estimate every one of those numbers cold; the method is in [capacity estimation](/blog/capacity-estimation), and the back-of-envelope here lands around 500 million tweets a day, 60,000 fan-out deliveries a second, and a few petabytes of storage over three years, enough to rule a single relational box out of the write path. The sharding that keeps the social graph and the timeline cache balanced is [consistent hashing](/blog/consistent-hashing) doing its quiet job, and keeping the three timeline replicas in sync is the same set of [replication strategies](/blog/replication-strategies) you would reach for in any stateful tier.
+
+Carry out of this the reframe, not the diagram. A timeline is not a list you read; it is an answer you precompute, except for the parts you cannot afford to, which you compute on the way out the door. The hybrid is just the honest admission that one strategy was never going to fit a graph whose nodes differ by six orders of magnitude in degree. Build for the average and you ship something that works in the demo. Build for the tail and the inactive followers and the reply that overtakes its parent, and you ship something that survives the night a celebrity tweets.
+
+## FAQ
+
+<FAQ />

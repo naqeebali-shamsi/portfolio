@@ -1,0 +1,140 @@
+export const meta = {
+  slug: 'autoscaling',
+  title: 'How Autoscaling Works: Reacting to Load Without Falling Over',
+  description:
+    'Autoscaling is a feedback control loop with multi-minute dead time, not a CPU threshold. Why fleets scale up fast and down slow, which signal to actually track, and why headroom is the price of not browning out.',
+  headline: 'How Autoscaling Works: Reacting to Load Without Falling Over',
+  deck: 'Autoscaling is a control loop with minutes of dead time, and every hard part follows from that one fact.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['autoscaling', 'distributed-systems', 'kubernetes', 'aws', 'reliability', 'system-design'],
+  faq: [
+    {
+      q: 'Why should autoscaling scale up fast but scale down slow?',
+      a: "The two directions have different costs. Under-provisioning hurts users right now through latency and errors, so adding capacity should be eager. Over-provisioning only costs money, so removing capacity should be cautious. There is also a stability reason: a control loop with long actuation delay oscillates if you tune it aggressively in both directions, so scaling in slowly damps the loop. AWS says it under-scales-in on purpose to avoid oscillation, and Kubernetes defaults its scale-down stabilization window to 300 seconds against 0 for scale-up.",
+    },
+    {
+      q: 'Is CPU a good metric to autoscale on?',
+      a: "It is a convenient default and a lagging proxy. A thread-pool-bound or I/O-bound service queues requests while CPU stays flat, so by the time CPU climbs your users are already waiting. Scale on the quantity tied to your SLO instead: requests per instance, in-flight concurrency, or backlog per instance, which equals your latency target divided by the time to process one unit of work. CPU is fine when CPU genuinely is the bottleneck and nowhere else.",
+    },
+    {
+      q: 'What is the difference between a cooldown and an instance warmup?',
+      a: "A cooldown is a legacy global pause on the whole group after a scaling action, defaulting to 300 seconds, and AWS now recommends against it for dynamic scaling. An instance warmup is a per-instance grace period during which a freshly launched instance is excluded from the aggregate metric, so a box that is still booting does not make the fleet look under-loaded and trigger a second scale-out. Modern target tracking and step scaling use warmup and will scale out during a cooldown.",
+    },
+    {
+      q: 'Why do I still need spare capacity if I have autoscaling?',
+      a: "Because autoscaling has dead time it cannot configure away: a sampling interval, a decision, then provision, boot, app warmup, and a passing health check, which together run into minutes. A spike that arrives inside that window is a spike you cannot scale into in time. Headroom is the pre-provisioned capacity that absorbs it. You size it from boot time multiplied by the peak arrival-rate slope, and you trade it explicitly against the dollar cost of idle machines.",
+    },
+    {
+      q: 'Can autoscaling cause an outage instead of preventing one?',
+      a: "Yes, in several ways. Freshly launched instances can be cold, with empty caches and un-warmed runtimes, and briefly fail health checks, which looks like unhealthiness and triggers more launches: a cold-start storm. Client retries multiply offered load exactly when you are saturated, feeding the autoscaler a partly self-inflicted signal. And if a load balancer routes by a signal that load shedding distorts, the control signal can invert and send more traffic to the hottest node. Autoscaling has to be designed alongside load shedding, retry budgets, and health checks, not in isolation.",
+    },
+  ],
+}
+
+The handler that double-charges a customer is a famous failure. The fleet that browns out at 9:01 on launch morning is the same kind of failure, one layer up: a system that did exactly what it was told and still could not keep its promise, because the promise depended on an assumption nobody wrote down.
+
+Here is the assumption. Most people picture autoscaling as a threshold. CPU crosses 70 percent, a machine appears. CPU drops, a machine leaves. Tidy, and wrong in a way that hides until the night you need it. Autoscaling is a feedback control loop, the same shape as a thermostat or a cruise controller. It reads a signal, compares it to a setpoint, and actuates capacity to drive the error to zero. AWS says this in as many words about its target tracking policy: "this is similar to how a thermostat maintains a target temperature."
+
+The trouble is that this particular thermostat is slow. When a cruise controller presses the accelerator, the car speeds up within a second. When an autoscaler decides it needs eight more machines, those machines do not exist for minutes: provision, boot the OS, start the app, warm the caches, pass a health check. Control theory has a name for that delay between deciding and the decision taking effect. It is dead time, and a loop with a lot of it behaves nothing like the tidy threshold in your head. Every hard part of autoscaling, the oscillation, the flapping, the asymmetry, the headroom you pay for and pray you never need, falls out of that one structural fact. So the useful question is never "what threshold do I pick." It is "how does this loop behave when the thing it controls takes minutes to respond."
+
+## The loop, and the lag you cannot delete
+
+Trace one full revolution. A sensor samples a metric. A controller computes the error against the setpoint and decides on a new capacity. An actuator provisions and boots that capacity. The fleet, now resized, changes the load each machine carries. The sensor reads again. Round and round, and the system is only ever steering toward where the metric was one lap ago.
+
+Two delays sit in that loop and neither is optional. The first is sample lag. Kubernetes' Horizontal Pod Autoscaler does not watch your metrics continuously; it re-evaluates on a sync period that defaults to 15 seconds. A spike that rises and falls inside 15 seconds is invisible to it. EC2 is worse out of the box: default CloudWatch metrics arrive at 5-minute granularity, so unless you turn on detailed or high-resolution metrics, your sensor alone can lag your boot time. The second delay is actuation. From "launch" to "serving real traffic" is the full cold-start tax, and on a real instance that is minutes, not seconds.
+
+Add them up and you get the response floor of the whole system. You cannot tune below it. This is the line that separates someone optimizing a number from someone reasoning about a loop: the threshold is a knob on the controller, but the dead time is a property of the plant, and the plant is what bites you. Everything that follows is a technique for staying stable, or staying alive, in spite of a loop that cannot close fast enough.
+
+Worth naming early: this is horizontal scaling, adding more machines behind a load balancer, which is what the rest of this piece means by autoscaling. Its cousin, vertical scaling, resizes one machine instead. Vertical is simpler and sometimes the right call, but it has a hard ceiling, the largest box money can rent, and usually a restart to get there, so it cannot react to load in real time. Horizontal trades that for a requirement: your service has to be stateless enough that any instance can serve any request, which is most of why "make it stateless" gets repeated so often. If you have walked through [the system design interview framework](/blog/system-design-interview-framework), this is the move behind "scale the stateless tier horizontally" that the framework keeps reaching for.
+
+## The control law, and the deadband nobody mentions
+
+Kubernetes publishes its controller as a formula, and it is refreshingly plain. The desired replica count is proportional to how far the metric is from target:
+
+```
+desiredReplicas = ceil[ currentReplicas × ( currentMetricValue / desiredMetricValue ) ]
+```
+
+Four pods averaging 90 percent CPU against a 50 percent target gives a ratio of 1.8, and `ceil(4 × 1.8)` is 8 pods. Double the load reading, roughly double the fleet. So far this is the tidy mental model, and if it were the whole story, autoscaling would flap itself to death, because real metrics jitter by a percent or two every sample and the formula would chase every wobble.
+
+It does not, because of a detail the formula omits and most explainers skip. The HPA has a deadband: "the control plane skips any scaling action if the ratio is sufficiently close to 1.0 (within a configurable tolerance, 0.1 by default)." With that default, the controller does nothing while the metric ratio sits between 0.9 and 1.1 of target. Ten pods reading 53 percent against a 50 percent target is a ratio of 1.06, inside the band, so the answer is: leave it alone. The deadband is the single most important anti-flapping mechanism in the HPA and it is invisible in the equation everyone quotes. A controller without a deadband treats noise as signal. A controller with one ignores the difference between 50 and 53 and waits for a difference that means something.
+
+There is a second, subtler guard. When the HPA scales, it does not act on the latest single reading; it considers every recommendation it computed across a stabilization window and, for scale-down, picks the highest one. The default scale-down window is 300 seconds. So a momentary dip cannot shrink your fleet; the controller only scales in once the entire recent window agrees it is safe. Scale-up gets a 0-second window by default, which is the asymmetry showing up again, this time as: react to growth instantly, retreat from it only after sustained confirmation.
+
+## Scale up fast, scale down slow, and mean it
+
+That asymmetry is not an accident or a tuning preference. It is doctrine, and it is correct, for two independent reasons.
+
+The first is about who gets hurt. Under-provisioning costs your users right now: requests queue, tail latency blows out, some fraction times out and errors. Over-provisioning costs you money and nothing else. Those are not symmetric stakes, so the responses should not be symmetric either. Google's SRE guidance states the bias directly: "most autoscaler implementations are intentionally more sensitive to jumps in traffic than to drops in traffic. When scaling up, autoscalers are inclined to add extra serving capacity quickly. When scaling down, they are more cautious and wait longer."
+
+The second reason is pure control theory, and it is the one most people miss. A feedback loop with large dead time has to be detuned, kept slow and conservative, or it oscillates. Act aggressively in both directions and you over-correct: you scale in during a lull, the lull ends, the metric jumps, you scramble to scale back out, you overshoot, and the fleet sawtooths forever. Scaling in slowly is what damps that. AWS is unusually candid that this, rather than thrift, is the reason it under-acts on scale-in: "if we determine that removing 0.5 instances increases your CPU utilization to above 50 percent, we will choose not to scale-in until the metric lowers enough that we think scaling in won't cause oscillation." It literally names oscillation as the reason it leaves machines running. "Scale down slow" is a stability property wearing a cost-savings disguise.
+
+This is also why the modern AWS distinction between a cooldown and a warmup matters, and why people get it backwards. A cooldown is the old simple-scaling idea: after any scaling action, pause the whole group for a while (default 300 seconds). It is blunt, and AWS now recommends against it for dynamic policies. An instance warmup is the replacement, and it is sharper: a freshly launched instance is excluded from the aggregate metric until it has had time to warm up. The reason is precise. A box that is still booting contributes near-zero load, which drags the fleet average down, which looks like "we are under capacity," which would trigger a second, spurious scale-out. The warmup keeps cold machines out of the math until they are real. AWS makes the directional asymmetry a hard interlock here too: during an active scale-out, scale-in is blocked until warmup completes. The loop refuses to undo a decision it has not finished making.
+
+## The honest signal: scale on work, not on symptoms
+
+Now the question that decides whether any of this holds up: what do you point the loop at?
+
+CPU is the reflexive answer and a lagging one. A service that is bound on a thread pool, a connection pool, or downstream I/O will happily queue requests while its CPU graph stays calm, because the bottleneck is waiting, not computing. By the time CPU finally climbs, the queue is already deep and your users are already in the tail. CPU is the symptom that shows up after the patient is sick. It is the right signal only when CPU genuinely is the constraint and nothing else fails first, which is a real case for compute-bound work and a trap everywhere else. The [latency, throughput, and the tail](/blog/latency-throughput-tail) story is exactly this: utilization and the tail decouple under load, and the tail is what your users feel.
+
+The signal you actually want is the one tied to a promise you made. For a request service that is in-flight concurrency or requests per instance. For a queue worker it is backlog per instance, and AWS publishes the cleanest statement of why and the math to back it. The trap it warns against first: raw queue depth does not work as a target-tracking metric, because the number of messages waiting is not proportional to how many machines you run. AWS lists `ApproximateNumberOfMessagesVisible` explicitly as a metric that does not work for target tracking, alongside load-balancer request count and raw latency, for the same reason. Target tracking is only stable when the metric moves inversely with instance count. Per-instance signals satisfy that contract; aggregate counts do not. Pick a non-proportional metric and you have built a latent oscillation bug that will not show up until traffic does.
+
+The fix is to divide by the fleet, which turns a raw count into a proportional, SLO-aligned setpoint. Backlog per instance is the queue depth over the in-service instances, and the target you aim it at is your acceptable latency divided by the average time to process one message. Work the canonical example, because it is the whole idea in four numbers:
+
+```
+10 instances, 1500 messages waiting
+0.1 s to process one message, 10 s acceptable latency
+
+target backlog/instance  = 10 / 0.1   = 100   (the setpoint)
+current backlog/instance = 1500 / 10  = 150   (above target -> scale out)
+
+scale out by 5 -> 15 instances -> 1500 / 15 = 100/instance
+```
+
+That is the bridge from "scale on whatever resource graph is handy" to "scale on a queueing-theory number that maps to a user-visible promise." Latency target divided by service time is the only setpoint that means something to the person waiting. This is the same instinct as [capacity estimation](/blog/capacity-estimation): start from the SLO and the per-unit cost of the work, and let the machine count be the thing you solve for, instead of the thing you guess. And if you ever caught yourself thinking "I'll just scale on the queue length," that is the same proportionality mistake that breaks token-bucket intuition in [the rate limiter](/blog/rate-limiter): the quantity you regulate has to be the one that actually responds to the lever you pull.
+
+A queue worker brings one more wrinkle. Naive scale-in will kill an instance in the middle of a job. The canonical guard is to toggle scale-in protection around each unit of work so the autoscaler cannot reap a busy machine; the Kubernetes analog is a pod deletion cost plus a graceful drain. Stateless web tiers can shed a machine almost for free. Stateful or long-running workers cannot, and the loop has to know the difference.
+
+## The cold-start gap, and why headroom is the bill
+
+Here is the trap no threshold can fix, and the reason this piece exists.
+
+Suppose an instance takes 4 minutes to boot and one instance serves 100 RPS. Traffic climbs from 200 to 1000 RPS over 60 seconds: a launch announcement, a cron stampede, a celebrity link. You need 8 more instances now. The loop notices within a sample, decides correctly, and issues the launch within a second. The machines are useful in 4 minutes. For those 4 minutes you are running 200 RPS of capacity against 1000 RPS of demand, and the gap is not a graph artifact. It is requests timing out, retries piling on, an SLO breach happening in real time. This is the spike you cannot scale into, and it exists no matter how perfect your thresholds are, because the dead time is in the plant.
+
+There is exactly one thing that fills a gap you cannot react into in time, and that is capacity you already paid for before the spike: headroom. Spare, idle, running-and-waiting capacity, sized to cover the dead time. Concretely, your headroom has to absorb at least boot time multiplied by the peak arrival-rate slope, because that is how much extra demand can pile up before the first new machine is real. In the example, 4 minutes of a steep ramp is the entire brownout, so headroom that covers those 4 minutes is the difference between a blip and a page. Google's SRE guidance is blunt about keeping it: "we recommend that user-facing services reserve enough spare capacity for both overload protection and redundancy," and "set a minimum number of instances per location to keep spare capacity for failover." That minimum-instances knob is not laziness about cost. It is the dead-time insurance premium, written into config.
+
+And it is a premium, which is the honest part: headroom is idle machines you are paying for against a spike that may not come today. So you hedge it instead of just buying more. Warm pools keep pre-initialized instances in a stopped state, so you pay for storage rather than compute and still cut most of the boot delay; AWS built them for exactly this latency problem. Pre-pulled images and snapshot-restore shrink the boot itself. Predictive scaling pre-launches ahead of forecasted demand so your steady-state headroom can be thinner. The real decision a senior makes is not "headroom: yes or no." It is a portfolio: how much of the un-scalable-into spike do you self-insure with idle capacity, how much do you reinsure by making boots faster or forecasting the wave, and how much do you simply accept and shed. Which is the right moment to bring in the loop next to this one.
+
+## Predict the wave, react to the surprise
+
+Pure reactive scaling has a built-in tax: it only ever responds after demand has already moved, and then waits out the boot time on top. You are structurally late. Netflix hit this hard enough to build a predictive engine, Scryer, on top of AWS's reactive scaling, for reasons that read like a list of everything above: reactive lags by construction, steep spikes outrun it, pure reactive scaling tends to oscillate, and Netflix traffic is so predictable on daily and weekly cycles that a forecast can pre-provision before the ramp and leave reactive to mop up only the residual surprise.
+
+AWS later productized that exact shape. Predictive scaling reads up to 14 days of history, forecasts the next 48 hours hour by hour, refreshes every 6 hours, and can pre-launch ahead of demand so the boxes are warm before the wave lands. Two properties make it safe to reason about. It only ever scales out, never in, so a bad forecast cannot remove capacity you needed; you pair it with a reactive policy for the scale-down. And when several policies run together, the desired capacity is the maximum across all of them. If predictive wants 8 and target tracking wants 10, you run 10. That `max()` is the whole architecture in one operator: predictive is a floor, reactive is the correction layered on top, and the floor can never starve you because the reactive trim can always ask for more.
+
+It is not free either. Predictive scaling assumes a roughly homogeneous fleet; AWS warns that forecasts degrade on mixed-instance groups because a CPU or network forecast misreads when vCPU and bandwidth vary per instance type. And it needs the pattern to be genuinely periodic. Forecasting works on Netflix's nightly ramp; it does nothing for an unannounced spike from a single viral post. Which is the standing rule: predict the part of the curve that repeats, keep headroom and reactive scaling for the part that does not.
+
+## Where the loops collide
+
+The failures that actually page you are rarely one loop misbehaving. They are loops interacting, and that is where staff-grade judgment lives.
+
+Pod autoscaling and node autoscaling are cascaded loops with their dead times stacked. The HPA can decide it wants more pods than the cluster has room to place, at which point those pods sit `Pending` and the cluster autoscaler (or Karpenter) has to launch a node, which has its own multi-minute boot before any of those pods run. Reason about the end-to-end dead time, not each layer's in isolation, or you will promise a scale-up time the bottom loop cannot honor. And keep the obvious truth in view: autoscaling cannot conjure capacity that does not exist. No warm nodes, an availability zone out of stock, an account limit, and the HPA's request just yields `Pending` forever. Autoscaling schedules capacity; it does not create it, which is why it complements [capacity estimation](/blog/capacity-estimation) instead of replacing it.
+
+Then the genuinely nasty one: a cold-start storm that locks into a bad equilibrium and stays there after the trigger is gone. A surge launches new instances; the new instances are briefly cold, with empty caches and runtimes not warm, and either fail health checks or run slow; the slow or failing boxes look unhealthy, which triggers more launches and concentrates load onto the few healthy machines, which pushes them toward failing too. The system can settle into a broken steady state that persists after the original spike has passed. This is a metastable failure, and the defenses are the ones already on the table: real headroom so the surge never lands on cold machines, warm pools so machines arrive warm, and a warmup window generous enough that a booting box is never mistaken for a dying one.
+
+Retries pour fuel on all of it. Client and proxy retries multiply offered load exactly when you are saturated, so the autoscaler reads a signal that is partly self-inflicted and scales to chase demand that the retries invented. Pair autoscaling with retry budgets and jittered backoff, or you are scaling against your own echo. SRE's "Dressy" story is the cautionary tale: a load balancer routed by CPU, combined with active load shedding, dropped requests in an overloaded region; the dropped requests lowered the per-request CPU in that region; the balancer concluded the region was cheap and sent it more traffic. The control signal inverted. The named lesson is the warning to tape above your dashboards: "potentially catastrophic feedback cycles between load balancing, load shedding, and autoscaling when these tools are configured in isolation."
+
+Which leaves ordering, the cheapest insurance in the whole stack. Your thresholds have to line up: the autoscale setpoint below the load-shed threshold below the hard failure limit, and the predictive floor at or under the reactive target at or under max capacity. SRE states the first ordering plainly: "set your thresholds such that your system autoscales before load shedding kicks in. Otherwise, your system might start shedding traffic it could have served had it scaled up first." Get it backwards and you drop requests you had the capacity to serve, or you never scale because you slam into a limit first. The same staged-promotion instinct shows up in [deployment strategies](/blog/deployment-strategies): the order in which thresholds fire is a design decision, not a default. And when a scale event also flips behavior, a flag flip or a new permission riding the new fleet, you inherit the consistency questions [event-driven RBAC](/blog/event-driven-rbac) works through, where pushing a change to a moving target is its own problem.
+
+## How a senior decides
+
+Strip it to the decisions that actually carry weight, because the threshold is the least of them.
+
+Choose the signal first, and make it proportional and SLO-aligned: requests per instance, concurrency, or backlog per instance equal to latency over service time. Never a raw aggregate count, which fails the proportionality contract and oscillates. Then set the deadband and the stabilization window so noise cannot move the fleet, and accept the asymmetry on purpose: eager up, cautious down, because the costs are asymmetric and because a high-dead-time loop has to be detuned to stay stable. Treat the cold-start gap as the load-bearing problem, not a footnote, and price its remedies deliberately: headroom sized to boot time times the arrival slope, hedged with warm pools and faster boots, thinned where prediction can pre-fill a periodic wave. Layer predictive as a floor under reactive as the trim, with `desired = max(all policies)`. And reason about the whole tower of loops at once, HPA into the node autoscaler, autoscaling against retries and shedding and the balancer, with the thresholds ordered so you scale before you shed and shed before you fall over.
+
+The one-line tell, the thing that separates the answer that survives launch morning from the one that looks fine in review: a shallow design optimizes the threshold; a real one optimizes the loop, its setpoint, its deadband, its actuation latency, and how it behaves when it shares a plant with every other control loop pulling on the same fleet. The threshold is where you start when you have not yet understood that capacity takes minutes to arrive. The loop is what you tune once you have. Get the loop right and the spike that arrives at 9:01 hits headroom you already bought. Get it wrong and the cleanest autoscaling config you ever wrote is the one that pages you while it is busy doing exactly what you asked.
+
+## FAQ
+
+<FAQ />

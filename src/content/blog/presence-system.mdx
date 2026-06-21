@@ -1,0 +1,158 @@
+export const meta = {
+  slug: 'presence-system',
+  title: 'Design a Presence System: Who Is Online at Scale',
+  description:
+    'The green dot is a distributed failure detector on a fan-out bus. Build presence at scale with heartbeat leases, TTL keys, and a staleness budget you spend.',
+  headline: 'Design a Presence System: Who Is Online at Scale',
+  deck: 'A senior engineer does not try to make the green dot always correct; they write down exactly how wrong it is allowed to be.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['presence', 'distributed-systems', 'real-time', 'redis', 'websockets', 'system-design'],
+  faq: [
+    {
+      q: 'How do you detect that a user went offline without scanning the whole user table?',
+      a: "You do not scan. The client renews a lease by writing a heartbeat key with a TTL, and absence of renewal past the TTL is the offline signal. The trigger is either the key's own expiry or a per-user scheduled timer set for one interval past the last heartbeat. A periodic scan of N users every tick is O(N) work for a handful of actual transitions, and it scales with your user base instead of with the number of state changes, which is exactly backwards.",
+    },
+    {
+      q: 'Why not store last-seen in a relational database?',
+      a: 'Because the hard part is write rate, not durability. At fifty million concurrent users with a thirty-second heartbeat you are taking roughly 1.7 million writes per second, and presence is disposable soft state that nobody needs after the user reconnects. An in-memory store with native TTL keys handles that volume and expires stale entries for free. A relational database would spend its life rewriting rows it is about to throw away.',
+    },
+    {
+      q: 'Should the TTL equal the heartbeat interval?',
+      a: 'No, and setting them equal is a classic source of false-offline flapping. A single delayed or dropped heartbeat would expire the key and flip a perfectly healthy user offline. The TTL has to exceed the interval, around two times, so the system tolerates one missed beat plus normal network jitter before it concludes anything. LinkedIn formalizes this as an interval d, a key expiry of d plus epsilon, and an offline trigger at d plus two epsilon.',
+    },
+    {
+      q: 'Can I just listen for Redis expired-key events to flip users offline?',
+      a: 'Not as your only mechanism. Redis expires keys lazily on access or via a background sweep, so the expired notification fires when the key is actually deleted, which can lag the logical zero of the TTL by an unbounded amount under load. The docs say there is no guarantee the event fires at the moment the TTL reaches zero. Treat keyspace events as a hint and pair them with a per-user timer or a sorted-set sweep by score for the authoritative transition.',
+    },
+    {
+      q: 'How do you keep a celebrity or a huge channel from melting the fan-out path?',
+      a: 'Switch high-degree users from push to pull. Most users are low-degree, so fan-out-on-write is fine: push the change to everyone watching. For a user with hundreds of thousands of watchers, do not push; let viewers fetch current presence when the user actually enters their viewport, which is fan-out-on-read. This is the same celebrity tradeoff that feeds make, and Discord measured a thirty-thousand-member channel taking 900 milliseconds to 2.1 seconds to publish a single naive event before they pushed the fan-out down to the subscriber node.',
+    },
+  ],
+}
+
+A presence indicator is one bit. Online or offline, a green dot or a grey one. It is the smallest piece of state a product can show, and it is one of the most expensive things you will ever build to show correctly.
+
+The deception is the point. That single bit hides a distributed failure detector wired to a publish-subscribe bus. The client has to keep proving it is alive, the server has to decide when silence means death, and every state change has to reach everyone who is looking, fast enough that the dot feels honest. None of those three jobs is novel. Heartbeat volume is a write-throughput problem. Fan-out is the celebrity problem feeds already solved. And the thing that saves you from both is that presence is allowed to be a little wrong for a few seconds, which means you get to batch, debounce, and lag on purpose.
+
+This is the same shape as the chat systems it usually rides alongside. If you have read [Design WhatsApp](/blog/design-whatsapp), you have already met the long-lived connection and the fan-out hub; presence is the loss-tolerant cousin that lives on the same wire. The single sharpest move that separates a junior answer from a staff one: a junior tries to make the dot always correct, and a senior writes down how wrong it is permitted to be, then bills every optimization against that budget.
+
+## The dot is a lease
+
+Start with the naive version, because naming what is wrong with it teaches the whole design.
+
+The client pings the server every so often. The server records the last time it heard from that client. If too much time passes with no ping, the user is offline. That is it, and it is correct in spirit. The trouble is in the words "records" and "too much time," because both of them, done literally, do not survive scale.
+
+The mechanism already has a precise name in the literature. The client is holding a **lease** on the claim "I am online," and it renews that lease before it expires. Gray and Cheriton named this in 1989, in a paper about cache consistency, and the property they identified is exactly the one presence exploits: a lease is a time-bounded grant that must be renewed, and when renewal fails, you lose *freshness*, not *correctness*. A stale lease never corrupts anything. It just means the holder has to ask again. Presence is that idea with a UI stapled on. The green dot is a lease; the heartbeat is the renewal; the TTL is the lease duration.
+
+That reframing does real work, because it tells you what failure costs. When a presence system gets confused, nobody loses money and no invariant breaks. Somebody's dot is grey when it should be green, for a few seconds, until the next beat. That generous failure mode is the budget you will spend everywhere downstream. It is the same intuition that runs through [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum): you decide up front which axis you are willing to relax, and for presence the answer is consistency, cheerfully, by seconds.
+
+Now the load-bearing parameter. How long is the lease relative to the heartbeat?
+
+The tempting answer is to make them equal. Beat every thirty seconds, expire after thirty seconds. This is wrong, and it is wrong in a way that pages you. A single heartbeat that arrives a little late, or drops entirely on a flaky mobile link, expires the key and flips a healthy user offline. Then the next beat flips them back. You have manufactured flapping out of a network hiccup. The fix is redundancy in the timeout: the TTL must comfortably exceed the interval so that one lost beat is survivable. Roughly two-to-one is the universal pattern. OneUptime ships a heartbeat of thirty seconds against a TTL of sixty. LinkedIn writes it most cleanly as three values:
+
+```text
+heartbeat interval   = d            (client beats every d seconds)
+key time-to-live     = d + epsilon  (expires just past one interval)
+offline trigger      = d + 2*epsilon (fires after one tolerated miss)
+```
+
+The key expires a hair past one interval, so a healthy client always refreshes before it lapses, and the actual "declare offline" decision waits a full extra interval beyond that. One missed beat is absorbed silently. Two missed beats, and the system is allowed to believe you are gone. That single inequality, TTL greater than interval, is the difference between a presence system and a flap generator.
+
+## Cost one: the heartbeats themselves
+
+The first bill arrives before any cleverness, and it is pure arithmetic.
+
+```text
+50,000,000 concurrent users
+heartbeat every 30 seconds
+= 50,000,000 / 30
+≈ 1,670,000 heartbeat writes per second
+```
+
+Each write is trivial in isolation: set one key to a timestamp with a sixty-second expiry, `SET presence:user123 <ts> EX 60`, an O(1) operation against memory. But 1.7 million per second is not trivial in aggregate, and it tells you immediately what the storage layer must be. It is an in-memory store with native TTL, Redis or equivalent, sharded across enough primaries to absorb the rate. A single Redis node does on the order of 100,000-plus operations per second, so this volume implies sharding to roughly twenty to thirty primaries, which is a [sharding](/blog/partitioning-sharding) problem you solve with a hash ring so that a user maps deterministically to a shard and a dead shard's users redistribute with minimal churn.
+
+What it must *not* be is a relational database. This is the most common wrong turn, and it comes from reading the feature as "store last-seen" instead of "absorb a write firehose for state I will discard the moment the user reconnects." The whole point of doing the [capacity estimation](/blog/capacity-estimation) first is that the writes-per-second number makes the storage decision for you before you have an opinion. Presence is soft state. It decays unless refreshed, nobody needs it durable, and the TTL key gives you expiry for free. A database would burn its life rewriting rows it is about to delete, and you would have paid for durability you actively do not want. If you have internalized [LSM-tree vs B-tree](/blog/lsm-tree-vs-btree) and the broader [database mindmap](/blog/database-mindmap), the tell is loud: a workload that is almost entirely short-lived writes with a hard expiry is the textbook case *against* a durable on-disk engine.
+
+Slack confirms the shape from the other direction. By their own account, the majority of events flowing through Slack are user presence status changes. Presence is not a side feature riding on chat; it is the dominant event class, which is precisely why mature systems give it a dedicated, specialized service instead of bolting it onto the messaging path.
+
+## Cost two: telling everyone, which is the hard one
+
+Writing the heartbeat is the cheap half. The expensive half is the fan-out: when one user's dot changes, everyone watching that user has to find out. This is not a new problem wearing a costume. It is the celebrity problem from feeds, and you can read its general treatment in [Design Twitter](/blog/design-twitter-feed). Presence just makes the cost legible in microseconds.
+
+Discord quantified it brutally. Publishing a single event from a roughly thirty-thousand-member channel took 900 milliseconds to 2.1 seconds, because Erlang's `send` primitive costs something like 30 to 70 microseconds each and you are doing tens of thousands of them from one process. The originating process becomes a serial bottleneck, spraying messages one at a time to every subscriber. That is the celebrity problem stated as a stopwatch reading, and it is the moment a naive design falls over.
+
+Their fix, called Manifold, is the move worth memorizing because it generalizes. Instead of the origin sending one message per *subscriber*, group the subscribers by which node they physically live on, send *one* message per remote node, and let a partitioner on that node hash-fan the event out to per-core workers and finally to the sessions. The invariant is the whole trick: the originating process issues at most one send per remote node, not one per subscriber. You push the fan-out down to where the subscribers actually are, so the expensive multiplication happens locally and in parallel instead of serially at the source. Run that across the fleet and the published numbers become almost absurd: over 26 million WebSocket events per second to more than 12 million concurrent users across 400 to 500 machines. That is what fan-out looks like when you stop doing it from one process.
+
+The second mitigation is even more powerful because it reduces the problem instead of parallelizing it. Slack only fans a presence change out to the users who are *currently looking*. In their words, a client receives presence notifications only for the subset of users visible on screen at that moment. You do not push a status change to everyone who *could* see it. You push it to the handful *currently viewing*. Viewport scoping collapses the subscriber set by orders of magnitude, because at any instant almost nobody is looking at almost anybody. This is the cheapest optimization in the entire design, and it is cheap precisely because it spends the staleness budget: a user you are not looking at can be a few seconds stale and you will never know.
+
+And for the genuine celebrity, the user with hundreds of thousands of watchers, you stop pushing entirely.
+
+```text
+Low-degree user  -> fan-out-on-WRITE: push the change to all watchers
+Celebrity / huge -> fan-out-on-READ:  watchers pull current presence
+                    when the user enters their viewport
+```
+
+Push for the many, pull for the few. It is the identical decision feeds make for celebrity authors, and Discord's per-node partitioned push is the hybrid sitting between the two extremes. A senior recognizes the fan-out fork on sight, because they have seen it in every system that has both normal users and superusers.
+
+## The staleness budget is the actual unlock
+
+Here is the idea the whole design pivots on, and it is a mindset before it is a mechanism.
+
+Write down a number. "Presence may be up to ten seconds stale." That sentence is not a concession you make under duress. It is a resource you allocate on purpose, and once you have it in hand, half the hard problems turn into knobs.
+
+Because you are allowed to lag, you can **debounce**: when a user's state changes twice in quick succession, you do not send two updates, you collapse them and send the latest once per window. Because you are allowed to lag, you can **coalesce on egress**: within a fan-out window, gather every transition destined for a given recipient into a single frame instead of a flurry of tiny pushes. Because you are allowed to lag, you can **jitter**: smear synchronized events across a few seconds instead of firing them all on the same boundary. Each of these trades freshness, which you have explicitly decided you can spare, for a dramatic reduction in writes, frames, and wakeups.
+
+The clearest place this pays off is the reconnect storm. Picture a regional network blip that knocks a quarter-million users offline in the same minute, each watched by fifty contacts.
+
+```text
+250,000 users go offline in ~the same minute
+x 50 contacts each watching them
+= 12,500,000 presence-change pushes in 60s
+≈ 208,000 pushes per second  (a brutal spike on top of normal load)
+```
+
+Without a budget, that spike lands all at once, exactly when your fleet is already reeling from the disconnects. With one, you attach 0 to 30 seconds of random jitter to each offline event and the same 12.5 million pushes smear into a flat plateau instead of a wall. You can go further and circuit-break: above some fan-out-rate threshold for an ultra-high-degree user, you simply drop the presence pushes and let viewers pull. The budget is what makes all of this legal. Spend it deliberately, in the egress path, where it buys the most.
+
+More frequent heartbeats, by contrast, buy almost nothing. Halving the interval doubles your write load and doubles connection wakeups for a freshness gain nobody can perceive. The interval should be tuned *to* the staleness budget, not toward zero. Real-time does not mean "as fast as the hardware allows." It means "inside the budget, and not one millisecond cheaper than that."
+
+## The connection substrate underneath all of it
+
+Before you can fan anything out, you have to *hold* the connections the heartbeats arrive on, and this is the cost that quietly caps your fleet size.
+
+A presence system is millions of simultaneously open, long-lived connections, usually WebSockets, sometimes Server-Sent Events. Which transport, and why, is its own decision worth understanding through [real-time transports](/blog/realtime-transports); the load-bearing fact here is that each connection is not free. LinkedIn reports roughly 100,000 persistent connections per node, at about 20 kilobytes of heap each, which is around 2 gigabytes of memory spent purely on connection state before any presence logic runs. They ran 16-gigabyte heaps on 64-gigabyte boxes and tuned the operating system to match: file-descriptor limits raised toward 200,000, the socket accept backlog widened.
+
+The consequence reorders your intuition about what drives capacity. Your fleet size is governed by *connections held*, not by *heartbeats processed*. At 20 kilobytes per connection a box tops out near 100,000 live clients no matter how cheap the presence write path is, so the number of front-door machines is a function of how many sockets you must keep open, full stop. This also reframes [autoscaling](/blog/autoscaling): you scale on open connections and memory pressure, not on CPU, because a presence node is almost never CPU-bound and almost always connection-bound. Optimizing the heartbeat handler to be twice as fast does nothing for a box that is out of memory holding sockets.
+
+## The staff-grade turns
+
+Everything to here gets you a working presence system. What follows is what a staff engineer raises in the design review, the failure modes that do not show up in a demo and absolutely show up at 2 a.m.
+
+**TTL expiry is not a reliable clock.** The seductive shortcut is to listen for Redis keyspace notifications and flip a user offline the instant their key expires. It does not work as your sole mechanism, and believing it does is a classic production bug. Redis expires keys lazily, on access or via a background sweep, so the `expired` event fires when the key is genuinely deleted, which under load can lag the logical zero of the TTL by an unbounded amount. The documentation is blunt: there is no guarantee the server generates the expired event at the moment the key's time-to-live reaches zero. So you do not *depend* on it. You use an authoritative trigger, a per-user scheduled timer at d plus two epsilon, or a sweep over a sorted set keyed by expiry score, and you treat the keyspace event as a hint that arrives when it arrives.
+
+**Pub/sub is lossy, so reconnect must re-sync, not replay.** Redis Pub/Sub is fire-and-forget, at-most-once. The docs spell out the consequence: if a subscriber disconnects and reconnects later, every event delivered while it was gone is simply lost. This means you cannot design the client to rely on having received the stream of deltas. Every reconnect must *re-fetch current state* for its visible set, a full snapshot of the viewport, with the delta stream layered on top as an optimization rather than the source of truth. Design the reconnect handshake as "fetch state for what I can see," and the lossy bus stops being a correctness problem.
+
+**Flap damping, because marginal links oscillate.** A user on a bad connection can bounce online and offline every few seconds, and each bounce multiplies into fan-out. Add hysteresis: require N consecutive missed beats before declaring offline, and pass through a short grace or SUSPECT window before you broadcast the transition. This is exactly the SUSPECT state that SWIM, the scalable membership protocol, uses before it declares a peer dead, and it exists for the same reason: a single missed probe is not death, it is a question.
+
+**Connected is not active is not engaged.** A heartbeat proves the connection is alive. It does not prove the human is doing anything. Real systems separate these: Slack auto-marks a user *away* after ten minutes of no client activity even while the socket stays perfectly connected. Liveness and engagement are different signals, and the green dot usually means the second one, which the heartbeat alone cannot tell you. You need client-side activity events feeding a separate away timer.
+
+**Who watches the watchers.** Client-to-server liveness is the heartbeat lease. Server-fleet liveness is a *different* failure detector, and forgetting that is a real gap. If a presence server dies, every user hashed to it appears frozen, neither refreshing nor expiring cleanly. The server tier wants gossip-based membership like SWIM and an adaptive detector like phi-accrual, which outputs a continuous suspicion level from heartbeat-arrival history instead of a hard up-or-down, so it produces fewer false positives on flaky inter-node links. Cassandra's default phi threshold of 8, roughly 99.9999 percent confidence, is a sane reference point. Two tiers, two detectors: leases below, gossip above. Building presence across regions layers the [multi-region and DR](/blog/multi-region-dr) questions on top of that, since a user's home shard and the watchers may not share a continent.
+
+**Drain without lying.** When you deploy a presence node, you must take it out of rotation *without* falsely marking all its users offline. LinkedIn's answer is to wait d plus two epsilon between marking a node for deployment and actually restarting it, so in-flight heartbeats re-home to a healthy node first and nobody's dot flickers because you shipped code. Graceful drain is a presence-specific concern precisely because the act of removing a server looks, to a naive system, exactly like every one of its users dying at once.
+
+**Privacy reshapes the fan-out itself.** Invisible mode, last-seen toggles, and per-contact visibility are not UI checkboxes bolted on at the end. They change *who is in the subscriber set*, and therefore the shape and size of every fan-out. A user in invisible mode must be removed from the watcher lists of people who should not see them, at fan-out time, in the engine, not hidden client-side where a crafted client could peek. Most consumer apps default presence on; the privacy survey work notes this, with professional networks as a notable exception. Whatever the default, the visibility rule has to be enforced where the push decision is made. If you have built role-aware fan-out before, the discipline is the same one in [event-driven RBAC](/blog/event-driven-rbac): authority is a property of the edge, evaluated when the message ships, never assumed by the recipient.
+
+## Where this actually shipped
+
+I have built the small end of this. [NomadCrew](/case-study/nomadcrew) runs real-time presence and live location for travel groups over a WebSocket hub, and it taught me the lesson the big-tech writeups assert: the connection layer is the constraint, not the logic. Holding the sockets open and re-syncing state cleanly on reconnect was the work; flipping a dot was an afterthought once the lease and the budget were nailed down. The mechanism scales down to a small group as honestly as it scales up to LinkedIn's half-billion members, because it is the same lease either way.
+
+If you are reasoning through this in an interview or a design doc, the spine to carry is the one from [the system design interview framework](/blog/system-design-interview-framework): state the staleness budget out loud as your first non-functional requirement, derive the heartbeat write rate to force the in-memory store, name the fan-out as the celebrity problem and split push from pull, then spend the budget on debounce and jitter, and only then reach for the staff-grade failure modes. The interviewer is not checking whether you can draw a green dot. They are checking whether you know it is a lease, and whether you can say how stale it is allowed to be.
+
+The honest landing is the thesis restated. The green dot is cheap. Guaranteeing it is correct and fresh for everyone, instantly, at millions of users is what costs money, and the discipline of a good design is that it explicitly refuses to do that. You decide how wrong the dot may be, you write the number down, and you bill every optimization against it. That refusal, stated as a budget, is the whole engineering.
+
+## FAQ
+
+<FAQ />

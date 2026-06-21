@@ -1,0 +1,180 @@
+export const meta = {
+  slug: 'dependency-resolution',
+  title: 'How Package Managers Resolve Dependencies: SAT Solving and PubGrub',
+  description:
+    'Installing packages looks like a download problem and is secretly an NP-complete search. How resolvers really work: backtracking, SAT solvers, and PubGrub.',
+  headline: 'How Package Managers Resolve Dependencies: SAT Solving and PubGrub',
+  deck: 'Picking one version of every package that satisfies every constraint is provably as hard as Boolean satisfiability, and that single fact explains every resolver you have ever cursed at.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['package-managers', 'dependency-resolution', 'sat-solving', 'pubgrub', 'algorithms', 'system-design'],
+  faq: [
+    {
+      q: 'Why is dependency resolution NP-complete?',
+      a: "Because it reduces to Boolean satisfiability. Treat each package version as a boolean variable, turn every Depends clause into a disjunction that must hold and every Conflicts into a clause forbidding co-presence, and asking whether a valid install set exists is exactly asking whether that formula is satisfiable. Di Cosmo and the EDOS project proved this reduction in 2005. It means no resolver is fast on every input; each one is a heuristic or exploits the fact that real dependency graphs look nothing like adversarial SAT instances.",
+    },
+    {
+      q: 'Does Cargo use PubGrub?',
+      a: "Not yet, and saying so is the most common mistake. Production Cargo ships a backtracking resolver with SemVer unification. PubGrub is the designated replacement, in progress behind the unstable -Z pubgrub flag, and it has to be one hundred percent behavior-compatible before it becomes the default. The package managers that use PubGrub in production today are Dart pub, Poetry, uv, Bundler, Swift Package Manager, and Hex.",
+    },
+    {
+      q: 'What makes PubGrub different from a normal SAT solver?',
+      a: "A generic SAT solver flattens every package version into its own boolean variable, which can mean thousands of variables and an unreadable conflict core when it fails. PubGrub keeps version ranges as first-class terms and records conflicts as incompatibilities, which are sets of terms that cannot all hold at once. That lets it produce a human sentence like every version of foo requires baz 3.0.0 instead of dumping a wall of variable assignments. It is conflict-driven clause learning kept in version space, optimized for explaining failure.",
+    },
+    {
+      q: 'Why do lockfiles make installs reproducible?',
+      a: "Because a lockfile is a cache of the answer to an NP-complete question. The first resolve does the expensive search and writes the exact solved graph to Cargo.lock, uv.lock, or pubspec.lock. Every later install verifies that known solution instead of re-solving, as long as the manifest still permits the pinned versions. Verifying a solution is cheap and deterministic, which is why CI after the first run is fast and gives you the same graph every time.",
+    },
+    {
+      q: 'Why does npm rarely fail to resolve when pip and Cargo do?',
+      a: "Because npm, yarn, and pnpm largely sidestep the hard problem. They allow multiple versions of the same package to coexist nested in node_modules, so a diamond with conflicting ranges just installs both copies instead of failing. That trades disk space and duplication for almost never hitting an unsatisfiable graph. Single-global-version ecosystems like Python packages and Rust crates cannot do that, so they have to actually solve the constraint problem.",
+    },
+  ],
+}
+
+You run `npm install` and it hangs. You run `pip install` and it prints "this is taking longer than usual, this could mean the package is unhealthy." Your instinct says network: a slow registry, a stalled download, a flaky mirror. Almost always, your instinct is wrong.
+
+The download is the trivial part. Deciding *what* to download is the hard part, and "hard" here is not a figure of speech. Picking one version of every package such that every dependency constraint is satisfied is provably as hard as Boolean satisfiability, the canonical NP-complete problem. That one fact is the whole story. It explains why naive resolvers blow up on a four-package graph, why three entirely different families of algorithms exist to do the same job, why the modern frontier cares more about *explaining* failure than about raw speed, and why lockfiles exist at all.
+
+This piece is about what actually happens between you pressing enter and the install starting. It turns out "dependency hell" was never a metaphor. It is a complexity class.
+
+## The reduction that turns installs into logic
+
+Start with the claim everything rests on. In 2005 the EDOS project, formalized by Di Cosmo and colleagues in a 2008 paper, proved that deciding whether a set of packages can be installed is NP-complete, by reducing it to SAT.
+
+The encoding is so direct it feels like cheating. Give every `(package, version)` pair a boolean variable: true means "this exact version is in the install set." Now translate the manifest:
+
+```
+Depends: A | B        becomes   (A_v1 OR A_v2 OR B_v1)     -- at least one must hold
+Conflicts: X          becomes   (NOT X_v1 OR NOT Y_v3)     -- these two cannot coexist
+"package P is wanted"  becomes   (P_v1 OR P_v2 OR ...)      -- some version of P must hold
+```
+
+Stack all of those clauses together with AND and you have a formula in conjunctive normal form. Asking "is there a valid set of versions to install?" is now *literally* the same question as "does this boolean formula have a satisfying assignment?" The package manager you cursed at last week is a SAT solver wearing a trench coat.
+
+Two pieces of vocabulary earn their place here, because the rest of the article leans on them. **Installability** is whether one package can be installed at all. **Co-installability** is whether a *set* of packages can be installed *together*, the multi-variable version, and it is the question real resolvers answer. And **NP-complete** does not mean "slow." It means no algorithm is known to be fast on *every* input, which has a sharp consequence: every resolver in existence is either a heuristic that can give up, or something that exploits the fact that real dependency graphs are nothing like the adversarial instances that make SAT hard. Hold that distinction. It is the most misunderstood thing in the whole field.
+
+If the reduction to a satisfiability question feels familiar, it is the same move that makes [the inverted index](/blog/inverted-index-search) fast and the same kind of constraint reasoning that shows up when you reason about [system design tradeoffs](/blog/system-design-interview-framework) under hard limits. Naming the problem class is what unlocks the right tool.
+
+## Why the obvious approach dies
+
+Before the clever algorithms, look at why you cannot just try things until one works. Picture the smallest possible failure, the diamond:
+
+```
+        root
+        /   \
+       A     B
+        \   /
+         D        A needs D >=1.0, <2.0
+                  B needs D >=2.0, <3.0   <- no single D satisfies both -> UNSAT
+```
+
+`root` pulls in `A` and `B`, both of which need `D`, but their ranges do not overlap. There is no version of `D` that satisfies both, so the graph is unsatisfiable. Fine, that one is easy to spot. The problem is what happens when the graph is deep instead of wide.
+
+The natural algorithm is depth-first backtracking: pick a version of the first package, recurse into its dependencies, and when you hit a dead end, undo the last choice and try the next version. Simple, and it is exactly what pip (via resolvelib), production Cargo, Cabal, and the node tooling do under the hood. The trouble is the size of the tree. As pip's own documentation puts it: package `A` has ten versions, each of which picks among five versions of a dependency, each of *those* among eight versions of another, and you are staring at millions of combinations. Worse, naive backtracking has no memory. It can hit the same underlying conflict through a thousand different paths and re-derive it from scratch every single time.
+
+pip is refreshingly honest about the consequence in its docs: once it starts backtracking, "it does not know how many choices it will reconsider, and how much computation would be needed" and so "it can take a long time." That sentence *is* dependency hell, described from the inside. The install is not slow because the network is slow. It is slow because a search tree with no pruning is quietly trying to brute-force an NP-complete problem on your laptop.
+
+And here is the counterintuitive part worth internalizing: *tighter* constraints usually make resolution *easier*, because they shrink the search space. It is the loose ones, the `>=0.6` and the bare `*`, that blow the tree up and breed duplicate versions. This is why Cargo's documentation actively discourages open-ended `>=` and wildcard requirements. More freedom for the resolver is not a gift. It is more rope.
+
+## Three families, one problem
+
+The ecosystem converged on three distinct answers to the same NP-complete question. Knowing which family a tool belongs to tells you, before you ever read its source, how it will behave when things go wrong.
+
+| Family | Complete? | Speed | Error quality | Who uses it |
+| --- | --- | --- | --- | --- |
+| Backtracking / DFS | Not guaranteed in bounded time | Fine on easy graphs, thrashes on hard ones | Poor | pip, production Cargo, Cabal, npm/yarn/pnpm |
+| Full SAT solver | Yes | Fast | Notoriously opaque | dnf, zypper, conda/mamba (libsolv), Composer |
+| PubGrub (CDCL in version space) | Yes | Fast | Designed to be readable | Dart pub, Poetry, uv, Swift PM, Hex, Bundler; Cargo in progress |
+
+**Backtracking** you already met. Simple to implement, no formal guarantee it finishes on a hard instance, and when it fails it can only really tell you *that* it failed.
+
+**Full SAT solvers** take the reduction at face value: encode everything into CNF and hand it to a real satisfiability engine. The dominant one is libsolv, the openSUSE library that powers dnf, zypper, and the conda/mamba world. It is described plainly as "a free package dependency solver using a satisfiability algorithm," and under the hood it is a MiniSat-class engine using conflict-driven clause learning with two-literal watching. It is *complete*, meaning if a valid install exists it will find one, and it is fast. The price is the error message. When a SAT solver proves a formula unsatisfiable, what it hands back is an unsatisfiable core: a minimal-ish set of contradicting boolean assignments. Mapping that back to "package X and package Y pinned different builds of Z" is genuinely hard, which is why dnf and conda conflict messages have a reputation. libsolv at least bolts on package-specific heuristics that can *suggest fixes*, something a generic SAT solver will never do, and it models the full RPM and Debian universe including weak dependencies like Recommends and Suggests that influence the solution without hard-failing it.
+
+The third family is the interesting one, and it exists almost entirely because of that error-message problem.
+
+## PubGrub: keep it in version space
+
+In 2018 Natalie Weizenbaum, building the resolver for Dart's pub, published the algorithm now called PubGrub. The premise is a refusal. A generic SAT solver throws away structure the moment it flattens `(package, version)` into anonymous booleans. You had a clean fact, "every version of `foo` in this range needs `bar` at version two," and you ground it into a thousand nameless variables. When the solve fails, you cannot un-grind it back into a sentence a human reads.
+
+PubGrub keeps the structure. Its atomic unit is the **term**: a statement about one package's allowed version range, positive ("`foo` in `[1.0.0, 2.0.0)`") or negative (its complement). It never expands a range into one-boolean-per-version. When it discovers a conflict, it records an **incompatibility**: a set of terms that may not *all* hold at once. The PubGrub-rs guide frames incompatibilities as *nogoods*, and a nogood is a conjunction, the De Morgan dual of the disjunctive clause a SAT solver stores. That representation choice is the entire reason PubGrub can explain itself, because an incompatibility maps cleanly onto the English phrase "these versions cannot coexist."
+
+Underneath, PubGrub is still doing conflict-driven clause learning, the trick that makes modern SAT solvers fast. **CDCL** means: when you hit a conflict, do not just step back one decision and retry. Compute the actual *root cause*, record it as a learned fact, and *backjump* straight past every intermediate decision that could not have mattered. Naive backtracking re-derives the same wall a million times; CDCL learns the wall exists once and never walks into it again. That is the difference between O(exponential thrash) and "fast in practice."
+
+The structural insight that makes the whole thing work is an asymmetry. The PubGrub-rs guide states it crisply: *"Incompatibilities express facts, and as such are always valid. Therefore, the set of incompatibilities is never backtracked, only growing."* Two collections are in flight. The **partial solution** holds your tentative decisions (versions chosen) and derivations (ranges deduced), and *this* is what rolls back on a conflict. The **incompatibility set** holds learned facts and only ever grows. That single monotonic set does double duty: it is the clause-learning that stops you re-exploring dead ends, *and* it is the proof object the error reporter later walks to generate its explanation. The same structure makes the algorithm fast and makes it articulate. That is the elegant part.
+
+Two mechanisms drive the loop. **Unit propagation** is the deduction step: when every term of an incompatibility but one is already satisfied, the remaining term is *forced*, exactly the way a partly-filled clause forces its last literal. When propagation produces a contradiction, the **satisfier / previous-satisfier** mechanism resolves it. It finds the earliest assignment in the partial solution that fully satisfies the conflicting incompatibility (the satisfier), and the earliest one before *that* which still keeps it satisfied (the previous satisfier). The previous satisfier's decision level is the backjump target. That is non-chronological backtracking done correctly, and most write-ups never even name the mechanism. The loop is the algorithm's heartbeat: decide a version, propagate the consequences, and on conflict, learn a new incompatibility and backjump, then decide again.
+
+## The explanation is the product
+
+Here is the payoff, and it is worth slowing down for, because it is the thing that actually changed the industry.
+
+Take this graph, straight from the dart pub specification:
+
+```
+root 1.0.0  depends on  foo ^1.0.0  and  baz ^1.0.0
+foo  1.0.0  depends on  bar ^2.0.0
+bar  2.0.0  depends on  baz ^3.0.0
+baz exists at 1.0.0 and 3.0.0
+```
+
+(`^1.0.0` is caret SemVer: it means `>=1.0.0, <2.0.0`. `^3.0.0` means `>=3.0.0, <4.0.0`. They do not overlap.) The transitive chain `foo -> bar -> baz` forces `baz` at version three. But `root` *also* directly demands `baz` at version one. No version of `baz` satisfies both, so the graph is unsatisfiable. A SAT solver would tell you this with a fistful of variable assignments. PubGrub tells you this:
+
+> Because every version of `foo` depends on `bar ^2.0.0` which depends on `baz ^3.0.0`, every version of `foo` requires `baz ^3.0.0`. So, because `root` depends on both `baz ^1.0.0` and `foo ^1.0.0`, version solving failed.
+
+Read the first clause again: "every version of `foo` requires `baz ^3.0.0`." That fact was *not stated anywhere* in the manifests. It is a *derived* incompatibility, learned by collapsing the `foo -> bar -> baz` chain during the solve. The error report is a depth-first walk of the **derivation graph**, the DAG of incompatibilities that together constitute a proof that root's dependencies are unsatisfiable, ordered so that external facts get explained before the conclusions drawn from them. The explanation is not generated *about* the proof after the fact. The explanation *is* the proof, read aloud.
+
+This is why the explanation is a product feature rather than a byproduct. The clinching evidence: Cargo's maintainers opened an issue titled, in plain words, "resolver error messages as good as PubGrub" (#5284). The Rust effort to move Cargo onto PubGrub is *motivated by error quality*, with the performance win as a bonus. When a team decides to swap out the resolver at the heart of a language's build tool and the headline reason is "so the failure message is readable," that tells you where the real cost of dependency hell was all along. Not in the milliseconds. In the human staring at the wall.
+
+## The nuance shallow write-ups get wrong
+
+Three corrections separate someone who has read about this from someone who has shipped against it.
+
+**"Cargo uses PubGrub" is currently false.** This is the single most common overstatement. Production Cargo ships a *backtracking* resolver with SemVer unification. PubGrub is the *designated, in-progress replacement*, gated behind the unstable `-Z pubgrub` flag, and the Rust project goal requires it to be one hundred percent behavior-compatible before it can become the default. The tools using PubGrub *today* are Dart pub, Poetry, uv, Bundler (which migrated off its older Molinillo resolver), Swift Package Manager, and Hex. Cargo is on the road, not at the destination.
+
+**"NP-complete means slow in practice" is false, and it is the nuance that matters most.** Both the EDOS work and the OPIUM paper (an ICSE 2007 result arguing for real SAT and ILP solvers in package management) stress the same point: the problem is intractable in the *worst case* and fast in the *typical case*, because real dependency graphs are nothing like the hand-crafted 3SAT instances that make the theory bite. NP-completeness bounds the worst case, not your Tuesday. The same way [capacity estimation](/blog/capacity-estimation) is about the load you will actually see, not the adversarial maximum, resolution performance is about the graphs that actually exist.
+
+**"PubGrub is just a faster SAT solver" misses the whole point.** It is CDCL deliberately kept in version-range space *specifically to explain itself*. Speed is the side dish. The main course is that a human can read the failure.
+
+While we are correcting things: a resolver does not find *the* correct answer, because there often is not a unique one. The same input graph produces different valid solutions depending on the *policy* the resolver encodes.
+
+## Resolution is a policy, not just a computation
+
+Cargo and uv are *greedy*: given a choice, they pick the highest compatible version. Go's modules and vcpkg do the opposite, Minimal Version Selection, deliberately choosing the *oldest* compatible version for maximal reproducibility. Maven, Gradle, and NuGet do not really search at all; they use *version mediation*, resolving duplicates by convention ("nearest wins" in the dependency tree) rather than by solving a constraint problem. Same graph, three philosophies, potentially three different and mutually-incompatible answers. Resolution encodes a value judgment about which valid world you want to live in.
+
+Cargo's SemVer unification makes the policy concrete, and the behavior surprises people. `bitflags = "1.0"` and `bitflags = "1.1"` resolve to **one** version, because both ranges share a major and unify. `log = "=0.4.11"` and `log = "=0.4.8"` produce an **error**, two exact pins that cannot reconcile. But `rand = "0.7"` and `rand = "0.6"` give you **two** coexisting versions (say `0.6.5` and `0.7.3`), because different majors live side by side. The footgun there: a type from `rand 0.6` and the "same" type from `rand 0.7` are *incompatible at the type level* even though the names match, which baffles anyone who assumed one name meant one type.
+
+The constraint set is also widening past versions. Cargo's resolver v3 is MSRV-aware: a crate declaring `rust-version = "1.62"` with `clap = "4.0"` resolves to `4.0.32` (compatible with Rust 1.62) rather than a newer `4.5.20` that needs Rust 1.74. The Rust project goal lists CVE-aware resolution as a target too. Resolution is creeping from "which versions satisfy the ranges" toward "which versions satisfy the ranges *and* my toolchain *and* my security posture."
+
+## The modern frontier: forking, anti-thrash, and feature graphs
+
+Textbook PubGrub is not where production stopped. uv, Astral's Python resolver, shows where the real edges are.
+
+The biggest one is **forking, or universal, resolution** (an idea uv inherited from Poetry). Python dependencies can differ by environment marker: package `X` might require one version under `python_version >= "3.11"` and another below it. Rather than resolve for one platform, uv *splits* the resolution into independent forks per marker, solves each, and merges any that come out identical. The lockfile then records each fork's `resolution-markers`, so a single `uv.lock` correctly serves every platform at once. That is a meaningfully harder problem than the one PubGrub was originally specified for.
+
+The second edge is an **anti-thrash heuristic**, because real-world graphs still find pathological corners. uv tracks pairwise conflict counts, and when a given pair of packages has conflicted *five* times, it promotes both to a "highly conflicting" priority, forces one to be decided before the other, and manually backjumps to before the troublesome decision. Pure PubGrub does not prescribe any of this. It is an engineering patch (uv PR #9843) layered on top of the clean algorithm to tame graphs the clean algorithm would grind on. The lesson generalizes: elegant algorithms meet ugly inputs, and production is where you bolt on the heuristics that the paper left out.
+
+The third edge is that **feature resolution is a second constraint problem stacked on the first**. Cargo features (and their v2/v3 semantics, which deliberately *stop* unifying features across build, dev, and target boundaries) mean two packages can request the same dependency with *different* sets of optional features that must be reconciled. Optional dependencies make the variable space bigger than "just versions," and the resolver has to satisfy the feature graph and the version graph at the same time.
+
+There is even a genuine *correctness* gap hiding under all this. OPIUM's argument is that heuristic, cutoff-based backtracking resolvers can *fail to find a solution that actually exists*, while complete solvers (SAT, PubGrub, answer-set programming) are guaranteed to find one if it exists. pip's depth limit and its "resolution-too-deep" error are exactly this: a bounded search that can give up on a solvable problem. OPIUM goes further and asks for *optimization*, using integer-linear programming to find the *best* graph (fewest packages, smallest download) rather than any valid one. Most mainstream resolvers do not optimize globally; Cargo's docs candidly admit it is greedy and can land on a duplicate-heavy solution. The gap between "satisfy" and "optimize" is where the research still lives, and tools like `resolvo` (the from-scratch CDCL-lineage solver behind prefix.dev's Rattler) prove the space is still moving.
+
+## Lockfiles: caching the answer to an NP-complete question
+
+Now the part that reframes a file you have committed a thousand times without thinking about it.
+
+A lockfile (`Cargo.lock`, `uv.lock`, `pubspec.lock`) is not "a list of versions for reproducibility." That description is true and shallow. A lockfile is a **cache of the solution to an NP-complete query**. The first install does the expensive thing: it solves the constraint problem. Then it writes the entire solved graph down. The Cargo book is explicit that the lockfile has the *highest priority* in resolution: later runs reuse the pinned versions exactly, as long as the manifest still permits them, and only re-solve when the constraints actually change.
+
+That is *why* lockfiles give you cheap reproducibility. Verifying a known solution against the manifest is fast and deterministic; re-deriving it from scratch is the NP-complete search you paid for once. So every CI run after the first skips the solve entirely. It does the cheap thing instead: confirm this known-good solution still satisfies the constraints. The lockfile turns an expensive search into a fast check, the same way memoizing turns recomputation into a lookup. Change the manifest and you invalidate the relevant part of the cache, triggering a partial re-solve; leave it alone and you never pay the search cost again.
+
+It is the same instinct that runs through good systems work generally: when an answer is expensive to compute and stable once computed, you store the answer. [Idempotent webhooks](/blog/idempotent-webhooks) cache "I already handled this event." A lockfile caches "I already solved this graph." Different domains, identical move.
+
+## The honest landing
+
+Dependency hell was never a download problem, and treating it like one is why the symptoms felt so mysterious. Underneath the spinner is a search through a space that is, in the worst case, exponential, because deciding what to install is the same shape as deciding whether a boolean formula can be satisfied. Once you see that reduction, everything downstream snaps into focus. The diamond that cannot resolve is an unsatisfiable clause. The install that hangs for ten minutes is naive backtracking with no memory re-deriving the same conflict through a thousand paths. The three families of resolver are three bets on how to attack the same hard problem. The lockfile in your repo is a cache of an NP-complete answer.
+
+And the most telling fact about where the field is going is what the smartest resolver teams are optimizing *for*. Not milliseconds. When Cargo's maintainers reach for PubGrub, the headline reason is that a human should be able to read the failure. The measure of progress stopped being "how fast does it solve" and became "when it cannot solve, can you understand why." That is the right thing to want. A resolver that finishes in fifty milliseconds and leaves you guessing has solved the easy half of the problem. The hard half was always the human staring at the wall, and that is the half PubGrub decided to make legible.
+
+## FAQ
+
+<FAQ />

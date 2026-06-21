@@ -1,0 +1,168 @@
+export const meta = {
+  slug: 'database-mindmap',
+  title: 'Choosing a Database by Data Structure, Not by Logo',
+  description:
+    'Stop picking databases by brand. Pick the access pattern, then the data structure that makes it cheap, then the engine. A RUM-grounded decision framework.',
+  headline: 'Choosing a Database by Data Structure, Not by Logo',
+  deck: 'The database name is the last decision you make, and the most reversible one, so stop making it first.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '15 min',
+  tags: ['databases', 'system-design', 'data-structures', 'lsm-tree', 'b-tree', 'postgresql'],
+  faq: [
+    {
+      q: 'How should I choose a database for a new system?',
+      a: 'Work in three steps and respect their order. First, name the dominant access pattern, the thing 90 percent of your traffic does: point lookup, range scan, full-text match, nearest-neighbor, multi-hop traversal, or full-column aggregate. Second, pick the data structure that makes that pattern cheap, knowing it will cost you on two of the three RUM axes (read, update, memory). Third, and only third, pick a product, preferring an engine you already run that can host that structure as an index or extension. The product name is the last and most reversible decision, so making it first is backwards.',
+    },
+    {
+      q: 'What is the RUM conjecture?',
+      a: 'RUM stands for Read overhead, Update overhead, and Memory overhead, from a 2016 paper by Athanassoulis and colleagues. The conjecture says an access method that bounds two of those three overheads gives up a bound on the third. There is no structure that is simultaneously read-optimal, update-optimal, and space-optimal. Every real datastore is a point inside that triangle, and choosing one means choosing which corner you sacrifice.',
+    },
+    {
+      q: 'Is an LSM-tree always better than a B-tree for writes?',
+      a: 'Directionally yes, as a law no. LSM-trees turn random writes into sequential ones and defer the sorting work to background compaction, so they have lower write amplification on ingest-heavy workloads. But with Bloom filters and caching, an LSM point read can match a B-tree, and on NVMe the B-tree write penalty shrinks. The honest claim is about amplification tendencies, not absolutes: LSM trades read amplification and bursty compaction stalls for cheaper writes, and whether that trade wins depends on your read/write mix and storage tier.',
+    },
+    {
+      q: 'When should I add a second database instead of an index?',
+      a: 'Add the index first, almost always. A new query shape usually maps to a data structure your current engine already ships. In Postgres alone, GIN gives you an inverted index for full-text and JSONB containment, GiST gives spatial and nearest-neighbor, BRIN gives cheap pruning on time-sorted tables, and JSONB gives document storage. Reach for a separate search, spatial, or document database only when the access pattern needs a structure your engine cannot host, or when its scale or operational profile genuinely diverges. Polyglot persistence is a real pattern, but it is an operational and consistency cost, not a default.',
+    },
+    {
+      q: 'Why is columnar storage bad for transactional writes?',
+      a: 'Columnar formats store each column in its own compressed run so an analytical query can scan a few columns across millions of rows without touching the rest. That layout is update-hostile by construction: you cannot update a single row in place inside a compressed column without rewriting the run. Columnar buys analytics scan speed and strong compression by giving up cheap row mutation, which makes it the wrong structure for an OLTP write path and the right one for the warehouse behind it.',
+    },
+  ],
+}
+
+A team I worked with once shipped a feature, hit a slow query, and reached for a new database. Search got slow, so they bolted on Elasticsearch. A geo feature arrived, so they stood up PostGIS in its own cluster. Someone read a blog post about traversals, so a graph database appeared for the recommendations. Eighteen months later the architecture diagram had four datastores, three of which existed because a single query was slow once, and the on-call rotation had four sets of backups, four failover stories, and four ways to be woken up at 3 a.m.
+
+Here is the thing nobody said out loud: every one of those decisions was a data-structure decision wearing a logo. The team thought it was choosing products. It was actually choosing access methods, badly, and paying for each one with a whole new operational surface.
+
+This piece is about the move that prevents that sprawl. You stop asking "which database?" and start asking "which data structure makes my dominant access pattern cheap, and what does it cost me on the other two axes?" The product name falls out of that answer almost as an afterthought, and it turns out to be the most reversible decision in the whole stack.
+
+## The question that hides the real question
+
+"Postgres or Mongo or Elastic?" feels like a database question. It is mostly a disguised question about three data structures: a B-tree, an LSM-backed document store, and an inverted index. And the reason the disguise matters is that one product usually ships several of these structures and lets you choose per index.
+
+PostgreSQL is the cleanest proof. It is one "database," but `CREATE INDEX ... USING {btree | hash | gist | spgist | gin | brin | bloom}` selects a genuinely different data structure for each access pattern inside the same engine. A B-tree for range scans, a GIN inverted index for full-text and JSONB containment, a GiST tree for nearest-neighbor geo, a BRIN summary for an append-only time series. You can change the data structure four times without changing the logo once. MySQL, SQLite, SQL Server, and Oracle all do versions of this.
+
+So the unit of the decision is not the product. It is the access method. A staff engineer decides in this order: name the access pattern, choose the data structure that makes it cheap, understand the bill that structure runs up elsewhere, and then pick the cheapest engine that ships that structure with operations you can actually run. The junior version runs the order backwards, starts from the logo, and inherits whatever structure the logo defaults to.
+
+That reframe sits one level below the [system design interview framework](/blog/system-design-interview-framework). The framework tells you to derive storage from access patterns and [capacity estimation](/blog/capacity-estimation). This is the layer underneath: once you know the access pattern and the numbers, which physical structure do you actually want, and why.
+
+## There is no free corner
+
+The theory that makes this rigorous is the RUM conjecture, from a 2016 paper by Athanassoulis and colleagues out of Harvard's data-systems lab. It defines three overheads, each a ratio of work done to useful work:
+
+- **Read overhead (R)**: bytes you read to answer a query, over the bytes the query actually returns.
+- **Update overhead (U)**: bytes an update touches (the row, every secondary index, the log), over the bytes that logically changed.
+- **Memory overhead (M)**: total bytes stored (data plus all the auxiliary structures), over the base data.
+
+The conjecture, stated plainly: an access method that sets an upper bound on two of these three overheads sets a lower bound on the third. You cannot be read-optimal, update-optimal, and space-optimal at the same time. Every real datastore is a point inside that triangle, and design is the act of choosing which corner you walk toward and which axis you let float up.
+
+The proof that makes it click is one logical object stored three ways. Take the set of integers from 0 to 1000.
+
+Store it as a **bitset**, one bit per possible value. Membership is a single bit test, so read overhead is 1 and update overhead is 1. But for a sparse set the space cost runs away, because you pay for every possible value whether present or not, so memory overhead heads toward infinity.
+
+Store it as an **append-only log**, just write each change at the end. Updates are a single append, so update overhead is 1. But answering "is 742 in the set?" means scanning the whole log, so read overhead heads toward infinity, and you keep dead versions, so memory does too.
+
+Store it as a **dense sorted array**. Memory overhead is 1, nothing wasted. But a lookup is a scan or binary search and an insert shifts the array, so both read and update overhead grow with the size of the set.
+
+Same set. Three structures. Three corners. There is no implementation that wins all three, and that is not an engineering failure waiting to be solved. It is a property of the space.
+
+## The same triangle, in Grafana
+
+The RUM triangle is the academic statement. Storage engineers reinvented it independently, and their version is the one you will actually see on a dashboard. Mark Callaghan, who ran MySQL and RocksDB at Facebook scale, framed it as read amplification, write amplification, and space amplification, and explicitly called it a CAP-style "pick two."
+
+The definitions are concrete:
+
+- **Write amplification** is bytes written to storage divided by bytes written to the database. Push 10 MB/s of logical writes, watch 30 MB/s hit the disk, and your write amplification is 3.
+- **Read amplification** is disk reads per query. If answering one query needs 5 page reads, read amplification is 5.
+- **Space amplification** is on-disk size over logical size. Store 10 MB that occupies 100 MB on disk, and space amplification is 10.
+
+That maps almost one-to-one onto RUM: write-amp is U, read-amp is R, space-amp is M. It is the bridge between the paper and the production incident. And it lets you put real numbers on the B-tree-versus-LSM debate that the logos obscure.
+
+Take a B-tree. To change one 128-byte row, it rewrites the entire 4 KB page that row lives in, plus a write-ahead log entry for crash recovery. So the disk write for a 128-byte logical change is roughly (4096 + 128) / 128, about 33 times the data you actually changed. You wrote 128 bytes; the disk wrote 33 times that. That is the price of keeping data sorted and ready to read.
+
+Now take an LSM-tree under leveled compaction. Writes land in an in-memory sorted buffer, flush sequentially to disk, and get merged in the background through levels that each hold roughly 10 times the data of the level above. A representative leveled-compaction write-amp works out to something like 1 + 1 + 1 + 7 + 7 + 7, about 24. Lower than the B-tree's 33, and that gap is the structural reason LSMs win write-heavy ingest. They defer and batch the sorting work instead of paying it inline on every write.
+
+Space tells the opposite story. A B-tree leaves pages partially full so it has room to insert without splitting, so it runs at roughly 1.5x space amplification when pages sit about two-thirds full, and 2x when they are half full. LSM leveled compaction packs tightly: Facebook's RocksDB work measured roughly 1.11x space amplification under leveled compaction. The LSM spends write amplification to claw back space.
+
+The deepest one-line statement of the whole tradeoff comes from an ACM Queue piece titled "Write Amplification Versus Read Perspiration." Keeping data sorted costs the same total work no matter which engine you pick. You only choose when to pay it: eagerly on every write, which is the B-tree's write amplification, or lazily by merging on read and in background compaction, which is the LSM's read perspiration. Sort cost is conserved. The engine just moves the bill around. That is exactly the kind of physics-level tradeoff the [LSM-tree versus B-tree post](/blog/lsm-tree-vs-btree) takes apart in detail.
+
+## The map from access pattern to structure
+
+Here is the table that replaces the logo question. Read it as: name the pattern in column one, and the structure in column two is what makes it cheap, with column three telling you what it costs.
+
+| Access pattern | Structure that wins | What it pays | Lives in |
+| --- | --- | --- | --- |
+| Point lookup plus range scan on sortable keys | B-tree / B+tree | Higher write-amp (full-page rewrite + WAL) | Postgres, InnoDB, SQLite, SQL Server |
+| Write-firehose ingest, still some range scans | LSM-tree | Higher read-amp and bursty compaction | RocksDB, Cassandra, ScyllaDB, HBase |
+| Point equality only, O(1) get | Hash index | No ranges; index wants to fit in memory | Redis, Bitcask, Postgres `hash` |
+| Full-text, token, "contains term X" | Inverted index | Re-index cost, segment merges, space | Lucene, Elasticsearch, Postgres GIN |
+| Spatial range and nearest-neighbor | R-tree / GiST | Build cost; collapses in high dimensions | PostGIS, Oracle Spatial |
+| Analytical scan: few columns, millions of rows, aggregate | Columnar | No cheap row updates at all | Parquet, ClickHouse, DuckDB, BigQuery |
+| Multi-hop traversal, depth 3 or more | Graph adjacency | Poor full-table aggregates | Neo4j, Memgraph |
+| Huge table physically sorted by a column | BRIN | Useless if data is not physically clustered | Postgres BRIN |
+| "Is this key definitely absent?" pre-check | Bloom filter | Probabilistic; false positives | RocksDB/Cassandra filters, Postgres `bloom` |
+
+A few of these reward a closer look, because the why is where the senior judgment lives.
+
+The **inverted index** answers "which documents contain term X" by keeping, for each term, a sorted postings list of the documents that hold it, with skip lists so a query can leap over irrelevant entries in O(log n). Lucene segments are immutable, which is why search engines can cache them aggressively and search them concurrently without locks. The cost is on the write side: every update means re-indexing and eventual segment merges, which is the inverted index's version of write amplification. This is what you get from `USING gin` in Postgres before you ever reach for Elasticsearch.
+
+**Graph adjacency** is the one people misread most. A native graph database stores each relationship as a direct pointer, so following an edge is O(1), against the O(log n) of a B-tree index probe in a relational join. The payoff is not "I have relationships in my data," because all relational data has relationships. The payoff shows up at depth. A friends-of-friends-of-friends query is three or four joins relational, each an O(log n) probe across the whole table, and the cost climbs with every hop and every row added. A native graph traverses the same path at constant cost per hop, the same whether the graph holds a thousand nodes or a hundred million. The crossover is around depth 3 to 4. At depth 1, a relational engine with a B-tree on the foreign key is usually faster and far simpler, and reaching for a graph database there is the structure choosing you instead of the other way around.
+
+**Columnar** is update-hostile on purpose. By storing each column as its own compressed run, an OLAP query scans a few columns over millions of rows and skips everything else, and the compression shrinks memory overhead at the same time. The catch is that you cannot update a row in place inside a compressed column. The format that makes the warehouse fast is the wrong tool for the OLTP write path in front of it, which is exactly why systems run both: a row store for transactions, a column store for analytics over the same data.
+
+And the **Bloom filter** earns its place by what it lets you skip. It is a probabilistic set-membership structure with no false negatives. It cannot tell you a key is present, but it can tell you a key is definitely absent, which lets an LSM avoid touching a disk run that cannot possibly hold the key. Tiny memory cost, large cut to read amplification. It does not answer your query; it saves you a seek. This is the same skip-the-work instinct behind a well-placed [distributed cache](/blog/distributed-cache): the cheapest read is the one you prove you can avoid.
+
+## A decision tree you can actually run
+
+Characterize the dominant access pattern first, the 90-percent case, not the rare one. Then walk down.
+
+**Is the workload analytical, scanning many rows over a few columns to aggregate?** Go columnar (ClickHouse, DuckDB, Parquet-on-something). Accept that cheap row updates are gone.
+
+**Is the primary query a multi-hop traversal at depth 3 or more, variable length?** Go graph adjacency (Neo4j, Memgraph). Accept poor full-table aggregates.
+
+**Is it full-text, token, or fuzzy "contains term" search?** Go inverted index. Stay in Postgres with GIN if you can, move to Elasticsearch when scale or relevance tuning demands it.
+
+**Is it spatial or nearest-neighbor?** For low-dimensional geo, an R-tree or GiST (PostGIS) wins. For high-dimensional vectors, do not reach for an R-tree, because bounding-box pruning loses its power as dimensions climb (the curse of dimensionality means that beyond roughly 10 to 20 dimensions a spatial tree degrades toward a full scan). That is precisely why vector search uses approximate-nearest-neighbor structures like HNSW instead. Same "match the structure to the pattern" logic, one layer newer.
+
+**Is it OLTP point and range on sortable keys, the default case?** Now split on writes. If you are ingest-bound and write amplification or flash endurance is the constraint, go LSM (RocksDB, Cassandra, Scylla), and treat the compaction strategy as a RUM dial you own. Otherwise go B-tree (Postgres, MySQL, SQLite) for the lowest read-amp and free sorted scans. If it is pure point-equality with no ranges and it fits in memory, a hash index (Redis, Bitcask) is the sharpest tool.
+
+Then run the cross-cutting checks at every leaf. Append-only and physically time-sorted? Add a BRIN index, which is just min/max summaries per block range, before you reach for a dedicated time-series database. Document-shaped aggregate fetched by id? JSONB plus GIN in Postgres may beat adopting Mongo. Lots of "is this key present" misses hammering disk? Add Bloom filters to cut read-amp.
+
+Only now do you pick the product, in this order: can an engine I already run host this structure as an index or extension, which is the cheapest possible outcome? If not, which engine ships this structure with operations I can actually run (backup, HA, scaling)? And finally, how reversible is this? The access-pattern decision is hard to reverse because it is wired into your schema and your queries. The engine decision is a bounded migration, expensive but finite. Do not treat the reversible decision as if it were the permanent one.
+
+## What the logos make you forget
+
+A handful of misconceptions survive only because the logo hides the structure underneath.
+
+**"NoSQL is faster than SQL."** This compares a marketing label to a query language. A Postgres B-tree point-get and a Mongo `_id` lookup both bottom out in a tree walk. The difference that matters is storage layout and amplification profile, not a "SQL tax."
+
+**"LSM is always better for writes, B-tree always better for reads."** True as a tendency, false as a law. With Bloom filters and caching, an LSM's worst-case point-read amplification can match a B-tree's. On NVMe, the random-write penalty that made in-place B-tree updates look catastrophic on spinning disks largely evaporates, and the modern argument for LSM is write amplification for flash endurance and tighter space, not "random writes are slow." Re-derive the tradeoff for your storage tier instead of inheriting disk-era folklore.
+
+**"A graph database is for any data with relationships."** Covered above, and worth repeating because it is the most expensive version of the mistake. Index-free adjacency pays off for deep, variable-length traversals. For depth-1 joins, the relational engine wins.
+
+**"Add a search, spatial, or graph database whenever a new query shape appears."** This is the sprawl from the opening, restated as a default. Often you can stay in one engine. Polyglot persistence is a legitimate pattern, but it is a cost you take on deliberately (more operational surface, more backups, eventual-consistency seams between stores), not a reflex.
+
+## What a staff engineer notices that a benchmark misses
+
+The RUM triangle has a fourth, hidden axis: variance. Compaction in an LSM and page-splits or vacuum in a B-tree convert steady-state cost into bursty tail latency. "LSM has lower average write-amp" can sit right next to "LSM has a worse p99 during a compaction stall." If you benchmark only the happy path, you will be surprised in production by the spike, not the mean. Budget for the tail, which the [latency and the tail](/blog/latency-throughput-tail) piece argues is the number your users actually feel.
+
+Compaction strategy is itself a RUM dial you own after you have chosen the engine. Leveled versus size-tiered versus universal in RocksDB or Cassandra is literally "trade write-amp for space-amp," exposed as configuration. Size-tiered runs roughly 2x space amplification against leveled's 1.1x, in exchange for less write amplification. Choosing the engine does not end the decision; you re-make the same tradeoff one layer down.
+
+Secondary indexes are RUM multipliers, and the logo question hides the multiplication. Every secondary index speeds some read and taxes every write that touches the table, plus the space it occupies. Make that tax explicit per index, because "just add an index" is never free on the U and M axes.
+
+The layout decision is orthogonal to the structure and easy to conflate. InnoDB clusters the table on the primary-key B-tree, so secondary indexes carry the primary key rather than a direct row pointer; Postgres uses a heap with separate indexes. Both say "B-tree," and they have materially different write and space behavior. Same word, different physics.
+
+And the real frontier is not "B-tree versus LSM" at all. The RUM authors point past fixed structures toward adaptive indexing, database cracking, and learned indexes, structures that move within the triangle as the workload shifts instead of committing to one corner at schema-design time. The senior question is increasingly "fixed or adaptive," not which fixed shape.
+
+## The landing
+
+Look back at the four-database sprawl. Elasticsearch was an inverted index, available as GIN. PostGIS was an R-tree, available as GiST in the database they already ran. The graph store solved a depth-2 problem a foreign-key B-tree handled fine. Three of the four products existed because nobody translated the logo back into the structure, and so nobody noticed the structure was already sitting in the engine they had.
+
+The discipline is small and it never changes. Name the access pattern. Choose the structure that makes it cheap, and say out loud which of read, write, and space you are sacrificing to get it. Prefer adding that structure to an engine you already run. You will still type a product name into a config file at the end. Just make sure it is the last decision you make, and not the first, because by the time you type it, the real choice is already made. Whether you ran the URL shortener's key design through this same lens (see [the URL shortener](/blog/url-shortener)) or sized it with [consistent hashing](/blog/consistent-hashing) and [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum), the move is identical: structure first, logo last.
+
+## FAQ
+
+<FAQ />

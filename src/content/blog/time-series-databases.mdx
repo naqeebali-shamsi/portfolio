@@ -1,0 +1,152 @@
+export const meta = {
+  slug: 'time-series-databases',
+  title: 'How Time-Series Databases Work: Why Metrics Need a Different Engine',
+  description:
+    'Metrics are append-only, timestamp-ordered, and read in windows. That workload shape breaks an OLTP B-tree and is exactly what a purpose-built time-series engine exploits.',
+  headline: 'How Time-Series Databases Work: Why Metrics Need a Different Engine',
+  deck: 'A metrics workload is append-only at "now" and read in windows, and a purpose-built engine wins by exploiting that shape to do less work and store far fewer bytes.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['time-series', 'databases', 'observability', 'prometheus', 'compression', 'system-design'],
+  faq: [
+    {
+      q: 'Why not just add a timestamp column to Postgres for metrics?',
+      a: "You can, and it works until ingest scales. A general B-tree index over (series, time) thrashes on inserts because every new sample lands in a different leaf and the working set outgrows RAM, so you pay random I/O on the hot path. A time-series engine keeps only the current chunk hot and sequential, makes old data immutable so eviction is a file delete instead of a billion-row DELETE, and stores points at roughly 1 to 2 bytes each. The timestamp column is the easy part. The engine is the part that makes the workload cheap.",
+    },
+    {
+      q: 'How do time-series databases get points down to about one byte each?',
+      a: "Two tricks from Facebook's Gorilla paper. Timestamps use delta-of-delta: because metrics are scraped on a fixed interval, the gap between samples is constant, so the change in the gap is zero and costs a single bit roughly 96% of the time. Values use XOR float compression: XOR each float64 with the previous one and store only the meaningful bits between the leading and trailing zero runs, which collapses unchanged values to one bit. Gorilla averaged about 1.37 bytes per point; Prometheus reproduced about 1.28 bytes per point in production. The figure is workload-dependent and high-entropy values defeat it.",
+    },
+    {
+      q: 'What actually breaks a time-series database in production?',
+      a: "Cardinality, not raw data volume. Each unique label-set is one series with its own chunk stream and its own entry in the inverted index, and the in-memory head holds about two hours of every active series. A million points across ten series is trivial; a million points across a million series can OOM the process. The classic trigger is a label that is bounded in staging but unbounded in production, like user_id, request_id, or a pod name on a service that autoscales, where adding one two-value label doubles series count.",
+    },
+    {
+      q: 'Is Prometheus the same thing as Gorilla?',
+      a: "No. Gorilla is an in-memory system with a 26-hour window and lossy eviction, built at Facebook as a hot cache in front of a durable store. Prometheus borrowed only the compression idea: its float chunk is a Gorilla-inspired XOR encoder, but Prometheus is a durable on-disk engine with write-ahead logging, immutable blocks, and configurable retention. Conflating them misstates durability and retention. Gorilla shipped as the open-source Beringei, which is now archived.",
+    },
+    {
+      q: 'How do you keep years of metrics without storage exploding?',
+      a: "Downsampling, treated as a first-class lifecycle rather than an afterthought. Compression makes each point tiny, but total cost is points-per-second times series times retention, so the real lever on old data is reducing resolution. The mature pattern keeps full resolution for 15 to 30 days, hourly rollups for a year, and daily rollups indefinitely. Recording rules precompute aggregates while keeping raw data; rollup rules and TimescaleDB continuous aggregates can discard the raw samples and keep only the rollup.",
+    },
+  ],
+}
+
+A metrics database has the easiest job in the building and the hardest one to do cheaply. Every measurement looks the same: a timestamp, a number, and a label that says what was measured. Nothing updates. Nothing deletes until it ages out. The writes all land at the same instant, "now," and march forward. If you described that workload to someone who had never seen a database, they would say it sounds trivial.
+
+It is trivial, right up until you run it on a database built for something else. Then it becomes one of the more expensive things you can ask a machine to do.
+
+The reason is that a general-purpose database is tuned for a workload that looks nothing like this. An OLTP store expects random point reads and in-place updates scattered across a shared index: a user changes their email, an order flips to shipped, a balance moves. Metrics are the opposite shape. They are append-only at a monotonically increasing time, read back in windows, and hot at the recent edge while the old tail goes cold and stays cold. A purpose-built time-series engine does not win by being a faster version of the same thing. It wins by taking the shape of the workload as a gift and doing less work because of it.
+
+This piece is about that shape, and about the three tricks an engine derives from it: compress because the data barely changes, partition by time because everything is immutable once written, and watch cardinality because that, not volume, is what kills you. If you want the wider map of where this engine sits among the others, [the database mindmap](/blog/database-mindmap) places it next to its neighbors.
+
+## The shape is the whole argument
+
+Start with what a single measurement costs before anyone is clever about it. A data point is an 8-byte timestamp and an 8-byte float64. Sixteen bytes. A modest fleet emitting a few hundred thousand points per second, kept for a couple of weeks, turns sixteen bytes into a number with too many zeros to keep in your head. So the first question an engine asks is not "how do I store this fast" but "how do I store almost none of it."
+
+That question only has a good answer because of what the data looks like up close. Consecutive samples of the same series are nearly identical. A CPU gauge scraped every ten seconds reads 0.41, then 0.41, then 0.42, then 0.41. A counter sits flat between events. The timestamps are even more regular than the values, because the scrape interval is fixed by configuration, so the gap between samples is the same ten seconds every single time. The data is boring on purpose, and boring data compresses.
+
+The second thing the shape gives you is immutability for free. In an OLTP table, "this row never changes after insert" is a constraint you would have to impose and police. In a metrics store it is just true. You do not go back and edit what the CPU read forty minutes ago. That single fact, the past is read-only, is what makes time-partitioning pay off, because a partition that will never be written again can be sealed, compacted, memory-mapped, and eventually deleted in one move.
+
+Hold those two properties, near-constant data and a read-only past, because every engine decision below falls out of them.
+
+## Compression, written out instead of hand-waved
+
+Most explanations of time-series compression stop at "it uses delta encoding, very efficient." That is true and useless. The interesting part is the exact mechanism, because it explains why the savings are so extreme and where they evaporate. The canonical answer is Facebook's Gorilla paper, which compressed a `(timestamp, value)` pair from 16 bytes down to about 1.37 bytes on average, a roughly 12x reduction, while serving around 700 million points per minute across two billion time series. Two encodings carry that result, one for timestamps and one for values, and they are worth seeing in full.
+
+Timestamps use delta-of-delta. Plain delta would store each timestamp as its gap from the previous one: +10, +10, +10. Delta-of-delta goes one derivative further and stores the change in the gap. For a fixed scrape interval that change is zero, every time, so the common case collapses to a single bit.
+
+```
+First delta from the block header:        14 bits
+Then D = (t_n - t_{n-1}) - (t_{n-1} - t_{n-2})   // change in the gap
+  D == 0                 -> write  '0'              (1 bit)
+  D in [-63, 64]         -> write  '10'   + 7 bits
+  D in [-255, 256]       -> write  '110'  + 9 bits
+  D in [-2047, 2048]     -> write  '1110' + 12 bits
+  else                   -> write  '1111' + 32 bits
+```
+
+Walk a real run through it. Timestamps `1600000000, 1600000010, 1600000020, 1600000030`, a perfect ten-second cadence:
+
+| timestamp | gap | change in gap (D) | encoded |
+| --- | --- | --- | --- |
+| 1600000000 | n/a | n/a | 14-bit header delta |
+| 1600000010 | +10 | n/a | first delta |
+| 1600000020 | +10 | 0 | `0` (1 bit) |
+| 1600000030 | +10 | 0 | `0` (1 bit) |
+
+Because the cadence holds, roughly 96% of timestamps cost one bit. And the failure mode is graceful, not a cliff. A single late sample at `1600000041`, a gap of +11, gives D = +1, which encodes as `10` plus 7 bits, nine bits total, and then the stream snaps right back to one bit. This is the concrete reason delta-of-delta beats plain delta: plain delta would spend bits on every sample because every gap is +10, while delta-of-delta spends bits only when the cadence actually changes.
+
+Values use XOR float compression. Take the current float64, XOR it with the previous one, and look at the result. If the values are identical the XOR is all zeros, and you write a single `0` bit. Gorilla found roughly half of all values hit this case, the flat gauges and the counters between events. (The exact figure is quoted as about 51% in one summary of the paper and about 59% in another; both are reading the same source, so call it "roughly half" and move on.) When the values differ, the meaningful bits cluster in a band between a run of leading zeros and a run of trailing zeros, and the encoding stores only that band:
+
+- Control `0`: identical to previous, one bit. Roughly half of values.
+- Control `10`: the meaningful band fits inside the previous band's window, so reuse it. Averages about 26.6 bits. Roughly 30% of values.
+- Control `11`: a fresh window, so write a 5-bit leading-zero count, a 6-bit length, then the band. Averages about 36.9 bits. Roughly 19% of values.
+
+That is the entire trick, and it is not a research curiosity. Prometheus's float chunk, the so-called varbit or type-2 encoding, is explicitly Gorilla-inspired, and it reproduced the result in a shipping open-source system: at SoundCloud the older double-delta encoding ran about 3.3 bytes per sample, and the XOR varbit encoding brought that down to about 1.28 bytes per sample. On disk a single value can occupy anywhere from 1 to 77 bits depending on how much it moved.
+
+One honest caveat, because the number gets quoted as gospel. The 1.37-byte figure assumes slow-moving gauges and fixed intervals. True random floats, jittery histogram buckets, anything high-entropy, defeats XOR because the meaningful band stays wide. The Prometheus authors wrote a whole post on when not to use varbit chunks for exactly this reason. Compression here is a bet on the data being boring, and you should know when your data is not.
+
+There is also a quiet cost baked into bit-packing. A varbit chunk has to be decoded sequentially from its start, because you cannot know where sample N begins without decoding the N-1 before it. You can seek to a chunk but not within one. That constraint sets the size of a chunk: small enough that decoding from the top is cheap, large enough that the per-chunk header overhead amortizes. Prometheus lands on 120 samples per chunk, which is about 30 minutes at a 15-second scrape. The compression scheme and the chunk size are not two separate decisions; one dictates the other.
+
+## Time-partitioning is the master move
+
+Compression shrinks each point. Partitioning is what makes the whole engine behave, and it is the direct payoff of immutability. The pattern is consistent across engines even though the names differ, so it is worth seeing one in full, then the variations.
+
+In Prometheus, a new sample lands in two places at once: the in-memory head block, and the write-ahead log on disk. The WAL exists for one job, durability of the unflushed head: if the process crashes, the log replays on restart and nothing recent is lost. The head accumulates samples into chunks, and when a chunk fills its 120 samples it is cut and memory-mapped to disk, handing residency to the OS page cache instead of the process heap. Every two hours the head compacts into an immutable on-disk block, which is just a directory holding a `chunks/` folder, an `index`, and a `meta.json`. Background compaction then merges small blocks into larger ones, up to 10% of the retention window or 31 days, whichever is smaller. And retention, the part that matters most, is the cheapest operation in the system: when a block ages past the limit, you delete the directory. That is the entire eviction path.
+
+Sit with how different that is from doing the same job in Postgres. Dropping 30-day-old metrics from a relational table is a `DELETE ... WHERE ts < now() - 30d` over potentially billions of rows: it takes locks, bloats the table, and leaves a vacuum bill behind. In a partitioned time-series store it is an `unlink()` of a directory. The cost is O(1) in the amount of data deleted, not O(n), and that is only possible because the partition was immutable, so there was nothing to lock against and nothing to clean up after.
+
+The other engines rhyme:
+
+- **InfluxDB** uses a Time-Structured Merge Tree, an LSM relative: writes hit a WAL, then settle into immutable, columnar TSM files that are conceptually SSTables, and compaction merges contiguous time blocks into larger ones. If you have read [LSM-tree vs B-tree](/blog/lsm-tree-vs-btree), the shape is familiar: sequential writes, immutable sorted files, background merges. InfluxData reported the move from their old B+tree-on-bolt storage cut disk usage by up to 45x while sustaining over 300,000 points per second, landing around 3 bytes per point for random second-resolution floats against roughly 12 for Graphite's Whisper.
+- **TimescaleDB** stays inside Postgres. A *hypertable* is a virtual view over many *chunk* child tables, each covering a fixed time interval, default seven days. Queries use *chunk exclusion*, the planner scans only the chunks whose time range overlaps the query, so a "last 6 hours" read never touches last month's chunks. (The docs now live under tigerdata.com after Timescale rebranded to TigerData, so do not be thrown by the redirect.)
+
+And here is the single sharpest reason TimescaleDB beats vanilla Postgres on ingest, which doubles as the clearest statement of why a B-tree struggles with this workload at all. Chunks are deliberately right-sized so that each chunk's own index B-trees fit in RAM during inserts. A monolithic Postgres table indexed on `(series, time)` has one enormous B-tree, and every new sample lands in a different leaf as series interleave, so once that tree outgrows memory every insert becomes a random disk seek. The working set thrashes. Right-sizing the chunk keeps the only tree you are actively writing small enough to stay resident, which turns the random-I/O insert storm back into something sequential. Columnar compression of cold chunks is a real second win, but it comes later. The insert-time fix is the partitioning. That is the answer to "why would a B-tree be bad here": not that B-trees are slow, but that an append-only monotonic write pattern over one shared tree guarantees the exact cache-miss behavior B-trees are worst at.
+
+The reads benefit too, and for a reason that sounds like OLAP but is not quite. When InfluxDB or Prometheus calls its layout "columnar," it means one series' values are stored contiguously, so a range read over a single series is one sequential run of compressed bytes rather than a scatter across interleaved rows. That is series-major storage, not the cross-row column storage of an analytics warehouse. The distinction matters, and the warehouse flavor, where you scan one column across millions of rows, is a different engine again, the subject of a companion piece on columnar and OLAP stores.
+
+## Cardinality is the thing that actually pages you
+
+Everything so far makes a metrics store cheap. This section is the one that makes it survivable, because it is where the real outages come from, and it is the part shallow explanations skip entirely.
+
+The dominant failure mode of a time-series database is not data volume. It is cardinality: the number of distinct active series. A *series* is a unique stream identified by a metric name plus the exact set of label key-values, and it is the atomic unit of cost. Every distinct series gets its own chunk stream and its own entry in an inverted index, the label-to-series-IDs map that a query intersects to answer "give me this metric where region=eu and status=500." The samples are cheap; the index is not. And the in-memory head holds about two hours of *every active series* at once, which means cardinality is paid in RAM, directly.
+
+This is why "1M points across 10 series" is trivial and "1M points across 1M series" can OOM the process. Same byte volume, wildly different cost, because the cost tracks series count, not sample count.
+
+Now the trap, which has a precise and very common shape. A label that is safely bounded in staging is unbounded in production. Watch it multiply:
+
+| step | label | distinct values | running series |
+| --- | --- | --- | --- |
+| base | `http_requests_total` | n/a | 1 |
+| add method | `method` | 5 | 5 |
+| add status | `status` | 8 | 40 |
+| add endpoint | `endpoint` | 40 | 1,600 |
+| add pod | `pod` (autoscaling) | 500/day, names not reused | 800,000/day |
+
+The first four rows look fine. Five methods, eight statuses, forty endpoints, 1,600 series, nothing. Then someone adds a `pod` label on a service that autoscales through 500 pods a day with non-reused names, and the head is now trying to hold two hours of 800,000 series in RAM. This is the "looked fine in staging" outage in one table, and it is the number-one self-inflicted cause of a metrics-stack meltdown. The multiplication is the danger: every label is a multiplier on every other label, so adding one innocent two-value dimension *doubles* the series count.
+
+The related pattern is *series churn*, series constantly appearing and disappearing, which the autoscaling-pod case is a perfect instance of. Churn was what broke Prometheus's original file-per-series storage and forced the v2 block redesign, because a file per series does not survive a world where series are born and die by the thousand each day. The deeper reason churn hurts is a transposition problem worth naming: writes arrive *horizontally*, one sample across many series at a single instant, while reads want data *vertically*, one series across a time range. The engine has to transpose between the two, and high churn makes the index that enables the transpose the most expensive object in the system.
+
+InfluxDB's answer to cardinality is instructive because it shows there is no free lunch, only a place to move the cost. The Time Series Index pushes the series index out of RAM and onto disk as memory-mapped, LSM-based files, and it uses HyperLogLog sketches to estimate "how many series match this?" cheaply for planning and guardrails. That is a genuinely nice piece of engineering, an approximate-counting structure living inside a storage engine so series count is no longer bounded by memory. But notice it does not make cardinality free. It makes cardinality affordable by spending disk and accepting approximation. The cost did not vanish; it moved somewhere you can afford to pay it. If you operate one of these systems, the single most valuable habit is to treat every new label as a cardinality decision and ask "what is the maximum number of distinct values this can take in production," not in the demo.
+
+## What the engine does not do, on purpose
+
+A few sharp edges separate someone who has read about these databases from someone who has run one, and they are all consequences of the same immutability that makes the good parts work.
+
+Immutability is a double-edged sword. It makes eviction a file delete and compaction a clean merge, but it makes deletes, edits, and late backfill genuinely expensive: you either rewrite a sealed block or carry tombstones over it. Before you promise GDPR-style point deletion on a metrics store, know that you are asking the one operation the engine is built to avoid. And backfill is the awkward path by design. These engines assume writes near "now." Out-of-order samples are a special case the engine grudgingly accommodates: the tstorage teaching implementation keeps two writable partitions specifically to absorb late points that straddle a boundary, and Prometheus historically rejected old samples outright before adding out-of-order support later. If your data arrives hours late as a matter of routine, you are fighting the engine's core assumption.
+
+Durability and high availability are also deliberately layered, not built in. The WAL protects the unflushed head against a crash, but a single-node WAL is not HA, and a single node is still a single point of failure. The local engine is kept simple on purpose, and durability and global query are bolted on above it by systems like Thanos, Cortex, and Mimir that ship blocks to object storage and federate queries across them. The split is intentional: a fast, simple local engine that does one thing, with the hard distributed-systems work, which is its own deep topic, handled by a separate layer. The way that layer fans writes out and keeps copies consistent is the same problem covered in [replication](/blog/replication-strategies).
+
+And the bytes-per-point number, however impressive, does not bound your bill. Total cost is points-per-second times series times retention, and compression only attacks the first term. The real lever on long-term storage is downsampling, and the mature stacks treat it as a first-class lifecycle. Recording rules in Prometheus precompute aggregates while keeping the raw data; rollup rules in systems like Thanos and Chronosphere, and continuous aggregates in TimescaleDB, can *discard* the raw samples and keep only the rollup. The common pattern is full resolution for 15 to 30 days, hourly for a year, daily forever. You are choosing, deliberately, to throw away resolution you will not query, because keeping every second of every series for three years is a budget decision dressed up as a technical one.
+
+## Where this fits
+
+None of these tricks is exotic in isolation. Delta encoding is old, LSM trees power half the storage world, partitioning by time is the first thing anyone tries. What makes a time-series engine a distinct *kind* of database is that it lets the workload shape drive every decision at once: the data is boring, so compress it to a bit a point; the past is immutable, so partition by time and evict with `unlink()`; cardinality is the scaling axis, so put the index, not the samples, at the center of your capacity planning.
+
+It is the same instinct that runs through good system design generally, the discipline [the system design interview framework](/blog/system-design-interview-framework) tries to teach: figure out the shape of the load before you reach for a tool, then pick the tool whose assumptions match. A metrics store is what you get when the load is append-only, time-ordered, and read in windows, and you take that shape seriously instead of bolting a timestamp column onto a database that wants something else. It is one of the three pillars of [Metrics, Logs and Traces](/blog/observability-three-pillars), and the engine under the "metrics" word is doing exactly the work this piece described: storing an unreasonable number of measurements for an unreasonably small number of bytes, and falling over the instant you give it too many distinct things to count. You can watch the same trade-offs play out across the case studies that lean on heavy ingest and tight read patterns, from the audio pipeline in [Audex](/case-study/audex) to the real-time coordination in [NomadCrew](/case-study/nomadcrew). Different domains, same lesson: the workload is the protagonist, and the engine is just the shape of your answer to it.
+
+## FAQ
+
+<FAQ />

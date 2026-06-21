@@ -1,0 +1,159 @@
+export const meta = {
+  slug: 'eval-harnesses',
+  title: 'How to Build Evaluation Harnesses for LLM and Agent Systems',
+  description:
+    'You cannot ship a non-deterministic system on vibes. Build an eval suite: a golden set, graders matched to the job, a CI regression gate, online monitoring.',
+  headline: 'How to Build Evaluation Harnesses for LLM and Agent Systems',
+  deck: 'A system you cannot measure is a system you cannot safely change, and every model swap becomes a blind bet.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['evals', 'llm', 'agents', 'testing', 'ci-cd', 'system-design'],
+  faq: [
+    {
+      q: 'What is an evaluation suite for an LLM system?',
+      a: 'It is the test rig for a non-deterministic system: a golden dataset of inputs with known-correct answers, a set of graders that score the outputs, an offline suite wired into CI as a regression gate, and online monitoring for the failures offline cannot see. An eval is just an input plus grading logic over the output. The point is to turn "did it get better or worse?" into a number you can diff across commits, instead of an opinion you form by eyeballing a few demos.',
+    },
+    {
+      q: 'Should I use an LLM as a judge to grade outputs?',
+      a: 'Only after you have validated the judge against human labels, and only for outputs that genuinely cannot be checked with code. LLM judges have measurable biases: they favor answers in certain positions, favor longer responses, and favor their own outputs (GPT-4 self-favors by about 10 percent, Claude-v1 by about 25 percent). Mitigate by using a different model as the judge than the one that generated the answer, calling the judge twice with the answer order swapped, and forcing a discrete verdict instead of free-form prose. Grade with code first, judge second, humans only for periodic calibration.',
+    },
+    {
+      q: 'How big does my eval dataset need to be before I can start?',
+      a: 'Twenty to fifty tasks drawn from real production failures is a good start. In early development each change has a large, obvious effect, so a small sample is enough to see it. The blocker is starting, not scale. Prioritize volume over polish: more cases with cheaper automated grading beats fewer cases with expensive hand-grading. Grow the set by converting every new production failure into a test case, and keep it private so it does not leak into a model vendor training set and rot.',
+    },
+    {
+      q: 'What is the difference between pass@k and pass^k for agents?',
+      a: 'pass@k is the probability of at least one success across k attempts. pass^k is the probability that all k attempts succeed. For agents you almost always want pass^k, because a single green run is survivorship bias. An agent that succeeds 75 percent of the time per trial passes all three trials only about 42 percent of the time. Run multiple trials in clean, isolated environments and grade the final state each time, because a trial that inherits state from the last one measures contamination, not capability.',
+    },
+    {
+      q: 'Do offline evals replace production monitoring?',
+      a: 'No, they cover different blind spots. Offline evals are fast, reproducible, and run on every commit, but they only test what you thought to test. Production monitoring shows real behavior at scale but lacks ground truth for grading and is reactive. Treat them as layers in a Swiss Cheese stack: automated evals, a CI gate, shadow or A/B comparison, production monitoring, user feedback, and manual transcript review. No single layer catches everything, so failures that slip through one are caught by the next.',
+    },
+  ],
+}
+
+You cannot ship a language model on vibes, and the reason is structural, not a matter of testing harder. [The way these models work](/blog/how-llms-work) makes them non-deterministic, so the same input gives different outputs run to run. Their failures are silent: a model hallucinates a passport number in exactly the confident tone it uses for a correct one, and nothing in the output flags which is which. And "it looked great in the demo" is a claim about the three inputs you happened to try, precisely the region of input space that does not matter. The long tail is where you get paged, and the demo never visits the tail.
+
+The thing that replaces vibes is an evaluation system. Four parts: a golden dataset of inputs with known-correct answers, a set of graders matched to what you are actually measuring, an offline suite wired into CI as a regression gate, and online monitoring for the ground truth offline can never see. If you have built systems before, you will recognize this as a test rig. The twist is that the thing under test lies to you with a straight face, so the rig has to be built for a component that is confidently wrong rather than one that is loudly broken.
+
+One idea sits underneath all four parts, and it changes how you sequence the work. **Eval design is system design.** The moment you write down "success means the MRZ check digit recomputes *and* matches the visually-extracted passport number," you have decided what "correct" means where it was previously fuzzy. An eval suite is not QA you bolt on at the end; it is the document that defines what you are building, in a form a machine can score.
+
+## Why a system you cannot measure is a system you cannot change
+
+Start with the cost of not having any evals, because it compounds. Without evals, teams get stuck in what Anthropic's agent team calls reactive loops: you catch issues only in production, where fixing one failure creates another, and you cannot tell a real regression from run-to-run noise. That last part is the quiet killer. You change a prompt, the output looks different, and you cannot tell whether it got better, got worse, or just landed on the other side of the model's randomness. Every change is a guess, and every guess ships.
+
+So a system you cannot measure is a system you cannot safely change. Every model upgrade, prompt edit, dependency bump, and provider swap is an unguarded bet the moment you have no test rig to catch a regression. The eval suite makes those decisions *reversible*: you run it, watch the number move, and roll back before users feel it. Without it, "let's try the new model" is indistinguishable from "let's gamble production on a vendor's release notes." This is the same instinct behind the [observability you build for the three pillars](/blog/observability-three-pillars), pointed at correctness instead of latency. And it forces an ordering most teams get backwards: the success criteria come first because they *are* the specification; the prompt and the model are just the current attempt at satisfying it.
+
+## The golden dataset is the spec in disguise
+
+A golden dataset is a held-out, labeled set of inputs with known-correct answers, the ground truth your offline graders score against. Three decisions separate evals that earn trust from ones that produce a comforting, meaningless number.
+
+**Start small, and start from real failures.** Twenty to fifty tasks drawn from production failures is a strong start, and the reason is statistical. In early development each change has a large, obvious effect, and a large effect size means a small sample is enough to detect it: you do not need a thousand cases to see a prompt edit broke date parsing, you need the eight documents where it broke. The blocker is starting, not scale. The cherry-picked happy-path set passes for the wrong reason, telling you the system works on the inputs you already knew it handled.
+
+**Build it balanced, not just positive.** Test both when a behavior should happen and when it should not. If your system should refuse to extract data from a document that fails a fraud check, half the eval is documents it should refuse. A set that only tests the happy path cannot catch a model that became too eager, and "too eager" is the failure mode that leaks PII or approves the wrong transaction. Anthropic's success criteria have to be Specific, Measurable, Achievable, and Relevant, and one worked example bakes all four into a sentence: an F1 of at least 0.85 on a held-out set of 10,000 diverse posts, a 5 percent improvement over baseline. That pins down the metric, the threshold, the data, and the bar to clear.
+
+**Label it so two experts would agree.** Write tasks where domain experts would independently reach the same pass/fail verdict. If two qualified people disagree on the gold label, the eval is measuring noise, and a grader trained to match a noisy label learns to be wrong consistently. Ambiguous gold labels are the most common way an eval stops meaning anything.
+
+One counterintuitive rule sits on top: prioritize volume over quality. More questions with slightly lower-signal automated grading beats fewer with high-quality hand-grading, because the bench lives or dies on coverage of the input space and coverage comes from quantity. After the first fifty, that volume comes from production: every user-reported failure becomes a test case. A public benchmark leaks into training data and goes stale; a private set fed from your own new failures stays ahead of the model, which otherwise keeps getting better at exactly the cases you already have.
+
+## Graders: code first, judge second, humans for calibration
+
+A grader is logic that scores one aspect of an output. *Which* grader is the question of how you check correctness, and there is a strict preference order most teams violate by reaching for the most expensive option first.
+
+**Deterministic graders, when the answer can be checked programmatically.** Exact match, substring match, JSON validity, regex, JSON-shape match. OpenAI's eval templates name them directly (`Match`, `Includes`, `FuzzyMatch`, `JsonMatch`), and they are the cheapest, fastest, most reproducible thing you can run. They are brittle to valid variation ("P1234567" and "p1234567" are the same passport number), so you normalize before you compare and reach for this tier first anyway, because a check that runs in a microsecond and never flakes is worth a little normalization code.
+
+**Statistical reference metrics, when exact match is too strict.** BLEU and ROUGE-L for summarization, cosine similarity over sentence embeddings for semantic closeness, Levenshtein distance for fuzzy strings. These earn their place when no single string is "the" right answer but you still have a reference. An embedding-similarity grader is the same cosine-distance operation from [RAG systems](/blog/rag-system) and [vector databases](/blog/vector-databases), pointed at grading.
+
+**LLM-as-judge, when the quality is genuinely subjective.** Use a strong model to grade another model's output against a rubric. This is the powerful, dangerous tier, and the danger is measured, not hand-wavy. The canonical MT-Bench work documents three biases you design around. Position bias: the judge favors answers in certain slots regardless of content. Verbosity bias: it favors longer responses even when they are not clearer or correct. Self-enhancement bias: it favors its own outputs, and the numbers are large, with GPT-4 favoring itself by about 10 percent higher win rate and Claude-v1 by about 25 percent. That is the whole reason the best practice is to judge with a *different* model than the one that generated the answer.
+
+The mitigations are concrete, and they fit in the grader prompt itself:
+
+```python
+def build_grader_prompt(answer, rubric):
+    return f"""Grade this answer against the rubric.
+    <rubric>{rubric}</rubric>  <answer>{answer}</answer>
+    Reason in <thinking> tags, then output exactly
+    'correct' or 'incorrect' in <result> tags."""
+# Judge with a DIFFERENT model than the generator (dodges self-enhancement).
+# Force a discrete verdict; reason first, then discard the reasoning.
+# For pairwise, call twice with answers swapped; a winner must win both orders.
+```
+
+And validate the judge before you trust it, because an un-validated judge is vibes with extra latency. In the MT-Bench setup GPT-4 agreed with humans about 85 percent of the time, slightly higher than the 81 percent humans agreed with each other, but you only know your judge clears that bar by measuring it against human labels. Re-run that check after any judge-model upgrade.
+
+Human grading sits at the top for quality and the bottom for everything else: slow, expensive, not scalable. Anthropic's guidance is to avoid it where possible. It earns one role: periodic calibration of the cheaper graders, not the per-commit loop.
+
+And accuracy is never the whole score. HELM, Stanford's whole-system benchmark, measures seven things on purpose: accuracy, calibration, robustness, fairness, bias, toxicity, and efficiency. A single number hides trade-offs, and the one that bites hardest is that a model can gain accuracy while losing calibration, which is whether the model's stated confidence matches how often it is actually right. Latency and cost belong in the score too, because an eval that ignores the budget happily passes a system you cannot afford to run, the same way a benchmark that ignores [the tail](/blog/latency-throughput-tail) passes a system that is fast on average and unusable at P99.
+
+## Agents change the unit of measurement
+
+Everything above grades a single output. An agent produces a trajectory of [tool calls](/blog/tool-calling), intermediate results, and reasoning that ends in some final state, which changes what you grade and how many times. This is where [agentic workflows](/blog/agentic-workflows) need different harnesses.
+
+Get the vocabulary exact. A *task* is one test with defined inputs and success criteria. A *trial* is one attempt at it. The *transcript* is the full record of a trial. The *outcome* is the final state of the environment when the trial ends, a different thing from what the agent *says* it did, and that distinction carries most of the weight. Grade the outcome, not the path, because grading the path makes your tests brittle and punishes the agent for finding a valid alternative strategy you did not anticipate. If the task was "the database has a paid order at the end," check the database, not whether the agent took the three steps you imagined.
+
+Then run it more than once, because one run is noise. The honest bar is `pass^k`, the probability that *all* k trials succeed, not `pass@1`. The arithmetic is brutal and clarifying: an agent that succeeds 75 percent of the time per trial passes all three only about 42 percent of the time. One green run is survivorship bias dressed up as a passing test. And run each trial in a clean, isolated environment, because a trial that inherits state from the last one measures contamination, not capability.
+
+The one place "grade the outcome, not the path" inverts is safety. For capability you grade the result; for safety you sometimes grade the path, because an agent that reaches the right answer by running `rm -rf` on a directory it had no business touching, or by reading a secret it should never have accessed, has failed regardless of how clean the output looks. promptfoo's trajectory assertions exist for this: outcome-grading for "did it work," path-grading for "did it stay inside the lines." When you wire tools through [MCP](/blog/mcp-tool-ecosystems) or carry [agent memory](/blog/agent-memory) across steps, the path is where the dangerous failures hide. The [guardrails you put around a model](/blog/ai-guardrails) are themselves a thing you evaluate, with balanced sets covering the inputs they should block and the ones they should let through.
+
+```python
+# pass^k: probability ALL k trials succeed, the honest agent bar.
+def pass_caret_k(task, agent, env_factory, k=3):
+    wins = 0
+    for _ in range(k):
+        env = env_factory()              # clean env every trial
+        agent.run(task.input, env)
+        wins += task.grade_outcome(env)  # grade FINAL STATE, not the transcript
+    return wins == k                     # 0.75 per-trial -> ~0.42 at k=3
+```
+
+## Wiring it into CI is just an exit code
+
+Offline harnesses that nobody runs are documentation. The regression gate makes them load-bearing: a CI step that fails the build when the score drops below a threshold.
+
+Tools like promptfoo make the gate declarative. You describe `prompts × test cases × providers` as a matrix and attach assertions to each case. The assertion taxonomy mirrors the grader tiers above: deterministic checks (`equals`, `contains`, `is-json`, `regex`, `latency`, `cost`) sit alongside model-assisted ones (`llm-rubric`, `factuality`, `similar`, `trajectory:goal-success`), and each carries its own `threshold` and `weight` so one case can hold several weighted checks. The gate itself is one flag, `--fail-on-error`, or a few lines that parse the JSON output and `exit 1` when the pass rate falls under your bar:
+
+```yaml
+# promptfooconfig.yaml
+prompts: [file://prompts/extract.txt]
+providers: [anthropic:claude-opus-4-8, openai:gpt-4o]
+tests:
+  - vars: { doc: file://golden/passport_01.txt }
+    assert:
+      - type: is-json                                 # deterministic
+      - type: contains-json
+        value: { passport_number: "P1234567" }
+      - type: latency
+        threshold: 15000                              # P95 budget, 15s
+      - type: llm-rubric                              # model-graded
+        value: "States a confidence score and flags low-confidence fields"
+        weight: 2
+```
+
+Two operational details keep the gate from becoming a tax. Cache on the config hash so an unchanged prompt does not re-spend tokens on every unrelated commit, and emit JUnit XML so the CI UI renders an eval failure in the same red as a unit-test failure, which makes the team treat it as a real gate instead of an advisory it learns to click past. The whole point is that a prompt change dropping accuracy two points cannot merge, the same way a broken unit test cannot. The model just happens to be the thing under test.
+
+## Offline and online are layers, not alternatives
+
+A common, expensive mistake is treating offline evals and production monitoring as competitors. They are complementary slices of cheese, and each one's hole is covered by another's strength. Automated evals are fast, reproducible, and run on every commit, but they are limited to what you thought to test. Production monitoring shows real behavior at scale but lacks ground truth for grading and is reactive: by the time you see the failure, a user already hit it. A/B testing gives real user outcomes but takes weeks. User feedback surfaces the unanticipated but is sparse and self-selected. Manual transcript review builds failure-mode intuition but does not scale. No single layer catches everything; stacked, the failures that slip through one are caught by another. You are not hunting for the one perfect method, you are arranging imperfect ones so their gaps do not line up.
+
+The bridge between offline and online is shadow mode: run the new system in production alongside the old one, log the diff, and serve nothing from the new path until the diff says it is safe. That turns "is the new pipeline better?" from an argument into a query, where the discipline of a golden set meets the reality of traffic you did not script.
+
+## Two systems that built the ruler first
+
+Two case studies cover the whole stack between them, and both arrived independently at the same instinct about honesty.
+
+[IntelliFill](/case-study/intellifill) is a multi-agent document-extraction pipeline (passports, Emirates IDs) retrofitted onto a live PII system. Its eval story is mature because it could not big-bang cut over, so it had to *measure* the new pipeline against the old one in production. With no ground truth at inference time, it runs an LLM extractor and a regex extractor on every field and treats their agreement as the signal, adding confidence when they match closely and penalizing the model when they diverge: two noisy graders standing in for the reference label you do not have. Inputs are guarded first through a `sanitizeLLMInput` pass, because a grader that faithfully scores a prompt-injected input is a reliable way to be fooled. On top sits a task-success grader in production code: the QA agent recomputes all four ICAO 9303 MRZ check digits and cross-checks the MRZ passport number against the visually-extracted one, exactly the "confident, plausible, wrong" failure evals exist to catch.
+
+The instructive part is the schema. IntelliFill stores both pipelines' outputs side by side with `fieldDiff`, `matchingFieldsCount`, `accuracyDelta`, and a `winner` column, with documented promotion criteria (95 percent shadow success, 90 percent accuracy match) before any A/B traffic. That `accuracyDelta` column is an offline-eval-shaped object in production, and writing it *forced* the team to define what "better" means. The honesty gap is the most senior detail: the table is instrumentation built to measure the delta, but the production accuracy numbers are not in the repo, and a confidence heuristic is hard-capped at 85 with a comment refusing to pass a fake 99 percent downstream. The schema was designed before the measurement existed; the engineer declined to claim a calibrated number he had not earned. You build the ruler before you take the reading.
+
+[Aladeen](/case-study/aladeen) is the online half. It ingests agent-CLI session logs into one trace schema and mines them for recurring failure patterns, the "manual transcript review, but it scales" layer made real. Its outcome classifier is the concrete answer to "grade the outcome, not the transcript": it marks a session `gave_up` when the event stream ends on a dangling, unmatched tool call, and `errored` when the trailing tool results are mostly failures, catching the silent abandonment an exit code of zero hides. Exit 0 is the transcript lying; the dangling call is the true outcome. It also enforces honesty structurally: remedy suggestions are tiered, and the literal word "fix" is templated so it can only appear on the rule-encoded `known-fix` tier, so the author cannot upgrade a suggestion's confidence by tone. Every suggestion prints its `nFailed` and `nResolved` denominators. That is the LLM-judge bias problem solved by construction: overclaiming is mechanically impossible. Both systems land on the same rule from opposite ends of the stack: never emit a confidence number you cannot defend with a denominator.
+
+## The honest landing
+
+You do not get to make a language model deterministic, and you do not get to make its failures loud. Both facts are permanent. What you control is whether you see the failures before your users do, and whether you can tell a real regression from the model's daily coin-flip. That is the entire job of the evals.
+
+So build the ruler first. Write the success criteria as a spec a machine can score, because that act *is* the system design. Pull twenty to fifty cases from real failures and grow the set from production forever. Grade with code where you can, with a validated and bias-corrected judge where you must, humans only to keep the cheaper graders honest. For agents, grade the final state, run k trials in clean rooms, and report `pass^k` instead of the one green run that flattered you. Wire the gate so a regression cannot merge, and stack offline against online so their blind spots do not align. Do that, and the model swap that looked safe in the release notes either clears the suite or gets caught at the gate. Skip it, and you find out what broke the way you always do: from the user who hit the tail you never tested.
+
+## FAQ
+
+<FAQ />

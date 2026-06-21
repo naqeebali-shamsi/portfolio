@@ -1,0 +1,192 @@
+export const meta = {
+  slug: 'file-storage-sync',
+  title: 'Design a File Storage and Sync System (Dropbox / Google Drive)',
+  description:
+    'How Dropbox keeps a folder identical across devices: split metadata from blocks, key blocks by content hash, chunk so edits dedup, reconcile with a merge base.',
+  headline: 'Design a File Storage and Sync System (Dropbox / Google Drive)',
+  deck: 'A file is not bytes in a database row, it is an ordered list of content hashes, and once you see that the whole design falls into place.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '16 min',
+  tags: ['system-design', 'dropbox', 'storage', 'distributed-systems', 'deduplication', 'sync'],
+  faq: [
+    {
+      q: 'Why split metadata from the blocks instead of one database?',
+      a: "The two halves have opposite requirements. Metadata is small, hot, relational, and needs strongly-consistent ordered transactions, so it lives in sharded SQL with cross-shard transactions (Dropbox runs this at 10M+ requests per second). Blocks are huge, immutable, write-once and read-many, and content-addressed, so they live in cheap erasure-coded object storage like Magic Pocket. Conflating them forces one store to be good at two jobs it cannot do at once, which is the shallow mistake.",
+    },
+    {
+      q: 'Why not just split files into fixed-size 4MB chunks?',
+      a: "Fixed-size chunking gives you deduplication only until the first insert or delete. Add one byte at the front of a file and every downstream boundary shifts, so every chunk hashes differently and dedup drops to zero. Content-defined chunking picks boundaries from the content itself using a rolling hash, so a one-byte edit only re-chunks locally and the rest of the file still dedups. CDC finds roughly 10 to 20 percent more redundancy than fixed-size chunking for this reason.",
+    },
+    {
+      q: 'How does sync transfer so little data when I edit a large file?',
+      a: "Sync is a diff of block lists, not a re-upload. The client recomputes the new list of block hashes, sends only the hashes, and the server replies with which blocks it already has and which it needs. Only the novel blocks move. Trim ten seconds off a 4GB video and a handful of blocks change, so you upload tens of megabytes while the other 4GB stays put.",
+    },
+    {
+      q: 'What stops the notification service from melting under fan-out?',
+      a: "It never carries file data. Clients hold a long-poll connection (Dropbox calls the endpoint longpoll_delta) that blocks until the server cursor advances, then the client pulls the delta itself. The notification channel only says something changed, come get it. Pushing payloads over a fan-out channel does not scale and breaks the metadata-versus-data separation, so real systems keep the signal tiny and let the client do the fetch.",
+    },
+    {
+      q: 'Why do conflicts create a duplicate file instead of just merging?',
+      a: "Because last-writer-wins silently destroys the loser's edits, and arbitrary text merging corrupts most file formats. When two people edit the same file offline, the engine cannot know which version is correct, so it preserves both as a conflicted copy and lets a human decide. Structural conflicts like two people moving the same folder into each other are resolved by deterministic ordering (first committer wins) rather than a copy, because you cannot have both moves and stay a tree.",
+    },
+  ],
+}
+
+Open the same folder on your laptop, your phone, and a machine you have not touched in a week, and they all show the same files. That is the entire product, and everything hard about Dropbox and Google Drive hides behind how mundane it sounds.
+
+The naive version is a one-liner. Put the file in object storage, write a row in a database, done. That survives until someone edits a 4GB video and your system re-uploads all 4GB because one frame changed, or until two people edit the same spreadsheet on a plane and one of them lands to find their morning of work quietly gone. The gap between "store a file" and "keep a folder identical across devices with minimal data moving" is where every interesting decision lives.
+
+The single idea that unlocks the design: a file is not bytes you store, it is an ordered list of content hashes. The bytes live elsewhere, addressed by their own hash, and the list is the file's real identity. Hold that, because it makes deduplication free, sync cheap, and the two-store split obvious. For the scaffolding to attack a problem this size from a blank whiteboard, [the system design interview framework](/blog/system-design-interview-framework) lays out the moves; this is the worked answer for storage and sync.
+
+## Two planes that want opposite things
+
+The first decision that separates a senior answer from a junior one is to stop thinking about a database and start thinking about two stores with nothing in common.
+
+**The metadata plane** is the filesystem tree plus, for every file, the ordered list of block hashes that reconstitutes it. Small, hot, relational, read constantly. It needs transactions, ordering, and strong consistency, because the moment two clients disagree about the current tree they diverge and never recover. Dropbox runs this as a server-side journal of filesystem mutations (the Server File Journal, SFJ) on sharded MySQL, fronted by a metadata abstraction called Edgestore that routes stateless cores to the right shard, and later by a transactional key-value store called Panda. The number worth keeping in your head: cross-shard transactions at 10 million requests per second, tens of millions of QPS. That is what strongly-consistent metadata at scale actually costs.
+
+**The block plane** is content-addressed object storage, every block keyed by the SHA-256 of its own contents. Blocks are immutable, opaque, write-once, read-many, enormous in aggregate. They need durability and cheap bytes, not transactions. Dropbox calls theirs Magic Pocket: blocks up to 4MB pack into 1GB buckets, buckets into volumes that are replicated or Reed-Solomon erasure-coded, on storage nodes (OSDs) that hold over a petabyte each and are treated as dumb boxes. A cell is roughly 50PB raw; the fleet runs 600,000-plus drives at four nines.
+
+Why is the split the senior insight rather than an optimization? Because the planes have genuinely opposite access patterns, and any store that serves both does both badly: in one database you pay transaction overhead on petabytes of immutable data while starving your hot relational queries. The shape that makes the system tractable is `metadata row -> ordered list of block hashes -> blocks`, with a hard wall between the list and the bytes.
+
+```
+   metadata plane (sharded SQL, transactional)        block plane (content-addressed, immutable)
+   ┌───────────────────────────────────┐              ┌──────────────────────────────────┐
+   │  /work/budget.xlsx                 │              │  sha256(B1) ──> [ block bytes ]   │
+   │   block list: [B1, B2, B3, B4]     │   ───────▶   │  sha256(B2) ──> [ block bytes ]   │
+   │   size, mtime, version, node-id    │              │  sha256(B3) ──> [ block bytes ]   │
+   └───────────────────────────────────┘              │  sha256(B4) ──> [ block bytes ]   │
+        the manifest IS the file                            bytes deduped across all files
+```
+
+There is a second, quieter reason the split matters: the block plane is where the cost lives, and erasure coding is the lever. Three-way replication triples your storage bill; Reed-Solomon hits comparable durability at a fraction of the overhead, while still cross-zone replicating hot blocks within about a second so a fresh file is durable almost immediately. That economics is much of why Dropbox could pull storage off public cloud and run it cheaper. The content-addressing that routes blocks to shards is the same machinery in [consistent hashing](/blog/consistent-hashing).
+
+## Chunking, and why fixed-size is a trap
+
+Now the part everyone gets wrong on the first pass. You have to cut the file into blocks. How big, and where?
+
+The tempting answer is fixed-size: slice every 4MB and move on. Trivial math, works in the demo, and it quietly destroys the property you most wanted, dedup on edited files. The failure: a file chunked into nice 4MB blocks, then someone inserts a single byte at the front. Every byte after it shifts one position, every boundary counted from the start moves, every block to the end of the file hashes differently. You re-upload the whole file to absorb one keystroke. This is the boundary-shift problem, fatal for exactly the workload sync exists to serve: small edits to large files.
+
+The fix is **content-defined chunking** (CDC). Instead of cutting at fixed offsets, you slide a small window across the file computing a rolling hash and declare a boundary wherever the hash hits a target pattern. Because the boundary rides the content under the window rather than a byte count, inserting a byte only disturbs the chunk it lands in; the next boundary downstream re-synchronizes as soon as the window passes the edit. A one-byte insert re-chunks locally and the rest of the file dedups as before. That single property is why CDC finds roughly 10 to 20 percent more redundancy than fixed-size chunking, and why it is the right default for a sync engine despite the added complexity.
+
+```
+   fixed-size, one byte inserted at front:
+   before |AAAA|BBBB|CCCC|DDDD|   every boundary counted from offset 0
+   after  |xAAA|ABBB|BCCC|CDDD|   ← all four blocks now differ → re-upload everything
+
+   content-defined, same insert:
+   before |AAAA|BBBB|CCCC|DDDD|   boundaries ride the content
+   after  |xAAAA|BBBB|CCCC|DDDD|  ← only the first block changed → the rest dedup
+```
+
+The rolling hash is the engine, and its speed is the whole game because you evaluate it at nearly every byte you ingest. The classic Rabin fingerprint is correct but slow, a polynomial modulo per step: `Rabin(B2..Ba+1) = [(Rabin(B1..Ba) - B1*p^(a-1))*p + Ba+1] mod D`. A Gear hash is the modern choice, one shift, one add, one table lookup: `fp = (fp << 1) + Gear[b]`. FastCDC, built on Gear plus a few tricks, runs 3 to 12 times faster than the best Rabin-based CDC at a near-identical dedup ratio.
+
+The parameters are not arbitrary. The LBFS-standard config FastCDC builds on targets an 8KB average chunk, 2KB minimum, 64KB maximum, declaring a cut when the low bits of the hash match a mask of `2^13 - 1`. Chunk size is exponentially distributed (`P(X <= x) = 1 - e^(-x/8192)`), so without the clamps you get a long tail, about 22 percent under 2KB; normalized chunking then tightens the distribution back toward the average after the minimum clamp steals some dedup. All of which is in service of one tradeoff a staff engineer names out loud: chunk size is a three-way pull. Smaller chunks find more duplicate data but multiply your metadata (more hashes to store, index, and ship per block list) and lower throughput; bigger chunks are cheap to track but dedup worse. There is no universally correct size, only the one that balances dedup ratio against metadata overhead for your file mix. Dropbox's client uses 4MB blocks, enormous by CDC standards, a deliberate lean toward less metadata over maximal dedup. A decision, not an accident.
+
+## Deduplication, and the security caveat nobody mentions
+
+Once blocks are keyed by content hash, deduplication is not a feature you build, it falls out for free. Two identical blocks, from the same file copied twice, the same attachment saved by a hundred people, or the same base-image layer across a thousand container builds, produce the same hash and map to one stored object. The studies FastCDC cites put 50 to 85 percent of primary and secondary storage as redundant and removable. You get that reduction simply because the key is the content. The junior version is "hash the whole file, skip if seen," which catches exact duplicates and nothing else; block-level dedup catches the dominant case, a small edit to a large file sharing all but a few blocks with its prior version, where whole-file hashing sees a new hash and re-stores everything.
+
+But cross-user dedup has a sharp edge worth raising before an interviewer does. If the protocol is "send the hash, skip the upload if the server already has that block," an attacker can probe for a known file: upload the hash of a leaked document, watch whether the server asks for the bytes, and you have learned whether someone else already stored it. The hash has quietly become a proof of possession, an information leak. Mitigations all cost something (per-user dedup throws away cross-user savings, randomized thresholds blur the signal), and convergent encryption, deriving the key from the content hash so identical plaintext still dedups while stored ciphertext stays opaque, remains a real privacy-versus-storage tradeoff rather than a solved problem.
+
+Dedup also creates a garbage-collection problem that is easy to wave away and hard to do. A block is shared by N files, so deleting a file must decrement, not delete, or you corrupt every other file referencing it. You need reference counting or mark-and-sweep over the block store, correct under races: a delete dropping the last reference can interleave with an upload adding a new one to the same block. Get it wrong and you either leak storage forever or delete live data, one of the genuinely hard distributed problems hiding inside what looks like a storage detail.
+
+## Sync as a diff of block lists
+
+Here is the payoff for treating a file as a list of hashes: syncing a change is not moving a file, it is reconciling two lists. The client computes the new block list and sends the server the hashes, not the bytes. The server checks which blocks it already has (most of them, because most of the file did not change) and replies: I have these, send me those. The client uploads only the missing blocks, the server commits the new list to the metadata journal, the cursor advances, and every other device learns there is something to pull. Only novel blocks ever cross the wire.
+
+The bandwidth math is the entire selling point. A 4GB video is about a thousand 4MB blocks; trim ten seconds off the end and a handful change, so you upload tens of megabytes and the other roughly 4GB stays put. Change the title slide of a deck and one block, a few hundred KB, moves. This is the content-addressed descendant of the rsync algorithm from 1996 (a weak Adler-32 rolling checksum to find candidate matches, a strong hash to confirm, unmatched regions sent as delta), except the block list is durable and shared rather than recomputed per transfer.
+
+You can squeeze the wire further. Dropbox's Broccoli project Brotli-compresses each block before sending, cutting daily upload bandwidth about a third, and sends the hash of the uncompressed block so integrity stays decoupled from wire encoding. The order matters: encrypted bytes are effectively random and do not compress, so you compress before you encrypt, always. Reverse it and your ratio collapses to nothing.
+
+A latency subtlety the first design misses: in a two-phase flow a file had to be fully uploaded and committed before any other client could learn it existed, serializing upload and download. Dropbox's streaming sync pipelines the two through a memcache staging area between clients, so by commit time the downloader is nearly done, a win approaching 2x for multi-client sync as file size grows. The principle, that tail latency is a distribution you design against rather than an average you hope for, is [latency and the tail](/blog/latency-throughput-tail).
+
+One more thing about the upload path: do not route bytes through your application servers, which should never be a bandwidth bottleneck for petabytes. Hand the client a presigned URL to upload directly to blob storage, then flip the metadata row from `uploading` to `uploaded` on the storage callback. For large files this is resumable multipart, with per-part state and a returned ETag you verify, trust-but-verify so a flaky connection resumes from the last good part instead of starting over.
+
+## The three trees: how correct sync actually works
+
+Comparing timestamps and uploading the newer file is the answer that feels obviously right and is quietly broken. Timestamps lie across machines, "newer" does not tell you whether the change happened locally or remotely, and the moment a device has been offline you cannot reconstruct what actually changed from two snapshots alone. You are missing a reference point.
+
+The model that gets this right, and the crown jewel of Dropbox's Nucleus rewrite, is three trees:
+
+- **Remote tree** is the latest state in the cloud.
+- **Local tree** is the current state on this disk.
+- **Synced tree** is the last state this device and the server agreed on. This is the merge base, exactly like the common ancestor in a git merge.
+
+The synced tree is the whole trick. With only remote and local you can see a file differs but not which side changed it, so you cannot know whether to upload, download, or flag a conflict. The synced tree answers "was this changed locally or remotely?" by giving you a before-picture to diff against: differs from synced on one side only means a one-directional edit to apply, differs on both sides in incompatible ways means a real conflict. You cannot answer that without the merge base, which is why naive timestamp comparison fails. The same merge-base reasoning applied to concurrent text edits instead of whole files is what makes [CRDTs](/blog/crdts) and operational transforms work in collaborative editors like the one behind a Google Docs design; here the unit is a file, not a character.
+
+```
+            Remote tree            Local tree
+            (cloud state)          (this disk)
+                  \                   /
+                   \                 /
+                    ▼               ▼
+                 ┌─────────────────────┐
+                 │      Planner        │  diffs each against the Synced tree
+                 │  (merge base =      │  to derive change direction, then emits
+                 │   Synced tree)      │  a minimal, dependency-ordered op plan
+                 └─────────────────────┘
+                            │
+                            ▼
+        ordered, concurrency-safe operation batches
+        (cannot create a file before its parent dir exists)
+```
+
+The component that consumes the three trees is the Planner: it takes (remote, local, synced) and emits the minimal operation sequence that converges all three, batched into groups safe to run concurrently while respecting dependencies (you cannot create a file before its parent directory). Crucially, the engine uses stable node IDs, so a move is one atomic operation, not a delete plus a create. Without them, renaming a folder of ten thousand files looks like ten thousand deletes and ten thousand creates, a re-upload storm and a conflict magnet; with them, a move of any subtree is a single cheap operation regardless of its size.
+
+## Conflicts: content versus structure
+
+When both sides changed you have to resolve, and the lazy resolution loses data. Last-writer-wins picks the most recent timestamp and silently discards the other edit. Sometimes that is acceptable (a presence indicator, a draft nobody else touches), and a senior answer says so. For a document two people worked on, it is data loss with a friendly face, and the friendliness is the problem: nobody gets alerted that work vanished. Real engines split conflicts into two kinds that need opposite handling.
+
+A **content conflict** is two people editing the same file's contents. You cannot merge arbitrary binary formats and should not pick a winner, so you preserve both: keep one as canonical, write the other as a conflicted copy, the familiar `budget (Jane's conflicted copy 2026-06-09).xlsx`. Both edits survive, a human decides.
+
+A **structural conflict** cannot be solved with a copy. Alberto, online, moves folder A into B. Beatrice, offline, moves B into A. Honoring both creates a cycle, A inside B inside A, which is not a tree. The resolution is deterministic global ordering: first committer wins, the later move is rejected or re-parented, and because the rule is deterministic every device computes the same outcome independently. This is hard at all because the bidirectional state space, offline windows, partial uploads, crashes mid-commit, is in Dropbox's own word astronomical, which is why the engine is a typed state machine in Rust where exhaustive matching makes whole classes of sync bug unrepresentable.
+
+To tell concurrent edits from causal ones, you want version vectors rather than wall-clock time: a version vector tells you when two edits are truly concurrent (a real conflict) versus when one strictly followed the other (a fast-forward), and wall-clock LWW is the lossy fallback when you cannot establish causality. Dropbox uses Lamport clocks for cross-namespace atomic moves for exactly this reason. Causality is information the network does not hand you for free; how you carry it in the metadata is a consistency decision in the same family as [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum). The metadata plane sits firmly on the strong-consistency side by necessity: the journal commit must be atomic and the cursor monotonic, or clients diverge.
+
+## Notification: a doorbell, not a delivery truck
+
+The last piece is how a device finds out something changed. The instinct is to push the new file down a WebSocket, and it is wrong on both counts: it ships payloads over a fan-out channel that should stay tiny, and it collapses the metadata-versus-data wall you spent the whole design building.
+
+The right model is pull-triggered. The client holds a long-poll connection (Dropbox's endpoint is `longpoll_delta`, taking the client's cursor) and the server blocks until that cursor advances, then returns. The client takes the wakeup, calls a separate delta endpoint to pull the changes, then reopens the long poll. The notification path carries one bit of meaning, something changed, come get it, and never the file. That keeps fan-out cheap (a held connection costs almost nothing until it fires) and preserves the separation: the journal is the source of truth, notification is just a low-latency nudge to read it.
+
+```
+   client                              server
+     │  longpoll_delta(cursor=42) ───▶ │  (blocks; nothing newer than 42 yet)
+     │                                 │
+     │                                 │  ← another device commits; cursor → 43
+     │  ◀─────────── 200 "changed"     │
+     │  delta(cursor=42) ────────────▶ │
+     │  ◀──── changes since 42 ────────│  client applies, reopens long poll
+```
+
+In production you run this as a hybrid: long poll (or SSE for one-way notify, WebSocket if you also need an upstream channel) for low latency, plus a periodic full poll so a missed wakeup degrades to a few-seconds delay instead of a stuck device. That is eventual consistency by design: the system always reconverges, the only question is how fast. The push side taken to its extreme, a real-time hub holding a connection per user for live presence and location, is the architecture behind [NomadCrew](/case-study/nomadcrew); a sync engine borrows the held connection but keeps the payload off it. The choice between a durable log you tail with a cursor and a queue you consume, exactly the journal-plus-cursor shape here, is [Kafka vs queues](/blog/kafka-vs-queues), and the cursor-driven catch-up is the same pattern behind a pull-based timeline in [Design Twitter](/blog/design-twitter-feed). And the reason the cursor can be trusted, that replaying it produces the same state every time, is the exactly-once-processing discipline in [idempotency and the exactly-once lie](/blog/idempotency-exactly-once): the journal delivers at least once, idempotent application makes a replay harmless.
+
+## Where the metadata plane actually strains
+
+It is easy to treat "sharded SQL" as a box you draw and forget, but at Dropbox scale the metadata plane is its own ongoing problem. When a single shard's data risks outgrowing one host you are in a slow-moving crisis, the pressure that drove Edgestore from 256 to 512 clusters and 1500 to 3000 hosts and drove the Panda key-value store underneath both the filesystem and Edgestore metadata. Most file metadata, once written, is never read again, so Alki tiers cold metadata onto cheaper storage to keep the hot path fast: the metadata store needs its own hot/cold hierarchy the same way the block store needs replicated and erasure-coded tiers, and a frequently-read slice is a natural fit for the patterns in [the distributed cache](/blog/distributed-cache) as long as the journal, not the cache, stays the source of truth.
+
+Verification is a deliverable here, not an afterthought. The sync state space is too large to enumerate, so Dropbox built deterministic simulation testing (Trinity and CanopyCheck): seed a PRNG, mock the filesystem, network, and timers, inject reordering and I/O failures, then assert all three trees converge. Any discrepancy is a bug, by definition.
+
+## How a senior actually decides
+
+Strip away the Dropbox-specific names and the decisions stack in a clear order, each one earning its place.
+
+| Decision | Default move | Why, and the tradeoff |
+| --- | --- | --- |
+| File representation | Ordered list of content hashes; bytes in a separate store | Makes dedup free and sync a diff; costs you a manifest to maintain and GC |
+| Metadata vs blocks | Hard split: transactional sharded SQL vs content-addressed object storage | Opposite access patterns; one store cannot serve both well |
+| Chunking | Content-defined (Gear/FastCDC), not fixed-size | Survives the one-byte insert; more complex, and chunk size trades dedup against metadata |
+| Durability of blocks | Erasure coding for cold, replication for hot/recent | Four-nines durability at a fraction of 3x replication cost |
+| Sync algorithm | Three-tree reconciliation with a synced merge base | Derives change direction; needs stable node IDs so a move is one op |
+| Conflicts | Conflicted copy for content, deterministic order for structure | LWW silently loses data; arbitrary merge corrupts formats |
+| Notification | Long-poll cursor signal, client pulls the delta | Keeps fan-out cheap and the data plane separate; add a poll fallback |
+| Upload path | Presigned direct-to-blob, resumable multipart | App tier never becomes a bandwidth bottleneck |
+
+None of these is exotic alone. What makes the answer senior is seeing they are not independent: the content-hash file model is what makes dedup, the block-list diff, and the cheap notification all fall out together, and the three-tree model is what makes any of it safe to run bidirectionally across devices that go offline and come back. Get the file model wrong and everything downstream is harder; get it right and the rest is mostly bookkeeping. The same values, sweating the data model first and treating correctness as a feature, show up in the document-intelligence pipeline behind [IntelliFill](/case-study/intellifill) and the audio work in [Audex](/case-study/audex), where the cheap path is always the one that moves the least data.
+
+The honest landing is the one the Dropbox engineers reached: the bytes are the easy part. Object storage is solved and erasure coding is well-understood math. The hard part, worth a rewrite in Rust and a simulator most teams never build, is the sync state machine, because the only failure that truly matters is the silent one where a file is wrong and nobody knows. Design for that, and a folder identical across every device stops being magic and starts being inevitable.
+
+## FAQ
+
+<FAQ />

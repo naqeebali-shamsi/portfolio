@@ -1,0 +1,139 @@
+export const meta = {
+  slug: 'cap-pacelc-consistency-spectrum',
+  title: 'CAP, PACELC, and the Consistency Spectrum (Beyond "Pick Two")',
+  description:
+    'CAP is misquoted as "pick two." PACELC is the upgrade: a partition forces consistency vs availability, otherwise you trade latency for consistency per op.',
+  headline: 'CAP, PACELC, and the Consistency Spectrum (Beyond "Pick Two")',
+  deck: 'A partition forces a choice between consistency and availability, but the rest of the time you are trading latency against consistency on every single operation.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '15 min',
+  tags: ['cap-theorem', 'pacelc', 'consistency', 'distributed-systems', 'databases', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between CAP and PACELC?',
+      a: 'CAP says that during a network partition you must choose between consistency and availability. PACELC keeps that and adds the half CAP ignores: Else, when there is no partition, you still choose between latency and consistency on every operation. A strongly consistent write must synchronously reach a quorum of replicas before it acknowledges, and that round trip is the latency cost. Since partitions are rare and normal operation is constant, the latency-versus-consistency tradeoff is the one you actually pay all day. PACELC is the frame senior engineers use because it describes the common case, where CAP only describes the emergency.',
+    },
+    {
+      q: 'Does the "C" in CAP mean the same thing as the "C" in ACID?',
+      a: 'No, and conflating them causes real confusion. The C in CAP is linearizability: every operation appears to take effect at a single instant, consistent with real-time order, as if there were one copy of the data. The C in ACID is integrity constraints: a transaction moves the database from one valid state to another without violating rules you defined, like foreign keys. They are unrelated properties that happen to share a letter. A system can be ACID-consistent and not linearizable, and vice versa.',
+    },
+    {
+      q: 'How eventual is eventually consistent in practice?',
+      a: 'Usually a matter of milliseconds, not an open-ended risk. On real production latency traces, the Probabilistically Bounded Staleness work measured a LinkedIn SSD store with the weakest quorum (one read replica, one write replica) returning a consistent read 97.4 percent of the time immediately after a write commits, and more than 99.999 percent within 5 milliseconds, while saving roughly 59 percent of read-plus-write latency versus a strict quorum. Eventual consistency is a distribution you can measure and tune with read and write quorum sizes, not a binary that means data is randomly wrong.',
+    },
+    {
+      q: 'Did Spanner break the CAP theorem?',
+      a: 'No. Brewer, who coined CAP, analyzed Spanner himself and concluded it is technically a CP system: under a partition it chooses consistency and sacrifices availability. It feels like a CA system only because Google runs it on a private global network where partitions contribute less than 10 percent of an already rare outage budget, so choosing consistency under partition costs almost no availability in practice. Spanner bought strong consistency with TrueTime, GPS and atomic clocks, and commit-wait, not by repealing a theorem.',
+    },
+    {
+      q: 'Should I pick one consistency level for my whole database?',
+      a: 'No. That is the mistake the system-wide CP or AP label encourages. The senior move is to choose consistency per operation. The same store can serve a linearizable read for a uniqueness check, a read-your-writes read so a user sees their own post, a causal read so a comment never appears before the comment it replies to, and an eventual read for a like counter where being off by a few for a second is invisible. One product, four consistency levels, each chosen for the operation it serves.',
+    },
+  ],
+}
+
+CAP is the most-misquoted theorem in distributed systems. The pop version, "pick two of consistency, availability, and partition tolerance," is not what the theorem says, not what its authors meant, and not the question a senior engineer asks at a design review. It survives because it fits on a slide: a three-circle Venn diagram, a knowing nod, and the conversation moves on before anyone notices the framing dissolves the moment you look at it.
+
+Here is what replaces it. A partition forces a choice between consistency and availability, yes. But partitions are rare. The rest of the time, which is almost all of the time, every replicated system trades latency against consistency on every operation it serves. CAP says nothing about that. The theorem that does is PACELC, and once you have it, "pick two" reads like a horoscope: vague enough to feel true, useless for any actual decision.
+
+This post is about the real shape of the problem. You do not stamp one label on a database. You choose a point on a spectrum per operation, each with a known cost in milliseconds. It is part of [the system design interview framework](/blog/system-design-interview-framework), and sits alongside two siblings published with it, [capacity estimation](/blog/capacity-estimation) and [latency, throughput, and the tail](/blog/latency-throughput-tail). Consistency is where those two meet, because the price of consistency is paid in latency, and the bill comes due under load.
+
+## What CAP actually says, with the sharp edges on
+
+The reason "pick two" is wrong starts with the words. In the formal statement, by Gilbert and Lynch in 2002, none of the three letters means the everyday English word people substitute for it.
+
+**C is linearizability.** Not "consistency" in the loose ACID sense, not "the data looks right." Every operation appears to take effect instantaneously at a single point between when you called it and when it returned, in an order consistent with real wall-clock time, as if there were exactly one copy of the data and every operation touched it in turn. A strong, specific, expensive guarantee.
+
+**A is total availability.** Not "the service is up," not "the cluster is healthy." Every request that reaches a non-failed node returns a non-error response. Note what it does not say: it does not say the response is correct. A node serving stale data is available. A node that rejects your write to protect consistency is, in CAP's vocabulary, not available, even though the cluster is perfectly healthy. That distinction trips up almost everyone the first time.
+
+**P is partition tolerance.** The network is allowed to drop arbitrary messages between nodes. And here is the move that breaks the pop version: P is not a dial you turn. Partitions are a property of the world, not a feature you opt into. Given enough time, a partition will happen to you on any real network whether you planned for it or not.
+
+So the theorem proves that in a fully asynchronous network where messages can be lost, you cannot have linearizable consistency and total availability at the same time. Brewer, who first conjectured CAP, put the scope plainly in 2012: the theorem "prohibits only a tiny part of the design space." That is the opposite of how it gets taught.
+
+Once P is not optional, "CA" stops being a category you can live in. A single-node database is "CA" right up until its first partition, at which point it is just down. Over a real network, "CA" collapses into either CP or AP depending on one decision: **when a partition arrives, do you sacrifice consistency or availability?** That conditional, binary, partition-only choice is the entire content of CAP. Everything else attributed to it is decoration.
+
+## The half CAP leaves out
+
+Brewer disowned the binary framing in the same 2012 retrospective. Two lines from it carry the whole argument. First: "when a system is not partitioned, the system can have both strong consistency and high availability." So the trilemma everyone draws only binds during the partition, which is the rare case. Second, and this is the bridge to everything below: "essentially, a partition is a time bound on communication." If you cannot reach agreement within your latency budget, you are partitioned in effect, even if no cable was cut.
+
+Hold that second idea, because it is the seam where CAP opens up into the real problem. Abadi named it in 2012 with PACELC, and the title of his paper is the thesis: "CAP is only part of the story." The formulation:
+
+> **If** there is a **P**artition, choose **A**vailability or **C**onsistency. **E**lse, choose **L**atency or **C**onsistency.
+
+The left half is CAP. The right half, the "Else," is what CAP forgot, and it is where systems spend 99.9 percent of their lives. Why does normal operation force a latency-versus-consistency choice at all? Replication. To make a write strongly consistent, you must synchronously contact a quorum of replicas and wait for them to acknowledge before you confirm the write to the client. That round trip is not overhead you can optimize away. The round trip *is* the consistency, because the coordination is what makes the write linearizable.
+
+So every replicated system, on every single write, answers a question CAP never asks: wait for the replicas and stay consistent, or acknowledge locally and replicate in the background and stay fast? That is the EL-versus-EC choice, and it is constant.
+
+PACELC also gives you a vocabulary that finally lets you describe real systems honestly, with two labels instead of one:
+
+- **Dynamo, Cassandra, Riak are PA/EL.** Under partition they keep serving and drop consistency; otherwise they favor latency over consistency. Availability-and-speed, top to bottom.
+- **Fully ACID systems, VoltDB and classic two-phase-commit, are PC/EC.** They refuse to give up consistency in either case, paying unavailability under partition and latency the rest of the time. Spanner is also PC/EC: it pays commit-wait latency to hold consistency, and chooses consistency under partition.
+- **PNUTS, Yahoo's store, is PC/EL.** Under partition it keeps consistency, but in normal operation it deliberately chooses latency over consistency. Abadi singles this out because CAP literally cannot express it. CAP has no slot for "consistent during the disaster, relaxed during normal life," and that gap is the reason PACELC exists.
+
+If you take one upgrade from this piece, take the second label. "It's an AP system" tells me what happens during the rare emergency. "It's PA/EL" tells me that too, and also tells me what it does to my p99 every single day.
+
+## Consistency is a lattice, and availability is printed on it
+
+"Consistent or not" is the junior model. The senior model is a lattice of consistency models ordered strongest to weakest, where each level carries a known ceiling on availability. Kyle Kingsbury's Jepsen consistency map is the canonical version, and the availability verdicts on it are the part worth memorizing.
+
+From strong to weak: strict-serializable, linearizable, sequential, causal, read-your-writes, the session guarantees like monotonic reads and monotonic writes, then eventual at the floor. The bands, stated almost verbatim from Jepsen:
+
+- **Everything at or above sequential cannot be totally available** in an asynchronous network. Linearizable and sequential are off the table during a partition. This is just CAP, restated precisely and placed on the lattice.
+- **Everything at or above read-your-writes can be at most sticky available**, meaning available only while a client keeps talking to the same replica.
+- **Causal and everything below it can be totally available**, which gives you the single most useful fact on the map: **causal consistency is the strongest model that survives a partition with full availability.** It is the sweet spot, and most engineers underrate it badly.
+
+Why does climbing the lattice cost availability and latency? Kingsbury says it directly: stronger models "tend to require more coordination, more messages back and forth," so they are "less available" and "impose higher latency constraints." The cost is physical. It is not a config flag you forgot to flip; it is round trips on the wire.
+
+One subtle rung explains a design decision you will hit. Linearizability respects real time; sequential consistency keeps a single total order but drops that real-time anchor, so an operation can appear to take effect before you called it or after it returned. The consequence is sharp: on a linearizable store you can build a distributed lock or leader election because real-time order gives you a "who got here first" you can trust, and on a merely sequential store you cannot. This is why Paxos and Raft target linearizability and not mere sequential order. The extra strength is what makes a lock a lock.
+
+## How eventual is "eventually consistent"? In milliseconds, and you can measure it
+
+Here is where most treatments wave their hands and say "eventually." Peter Bailis and collaborators refused to, and built Probabilistically Bounded Staleness to put numbers on it, measured against real production latency traces. The numbers are the antidote to the fear that eventual means "randomly wrong."
+
+On the LinkedIn SSD-backed store, with the weakest possible quorum of one read replica and one write replica, a read is already consistent **97.4 percent of the time immediately** after the write commits, and **better than 99.999 percent within 5 milliseconds**, while saving roughly **59.5 percent** of combined read-plus-write latency versus a strict quorum. You give up about two milliseconds of staleness on a small fraction of reads, and you halve your latency for it. On the LinkedIn disk-backed store the window is wider because seek time varies more, 43.9 percent immediately and 92.5 percent within 10 milliseconds: slower storage, longer inconsistency window, the physics showing up in the percentages.
+
+On the Yammer trace, the tradeoff has teeth. With one read and one write replica, operations are fast at about 16 milliseconds, but the time-to-visibility tail stretches to a long **1364 milliseconds**. Bump the read quorum to two while keeping writes at one, and that tail collapses to **202 milliseconds**, while the configuration is still **81.1 percent lower latency** than the fastest strict quorum.
+
+Read that last one again, because it is the whole lesson in one trace. Moving a single replica into the read quorum, R from one to two, cut a worst-case staleness window by almost a factor of seven, and the result was still dramatically faster than going fully strict. You are not choosing between "fast and wrong" and "slow and right." You are choosing a point on a curve, and you can tune it per operation by turning the R and W knobs. "Eventual" is a distribution with a measurable shape, and on fast storage the bulk of it is gone in single-digit milliseconds while the tail is the part you respect. You are trading p50 latency for a p99.9 staleness window, the same p50-versus-tail discipline that governs response time, pointed at staleness instead.
+
+The knob has a precise rule. In a Dynamo-style store with N replicas, read quorum R, and write quorum W, the identity is **W + R > N**: when the write set and the read set are forced to overlap on at least one replica, every read sees the latest write, and you have strong consistency. **W + R ≤ N** lets them miss each other, and you get eventual. With N=3, W=2/R=2 is the balanced strong default that tolerates one node down for both reads and writes; W=1/R=1 is Dynamo's "always writeable" eventual default that tolerates two down, the one PBS measured at 97.4 percent immediate consistency on SSD. "Strongly consistent" and "eventually consistent" are not two products, then. They are two settings of the same three numbers, pickable per query, which is exactly what Cassandra's per-query consistency level, Cosmos DB's five named levels, and MongoDB's read and write concerns expose.
+
+Across regions the cost stops being subtle. A cross-US-region round trip runs thirty to seventy milliseconds, so a linearizable write whose quorum spans us-east and us-west must add at least one such trip before it acknowledges, because the round trip is the consistency, while an eventual write to the same row acknowledges locally in about a millisecond. "Strong versus eventual" becomes "plus seventy milliseconds on every write" versus "near zero," which on a write-heavy path is the gap between a product that feels instant and one that feels broken. That is the PACELC "Else" branch with the abstraction stripped off: the L and the C are milliseconds you can feel.
+
+## "Spanner beat CAP" means "Spanner made P rare enough to ignore"
+
+Spanner is the system people cite to claim CAP is obsolete. Brewer, who coined CAP and worked at Google, wrote the honest version himself in 2017, and his verdict is blunt: Spanner "is technically a CP system." Under a partition it chooses consistency and gives up availability, exactly as the theorem requires. It only *looks* like it cheated because of where it runs. On Google's private global network, "the network contributed less than 10 percent of Spanner's already rare outages," and the system achieves "more than five 9s of availability." Google controls the network end to end and engineers redundant paths until partitions become a rounding error in the outage budget. Spanner did not repeal CAP; it drove the partition probability so low that choosing consistency under partition costs almost no availability in practice. The CP label is technically true and operationally invisible.
+
+The consistency itself is bought with hardware. TrueTime bounds clock uncertainty with GPS and atomic clocks, generally under 10 milliseconds, and commit-wait waits out twice that before committing so timestamps respect real-time order, which is the latency price of external consistency. The honest one-liner: Spanner bought global consistency with atomic clocks and a private network, and pays for it in commit latency. "Just do what Spanner does" is non-trivial on commodity cloud, because the bet hinges on bounding clock error, a physical-infrastructure problem, not a library you import.
+
+There is one more senior reflex worth naming before the payoff: a vendor saying "we are strongly consistent" is a hypothesis, not a guarantee. Kingsbury's Jepsen analyses repeatedly caught databases violating their own claims, including MongoDB 4.2.6, where a network partition could make transactions lose writes that the MAJORITY write concern had already acknowledged, and expose stale reads on top. The spec is a claim, the test is the truth, so you verify consistency under injected partitions and clock skew rather than taking the label on faith. An idempotency scheme that faithfully dedupes against a store that silently drops writes is a reliable way to be wrong, the same lesson as [idempotent webhooks](/blog/idempotent-webhooks): correctness only composes if every layer actually delivers the guarantee printed on it.
+
+## The payoff: one product, four consistency levels
+
+Everything above converges on a single move, and it is the one that separates senior design from junior design. Stop labeling the database. Choose consistency per operation. Martin Kleppmann put the negative case bluntly in his post titled, with feeling, "Please stop calling databases CP or AP." The positive case is a routing table.
+
+Take a social app. One logical product, four operations, four different right answers:
+
+| Operation | Consistency level | Why | PACELC cost |
+| --- | --- | --- | --- |
+| Reserve a unique @username | Linearizable | Two users must never both win the same handle; you need real-time uniqueness | Pay latency, unavailable under partition. Worth it, it is rare |
+| Your post appears in your own feed | Read-your-writes | You must see your own post instantly; others may lag a beat | Sticky-available, cheap |
+| Comment thread ordering | Causal | A reply must never appear before the comment it answers | Totally available, survives a partition. The sweet spot |
+| Like and view counters | Eventual | Off by a few for a second is invisible; throughput is king | Cheapest, fully available |
+
+That table is the entire thesis in miniature. One system, four levels, each chosen for the work it does. Spending linearizable coordination on the like counter would be a self-inflicted wound, because nobody notices a counter briefly off by three and the throughput is enormous; serving the username check as eventual would be a bug that lets two people own the same name. The same instinct shows up in real systems: [NomadCrew](/case-study/nomadcrew) keeps live group location eventual because a two-second-stale position is fine at high volume, while holding the expense ledger that decides who owes whom to a far stronger bar because money demands it. In [event-driven RBAC](/blog/event-driven-rbac), a permission revocation is the one operation you make strongly consistent on purpose, because a stale "yes" to "can this user still access payroll" is the failure you cannot ship while the rest of the system runs happily on eventual reads.
+
+## A few nuances that signal you have actually built this
+
+Three details separate someone who has read about consistency from someone who has been paged about it. First, **session guarantees have an affinity requirement**: read-your-writes and monotonic reads are achievable only as sticky availability, so the client has to stay pinned to one replica, and the day your load balancer reshuffles a user to a different node the guarantee evaporates with no error to warn you. Second, **transaction isolation is a second lattice with its own ceiling**: Bailis's Highly Available Transactions work showed read-committed, monotonic-atomic-view, and read-atomic can stay highly available while serializable and snapshot isolation cannot, and since most databases do not default to serializable, "is it consistent?" is really two questions, which object-level model and which isolation level. Third, **CRDTs are eventual consistency that does not lose writes**: where Dynamo's vector clocks and last-writer-wins silently discard one of two concurrent writes, conflict-free replicated data types converge deterministically with no coordination and no lost updates, and the CALM theorem says exactly when you can pull that off, a program has a coordination-free implementation if and only if it is monotonic. Which is the same as asking when you are allowed to be fast. The thread through all three: consistency is a property of an operation, priced in coordination and paid in latency, chosen at the granularity of the thing you are actually doing.
+
+## The honest landing
+
+CAP is real, but it is small. It governs one rare moment, the partition, and during that moment it forces one binary choice. The myth inflated it into a permanent law about your whole database, and that inflation is why most people who can recite it cannot use it. The frame that earns its keep is PACELC, because it names the tradeoff you pay all day: latency against consistency, on every write, whether or not anything is broken. Strong consistency is synchronous coordination, coordination is round trips, and round trips are the seventy milliseconds a cross-region write costs. Eventual consistency is a measured distribution, usually gone in single-digit milliseconds and tunable per query.
+
+So when you walk into a design review, do not ask "is this database CP or AP." Ask, operation by operation: what does this one need, what does that strength cost in latency, and what breaks when the partition finally comes. Reserve linearizable for the handful of operations where being wrong is unacceptable, like the username claim and the permission revoke. Let causal carry the collaborative middle, because it is the strongest thing that survives a partition. Spend eventual freely where a one-second lag is invisible and throughput is the prize. One product, many consistency levels, each chosen on purpose. That sentence, said out loud at a whiteboard, is the difference between someone who memorized a triangle and someone who has shipped the thing.
+
+## FAQ
+
+<FAQ />

@@ -1,0 +1,179 @@
+export const meta = {
+  slug: 'recommendation-systems',
+  title: 'How Recommendation Systems Work: From Collaborative Filtering to Two-Tower Retrieval',
+  description:
+    'The arc from the Netflix Prize to YouTube two-tower retrieval: matrix factorization, implicit feedback, the cold-start problem, ANN candidate generation, and feedback loops.',
+  headline: 'How Recommendation Systems Work: From Collaborative Filtering to Two-Tower Retrieval',
+  deck: 'The metric that wins the contest is almost never the product, and the gap between them is the whole education.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '16 min',
+  tags: ['recommendation-systems', 'machine-learning', 'matrix-factorization', 'embeddings', 'vector-search', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between content-based and collaborative filtering?',
+      a: "Content-based filtering recommends items similar to ones a user already liked, using item attributes such as genre, tags, or text. It survives cold start because it needs no other users, but it over-specializes and rarely surprises you. Collaborative filtering recommends from interaction patterns across many users and items without knowing anything about content, so it discovers non-obvious affinities, but it falls apart for brand-new users and items that have no interactions yet. Production systems blend both, often by feeding content features into the item side of a learned model so a new item still gets a usable representation.",
+    },
+    {
+      q: 'Why do recommendation systems split retrieval and ranking into two stages?',
+      a: "Because you cannot run an expensive model over a corpus of tens of millions of items per request under a latency budget of tens of milliseconds. The first stage, retrieval or candidate generation, is cheap per item and reduces the corpus to a few hundred candidates using an approximate nearest-neighbor lookup over precomputed embeddings. The second stage, ranking, then runs a heavy model with hundreds of features over only those survivors. YouTube describes this in its 2016 paper as the classic two-stage information retrieval dichotomy, and the split exists purely because per-item cost is the binding constraint.",
+    },
+    {
+      q: 'What is a two-tower model in recommendations?',
+      a: "A two-tower model, also called a dual encoder, has a user-and-context tower and an item tower, each a neural network that maps features to an embedding. The score is just the dot product of the two embeddings. The towers are kept separate on purpose so there is no interaction between user and item features before that dot product, which is the exact property that lets you precompute every item embedding offline and serve retrieval as a nearest-neighbor lookup. That separation is also why retrieval is structurally weaker than ranking: it can only express a bilinear interaction.",
+    },
+    {
+      q: 'Did Netflix deploy the $1M Netflix Prize winning solution?',
+      a: "No, not the full ensemble. Netflix engineers wrote that the extra accuracy from the complete winning blend did not justify the engineering effort to bring it into production, and by 2012 the business had shifted from predicting DVD star ratings to ranking what to stream now. They used pieces of the winning approaches, but the headline model that won the $1,000,000 prize on RMSE was never shipped whole. It is the cleanest lesson in the field that the offline metric is a proxy, not the product.",
+    },
+    {
+      q: 'What is the cold-start problem and how is it handled?',
+      a: "Cold start is having too little interaction data to make a good recommendation, and it comes in three flavors: a new item, a new user, and a whole new system with no data at all. The item case is handled structurally by an item tower that consumes content features, so a brand-new video gets an embedding from its attributes with zero watches. The user case needs onboarding signals, popularity priors, and deliberate exploration. The system case leans on bandits and heuristics until enough data accrues. Exploration is not free, though, because the impressions you spend on uncertain items are the price of keeping your training data honest.",
+    },
+  ],
+}
+
+A recommender is a bet about what you want next, placed before you know you want it, in the few milliseconds between your click and the page rendering, drawn from a catalog of millions, and personal enough that you do not bounce. That is the whole problem, and almost everything interesting about it comes from the constraints, not the math.
+
+The cleanest way into the field is a story where the people who won got the answer wrong, on purpose, and shipped something else.
+
+## The contest that taught everyone the wrong lesson first
+
+In October 2006 Netflix put a million dollars on the table. The deal was blunt: beat Cinematch, their in-house rating predictor, by ten percent on RMSE over a held-out set of movie ratings, and the prize is yours. The dataset they handed out motivates the entire field in one ratio. Roughly 480,000 users by 17,770 movies is about 8.5 billion possible user-movie cells, and the number of ratings that actually existed was about 100 million. That is 98.8 percent empty.
+
+Sit with that. You are asked to predict the 8.4 billion blank cells from the 1.2 percent that are filled, and you cannot treat a blank as a zero, because a blank means "has not watched," not "hates it." The single defining fact of recommendation is that your data is mostly absence, and you have to generalize from a sliver.
+
+The finish is the part worth keeping. In the final hours two teams crossed the ten percent line: The Ensemble posted a 10.10 percent improvement, BellKor's Pragmatic Chaos posted 10.09 percent, and the rules broke ties by submission time, with BellKor's entry stamped about twenty minutes earlier. Twenty minutes, on a three-year contest, for a million dollars. BellKor won with a test-set RMSE of 0.8567, a 10.06 percent gain over Cinematch.
+
+Then the lesson nobody expects, and the most important one in this article. Netflix never deployed the winning solution. Their own engineers wrote that the extra accuracy from the full ensemble "did not seem to justify the engineering effort needed to bring them into a production environment." By 2012 the business had moved from shipping DVDs and predicting a star rating to streaming, where the job is to rank what you should play right now, not to guess a number out of five. The metric that won the contest was a proxy. The product was something else.
+
+Every section below is downstream of that gap. Optimizing the proxy harder is the trap. Knowing which proxy to optimize, and when to abandon it, is the craft.
+
+## Two ways to guess, and why one of them generalizes
+
+Two foundational strategies, and the difference between them shapes everything after.
+
+Content-based filtering recommends items similar to ones you already liked, using the items' own attributes. You watched three noir thrillers, so here is a fourth. It never needs another human being, so it survives cold start gracefully. Its weakness is that it boxes you in: it can only recommend more of what it already knows you like, so it over-specializes and almost never surprises you.
+
+Collaborative filtering ignores content entirely and works from interaction patterns across the whole population. The phrase people repeat is "users who liked this also liked that," but that slogan only describes one branch. The naive form, memory-based CF, finds your nearest-neighbor users or items and borrows their preferences directly, a k-nearest-neighbors over rows or columns of the matrix. It is intuitive, and it does not scale or generalize especially well.
+
+What most explainers get wrong is equating collaborative filtering with that neighborhood method. The technique that actually won the Netflix Prize was also collaborative filtering, just the model-based kind, and it beat the neighborhood methods decisively. So when someone says "CF," do not picture kNN on rows. Picture the move that follows.
+
+## Matrix factorization, and the assumption hiding inside it
+
+The model-based answer is to assume the giant sparse matrix has a low-rank structure underneath. Every user and every movie gets described by a short vector of, say, 50 hidden traits, and your predicted rating is the dot product of the two. If a movie scores high on "slow and cerebral" and you score high on "likes slow and cerebral," the dot product is high. Nobody labels the traits by hand; they are learned, and they arrange themselves into geometry where proximity means shared taste.
+
+The sizing tells you why this works at all. Instead of storing 8.5 billion cells, you store two skinny matrices: roughly (480,000 + 17,770) by 50, about 25 million numbers. That is a 340-times compression, the dot product reconstructs any cell on demand, and that same compression makes serving cheap at scale later.
+
+The part that separates understanding from a hand-wave: you do not factor the matrix. You cannot, because most of it is missing, and there is no such thing as the factorization of a matrix you mostly cannot see. What you do is fit the model to the observed entries only and let it generalize to the rest. The objective, in plain terms: minimize the squared error between predicted and actual ratings over the ratings that exist, plus a regularization penalty on the vector magnitudes so the model does not overfit the sparse data. Koren, Bell, and Volinsky's 2009 IEEE Computer paper is the canonical, readable statement of all of this, and the one citation to keep for this era.
+
+The biases matter more than newcomers expect. Before any personalization, you account for the fact that some raters are harsh, some films are universally loved, and the world has an average. The prediction becomes the global mean, plus a user bias, plus an item bias, plus the personalized dot product. Worked: global mean 3.5 stars, a grumpy user at minus 0.4, a beloved film at plus 0.7, and a taste match of plus 0.5, gives 4.3 stars. A surprising fraction of the achievable accuracy lives in those bias terms alone.
+
+One practical fork. You can fit this with stochastic gradient descent, simple, or with alternating least squares, which parallelizes cleanly because holding one matrix fixed makes the other a tidy least-squares problem. That is a real engineering decision about your hardware and data shape: ALS to spread the work across a cluster, SGD for the simpler loop.
+
+## Most signal is implicit, and implicit signal has no "no"
+
+The Netflix Prize was about explicit ratings, those deliberate five-star judgments, and real products rarely have that luxury. What you actually collect is implicit: clicks, watches, dwell time, replays, skips. People interact constantly and rate almost never.
+
+Implicit feedback breaks a hidden assumption in everything above. With star ratings, a low score is a real negative signal. With implicit data there are no true negatives: a video you never watched might be one you would hate, or one you simply never saw. Absence is ambiguous, and you cannot call every non-watch a zero.
+
+Hu, Koren, and Volinsky solved this in 2008 in a way that still anchors production baselines, and it won ICDM's ten-year highest-impact award in 2017 for good reason. Split each observation into two pieces: a binary preference (did they interact at all) and a confidence (how much you trust that signal, growing with the number of interactions). Someone who watched a series five times gives a high-confidence positive; a single accidental click gives a weak one. Then minimize confidence-weighted error over all user-item pairs, including the unobserved ones, with the confidence dialing down how much the zeros count. This is the model people still call WRMF or implicit ALS, and it is the answer to "but I don't have ratings."
+
+A second reframing closed the loop toward modern systems. Rendle's BPR, also 2009, made the point that you should stop predicting an absolute number at all. What you care about is order: for a given user, an item they engaged with should rank above one they did not. BPR's objective optimizes exactly that pairwise comparison, derived as a maximum-posterior estimate. This is the conceptual bridge out of the rating-prediction era. The job was never to nail the star value. It was to get the ordering right, which is what a ranked list actually is.
+
+## The funnel: why you split retrieval from ranking
+
+Fast-forward to a modern feed at YouTube scale, and a new constraint dominates: tens of millions of items, thousands of requests per second, a budget of tens of milliseconds per request. You physically cannot run a rich, feature-heavy model over every item for every request. Ten million forward passes per request under a 100-millisecond budget is not slow, it is impossible.
+
+So the system splits in two. YouTube's 2016 paper states it plainly: the design is "split according to the classic two-stage information retrieval dichotomy," a cheap candidate generation stage and then a separate heavy ranking stage. The shape, with rough magnitudes:
+
+```
+   Corpus:      ~10,000,000 items
+     |  Stage 1: RETRIEVAL (candidate generation)
+     |    cheap per item, ANN over precomputed embeddings
+     |    one user-vector compute + one nearest-neighbor lookup
+     |    single-digit milliseconds, recall-optimized
+     v
+   Candidates:  ~500 to 1,000 items   (~4 orders of magnitude cut)
+     |  Stage 2: RANKING
+     |    expensive per item, hundreds of features each
+     |    ~500 full forward passes, tens of milliseconds
+     |    precision-optimized, orders the survivors
+     v
+   Shown:       ~10 to 20 items
+```
+
+The division of labor is the insight. Retrieval optimizes recall: do not lose the good item before it reaches the ranker, because no ranker can resurrect a candidate the funnel already dropped. Ranking optimizes precision and ordering at the very top, where it can afford to be lavish because it only sees a few hundred items. Conflating their metrics is a classic mistake, because a brilliant ranker cannot save a candidate set that already threw away the right answer.
+
+That two-stage shape is the same skeleton behind a [recommendation feed in Design YouTube](/blog/design-youtube) and the timeline assembly in [Design Instagram](/blog/design-instagram) and [Design Twitter](/blog/design-twitter-feed). It is one of the load-bearing patterns in [the system design interview framework](/blog/system-design-interview-framework): when per-item work is expensive and the corpus is huge, you put a cheap, recall-oriented filter in front of an expensive, precision-oriented scorer.
+
+## Retrieval as a dot product, and the tower that makes it cheap
+
+For retrieval to be cheap per item, the score has to be something you can precompute most of. So you force it into a dot product.
+
+This is the two-tower model, the structural heart of modern retrieval. You build two separate neural networks. A query tower ingests the user and context, watch history plus dynamic signals the YouTube two-tower paper names directly, "such as time of day, and devices users are using." An item tower ingests the item's own features. Each tower outputs an embedding, the score is the dot product of the two, and Yi and colleagues' 2019 paper is where this formally enters production retrieval at YouTube.
+
+Why two separate towers instead of one model over user and item together? If the two never interact until the final dot product, the item embedding does not depend on the user at all. So you compute every item's embedding once, offline, and store it; at request time you compute one user embedding and find its nearest neighbors among the precomputed item vectors. That is the entire reason retrieval scales.
+
+It is also the reason retrieval is fundamentally weaker than ranking. A dot product can only express a bilinear interaction, so the two-tower model structurally cannot represent "this user likes long videos, but only on weekends, on a TV." That cross-feature interaction is exactly what you forbade to get precomputability. So you push simple, decomposable signals into retrieval and save the rich cross-features for ranking, where the model sees user and item together and can be as nonlinear as you like. Knowing which signal belongs in which stage is most of the skill.
+
+Training the towers is where models live or die on real corpora. You do not compute a softmax over ten million items per step; that is as infeasible as scoring them at serve time. Instead you use in-batch negatives: for each positive user-item pair, the other items in the same minibatch act as free negatives. Cheap and effective, with one ugly bias. Popular items show up in lots of batches, get sampled as negatives constantly, and the model learns to suppress them, or in the paper's words, "popular items are overly penalized as negatives due to the high probability of being included in a batch." The fix is the logQ correction: subtract the log of each item's batch-appearance probability from its score, which un-penalizes the common ones. The paper's actual contribution is estimating those probabilities online from the stream of batches, with no fixed vocabulary, so it adapts as YouTube's popularity distribution shifts by the hour. That is the difference between a model that works in a notebook and one that works on a power-law catalog.
+
+## Approximate nearest neighbors: the dial you have to monitor
+
+"Find the nearest item vectors" sounds like a solved lookup, and at small scale it is. Over ten million 256-dimensional vectors it is not. A brute-force scan computes the dot product against every vector, on the order of 2.5 billion multiply-adds per query. Do that thousands of times per second and you have melted a data center.
+
+So retrieval is approximate. Approximate nearest neighbor search trades a little accuracy for orders of magnitude in speed, and the trade is the entire point. The dominant production index is HNSW, a hierarchical navigable small-world graph: sparse top layers let a query take big jumps across the space, dense bottom layers let it search finely, so it descends greedily and finds good neighbors in roughly logarithmic time instead of linear. The other major family is IVF with product quantization, popularized by FAISS, which partitions the space into cells and compresses vectors so a billion of them fit in memory. The choice between them is a real memory-versus-latency-versus-recall decision, not a default.
+
+The word "approximate" hides a discipline. Because you are not guaranteed the true nearest neighbors, you measure how many you actually got against a brute-force ground truth. That metric is recall@k, and ANN-Benchmarks (Aumüller, Bernhardsson, Faithfull) is the standard way the field plots it. A well-tuned HNSW index returns something like 95 to 99 percent recall@10 at thousands of queries per second per core, where exact search would crawl. You accept losing 1 to 5 percent of true neighbors to gain 100 to 1000 times the throughput, and you tune that point with knobs like HNSW's efSearch and M, or IVF's nprobe.
+
+The operational trap is treating "approximate" as a one-time decision. Recall degrades as the index grows and the data drifts, so recall@k is a service-level objective you monitor with a canary, not a number you checked once in a benchmark. And when the item tower retrains, every item embedding changes, so the whole index has to be re-embedded and rebuilt while staying consistent with the live user tower. That refresh problem is a genuine systems headache, the kind of detail that separates a demo from a deployment.
+
+If this machinery feels familiar, it should. Learned embeddings plus an ANN index are what [vector databases](/blog/vector-databases) productize, and they shipped in recommendation systems years before the current retrieval-augmented-generation wave rebranded them. YouTube's two-tower retrieval was 2019, FAISS was 2017, HNSW was 2016. Vector search is not an LLM-era invention. It is recsys infrastructure that found a second career.
+
+## Cold start, properly decomposed
+
+"Use content features" is the usual one-line answer to cold start, and it is incomplete because cold start is three different problems wearing one name.
+
+A new item has no interactions. This is the case content features genuinely solve, and the two-tower architecture solves it almost for free: the item tower already consumes the item's attributes, so a brand-new video gets a real embedding from its features with zero watches and can be retrieved on day one. The structure you built for scale doubles as the structure for item cold start.
+
+A new user has no history, and content features on items do nothing for that. Here you lean on onboarding signals, a popularity prior so you at least show broadly good items, and deliberate exploration to learn fast.
+
+A new system has no data at all, and neither item nor user tricks apply. That is bandit territory and hand-tuned heuristics until enough interactions accrue to train anything learned.
+
+The thread connecting the user and system cases is exploration, and exploration is where the next problem is born. To learn what an uncertain item or user is worth, you have to show it, which costs you impressions you could have spent on a safe bet. That tension between exploiting what you know and exploring what you do not is the explore-exploit tradeoff, and it is not optional. It is the price of keeping your data honest, which brings us to the failure mode that quietly corrupts everything.
+
+## The feedback loop that eats your data
+
+The uncomfortable truth about a deployed recommender: it trains on data it generated. You can only learn from items you chose to show, and you chose them with your previous model. So tomorrow's training set is shaped by today's recommendations, which were shaped by yesterday's, all the way down.
+
+Chaney, Stewart, and Engelhardt gave this a name and a rigorous treatment in 2018: algorithmic confounding. In simulation, when a recommender trains on the logs of its own past recommendations, the system measurably homogenizes (users get pushed toward the same narrow set of items) and measurably loses utility. It is a quantified degradation that comes specifically from the loop, and it gets worse the tighter the loop runs.
+
+Popularity bias is the everyday face of the same disease. Popular items get more impressions, which generate more positive interactions, which the model reads as "even more popular," which earns more impressions. The bias enters through the data, through in-batch negatives, and through evaluation all at once, which is why de-biasing (the logQ correction, inverse-propensity weighting, calibration) is a recurring theme rather than a niche concern.
+
+This is where the famous "filter bubble" idea lands, and the honest version is messier than the slogan. Eli Pariser coined the term around 2010 for the failure where personalization narrows what you ever see. But the empirical record resists the simple story. Nguyen and colleagues' longitudinal study on MovieLens (2014) found that everyone's content diet narrowed somewhat over time, and yet the users who actually followed their recommendations narrowed less than those who ignored them. Following the algorithm did not collapse their diversity the most. Cite the nuance, because the slogan is wrong about the direction.
+
+The defense is to spend impressions keeping your data truthful: log the propensity (how likely you were to show each item), do some genuinely unbiased exploration, and account for exposure when you train. The cost is real, which is exactly why it is tempting to skip, and exactly why skipping it slowly poisons the model.
+
+The Netflix lesson then recurs at the ranking stage in copyable form. YouTube's ranker does not predict the probability of a click, because raw click-through rate invites clickbait: the thing most likely to be clicked and the thing most worth watching are not the same. It predicts expected watch time instead, trained with a weighted logistic regression where positive examples are weighted by how long the user actually watched. That is the same move as Netflix abandoning RMSE, picking the objective that matches the product over the one that is easiest to measure. And the offline numbers themselves lie: recall and NDCG on logged data are confounded because you only observed the items you showed, which is why both YouTube papers report live A/B results. The offline number is a hypothesis; the A/B test is the verdict.
+
+## How a senior engineer holds the whole stack
+
+Every layer here is defined as much by what it gives up as by what it does, and that is the through-line worth internalizing.
+
+| Layer | The move | What you give up |
+| --- | --- | --- |
+| Explicit MF | Fit observed ratings, generalize to the rest | You never model the missing cells; pure explicit MF ignores implicit signal entirely |
+| Implicit MF | Confidence-weight all pairs, sample negatives | You manufacture negatives that may not be real dislikes |
+| Ranking objective | Optimize order (BPR, watch time), not raw score | A pairwise objective is harder to reason about than predicting a number |
+| Retrieval | Dot-product two-tower + ANN, precompute items | No user-item cross features before retrieval; recall loss from approximation |
+| Ranking | Heavy model, hundreds of features, top few hundred | Cost; it can only see what retrieval already kept |
+| Exploration | Spend impressions on uncertain items | Short-term engagement, to keep the data honest |
+
+A shallow treatment lists what each technique does; a senior one names the tradeoff in that right-hand column at every step, then decides where to make each trade for its own corpus, latency budget, and business goal. That deciding is the actual job.
+
+The systems thinking transfers cleanly. The two-stage funnel is the same "cheap filter in front of expensive scorer" pattern you reach for whenever per-item cost is the bottleneck, and the embedding-and-index machinery is the same substrate behind [vector databases](/blog/vector-databases) and modern semantic search. The history runs in a straight line from a million-dollar contest about star ratings to a dot product over a billion-item index, and the constant across all of it is that the constraints, not the cleverness, decide the architecture.
+
+## FAQ
+
+<FAQ />

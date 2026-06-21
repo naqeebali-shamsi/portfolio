@@ -1,0 +1,160 @@
+export const meta = {
+  slug: 'feature-flags',
+  title: 'Design a Feature Flag Platform: Decoupling Deploy from Release',
+  description:
+    'Deploy ships code; release flips it on. A senior design of a flag platform: local in-memory evaluation, deterministic bucketing, fail-static propagation, and flag debt.',
+  headline: 'Design a Feature Flag Platform: Decoupling Deploy from Release',
+  deck: 'Deploy puts dormant code on the server. Release is a runtime data change that turns it on for a cohort, and the gap between them is the whole platform.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['feature-flags', 'system-design', 'progressive-delivery', 'distributed-systems', 'experimentation', 'sdk'],
+  faq: [
+    {
+      q: 'What is the difference between a deploy and a release?',
+      a: 'A deploy puts code on the server, where it sits dormant behind a flag. A release flips that flag on for some set of users, which is a runtime data change rather than a code-shipping event. Separating the two means you can ship a binary on Tuesday and turn the feature on for one percent of traffic on Friday, with the release controlled by a product owner instead of an engineer pushing code. Every other capability such as gradual rollouts, kill switches, and experiments falls out of that one decoupling.',
+    },
+    {
+      q: 'Does every feature flag check make a network call to the flag service?',
+      a: 'No, and a platform that works that way is mis-designed. A server-side SDK pulls the entire ruleset for an environment into memory and evaluates flags locally, so a flag read is a hash-table lookup that finishes in under a millisecond. The network is off the request path entirely. The control plane pushes rule changes to the SDK in the background over a streaming connection, but the actual evaluation never leaves the process.',
+    },
+    {
+      q: 'How does a percentage rollout decide who gets the feature?',
+      a: 'It is deterministic hashing, not a coin flip per request. The SDK hashes a stable key, usually a user id, combined with the flag name into a fixed bucket space, then compares the bucket to a threshold. Because the hash is stable, the same user always lands in the same bucket, so a user never flickers between on and off. Raising the rollout from ten to twenty percent only adds users; it never reshuffles the ones who already had it. Mixing the flag name into the hash keeps each flag independent so the same unlucky cohort does not get every new feature.',
+    },
+    {
+      q: 'What happens to feature flags when the flag service goes down?',
+      a: 'A well-designed SDK fails static: on losing the connection it keeps serving the last-known-good ruleset it already has in memory, so your application behaves exactly as it did a moment ago. If the SDK never managed to initialize, evaluation falls through to the code default you passed at the call site. This is a deliberate policy rather than an accident, and it is why a flag platform outage should degrade your release controls instead of taking down your product.',
+    },
+    {
+      q: 'Why is removing old feature flags considered a hard problem?',
+      a: 'Because flags are inventory with a carrying cost. Every live release flag doubles the number of code paths your tests have to cover and leaves a dead branch nobody wants to touch. Release and experiment flags are meant to be temporary, but without an owner, a real expiry date, and a CI check that fails the build on expired flags, they accumulate forever. Mature teams automate the cleanup: Uber built an AST-based tool called Piranha that generates the deletion diff and has removed roughly two thousand stale flags from their mobile apps.',
+    },
+  ],
+}
+
+A feature flag is the seam between two events that everyone treats as one.
+
+The first event is the deploy. Your code clears CI, gets built into an artifact, and lands on the server, where it sits there doing nothing. The second event is the release, when that code starts actually serving users. Most teams fuse these together: you push, and what you pushed goes live, in one motion, to everyone, at once. That fusion is the reason a Friday deploy is scary. It is why rollbacks mean redeploying the previous build under pressure. It is why "we shipped it" and "users have it" are the same sentence even though they describe different risks.
+
+A flag platform exists to pry those two events apart. After you split them, the deploy becomes boring (dormant code is safe code) and the release becomes a runtime data change you can dial from one percent to a hundred, target to a cohort, and rip back to zero in seconds without touching the build. That single decoupling is the whole field. Gradual rollouts, kill switches, A/B experiments, entitlement gating, progressive delivery: every one of them is a consequence of making release a data mutation instead of a code-shipping event. This piece designs the platform that makes it work, and most of the engineering lives in places the demo never shows you.
+
+If you have worked through [the system design interview framework](/blog/system-design-interview-framework), the move here is the same one that separates a senior answer from a shallow one: name the decoupling first, then let the architecture fall out of it.
+
+## The taxonomy nobody finishes learning
+
+Before designing anything, you have to know what a flag *is*, and the honest answer is that "feature flag" names four different things with different lifespans and different failure modes. Pete Hodgson's taxonomy, written up on Martin Fowler's site, is the one to internalize, and the trick is that it has two axes, not one. People remember one axis and miss the other.
+
+The first axis is **longevity**: how long the flag lives. The second is **dynamism**: how often its answer changes. Cross them and four categories fall into the corners.
+
+- **Release toggles** are transient and static. They guard half-built code during a rollout, live for days to a couple of weeks, and return the same answer for an entire deploy. These are the ones you create constantly and are supposed to delete.
+- **Ops toggles, the kill switches**, are short-to-permanent and dynamic. A kill switch for a flaky recommendation service has to flip *immediately*, without a redeploy, the moment that service starts smoking.
+- **Experiment toggles** are transient but highly dynamic. They live until a result reaches significance, and they decide *per user* so you can measure the difference between variants.
+- **Permissioning toggles** are long-lived and per-request by definition. They gate features by plan tier or entitlement, and they may run for years.
+
+This is not academic. The dynamism axis dictates *architecture*: a static release toggle could in principle live in source control, but anything dynamic has to live in a runtime store the platform can change without a deploy. The longevity axis dictates *governance*: transient flags accrue debt and need expiry dates, while permanent ones are legitimately forever. Conflate a kill switch with a release toggle, the single most common category error, and you will either redeploy in an outage when you needed a runtime flip, or leave a "temporary" flag in the codebase for three years.
+
+## The keystone is that a flag check never touches the network
+
+Here is the question that decides whether your platform is viable or a latency tax: when application code asks "is this flag on for this user?", what actually happens?
+
+The naive mental model is a network call. Your code calls the flag service, the service evaluates the rule, and the answer comes back. Do that and you have added a round-trip to the control plane on *every flagged decision*, which means every flag is now a dependency in your request path with its own latency, its own failure mode, and its own contribution to [the tail](/blog/latency-throughput-tail). At any real flag density this is unworkable.
+
+The actual design inverts it. A server-side SDK pulls the *entire ruleset* for its environment into memory at startup and evaluates flags locally. A flag read becomes a hash-table lookup against in-memory data, which LaunchDarkly clocks at under a millisecond, "about as fast as looking up a value in a hash table." The network is off the request path completely. The control plane's only job is to *keep that in-memory copy fresh*, pushing rule changes to the SDK in the background. Evaluation and delivery are separated: the hot path reads memory, and a cold background channel handles updates.
+
+This is the architectural keystone, not an optimization. It is the same instinct as caching the ruleset locally instead of round-tripping a service, and it is why the platform can sit in the middle of a payment path or an auth check without showing up in your p99. Get this wrong and nothing else matters, because no amount of clever rollout logic saves you once every flag is a synchronous call to someone else's uptime.
+
+It does buy you one genuinely hard problem, which the demo never surfaces: the **cold start**. Between process boot and the ruleset arriving, what does a flag evaluation return? You have three options and none is free. Block initialization until the rules land, and you have added latency to startup. Serve code defaults in the gap, and you might briefly serve the wrong value. Bootstrap the values from somewhere faster (a server render, an edge cache) and you have added a moving part. A staff engineer names this trade out loud instead of pretending the ruleset is always present.
+
+## Server and client SDKs are opposite security models
+
+The most-missed point in this entire design is that a server SDK and a browser or mobile SDK cannot work the same way, and the reason is trust, not performance.
+
+A server is trusted, so a server SDK can hold the *full ruleset* in memory, including the segment definitions: who is in the beta, the internal staff allowlist, the enterprise-customer list, the exact targeting rules. A browser or a phone is *not* trusted. Ship that same ruleset to a user's device and you have leaked it. Anyone can open dev tools and read the membership of every segment, the name of every unreleased feature, and the logic of every rule. That is a data breach wearing a feature-flag costume.
+
+So client SDKs cannot evaluate the same way. They either receive *pre-evaluated* flag values for one specific user context, computed server-side or at the edge and handed down already resolved, or they evaluate against a deliberately stripped, client-safe payload that contains no sensitive segments. The design move that marks seniority is drawing the **trust boundary first** and letting it dictate the connection model, instead of reaching for "use the SDK" as if there were one kind. This is the same boundary-drawing discipline that [the auth deep dive](/blog/auth-deep-dive) applies to tokens: decide what the untrusted edge is allowed to know before you decide how it talks to you.
+
+## Propagation is a CAP problem in a trench coat
+
+Now the genuinely hard part. You have thousands of SDK instances, each holding an in-memory copy of the rules. An operator flips a flag in the dashboard. How does that change reach every instance?
+
+This is a fan-out consistency problem, and it obeys the same physics as every other one. You cannot have a flag change that is *instant*, *globally consistent*, and *always available* at the same time. Something gives. Every real platform on earth picks **availability and eventual consistency**, which turns the design into two honest questions. First, what is the **staleness window**: how long may two SDKs disagree about a flag's value before they converge? Second, what is the **failure posture**: when an SDK cannot reach the control plane, does it serve last-known-good or fall to code defaults?
+
+The delivery mechanism is where staleness gets bought down. The first instinct is **polling**: each SDK asks "any changes?" on a timer. LaunchDarkly's own history is a clinic in why that breaks at scale, and it is worth reading because the failures cascade. Polling failed on *cost* (millions of clients hitting the origin on a timer is a standing bill), on the *thundering herd* (a million clients polling in sync can flatten your servers), and on *battery and bandwidth* for mobile. Their first fix was random **jitter** to smear the polls across time, which kept them alive but *increased* propagation latency, which then pushed them to **streaming** over Server-Sent Events, and finally to per-user personalized streams that hold each user's context in memory for the life of the connection. Every fix exposed the next constraint. That is the texture of real infrastructure work, and it is the same "each layer reveals the next bottleneck" shape you see when you push throughput in [the rate limiter](/blog/rate-limiter).
+
+Streaming gets the staleness window down to roughly two hundred milliseconds in LaunchDarkly's architecture docs, but here is the trap that separates people who have run this from people who have read about it: **streaming is faster but less resilient than polling**, and those are different axes. The proof is a public post-mortem. During an October 2026 incident, an AWS us-east-1 outage was followed by an internal config change that reverted flag delivery to a legacy path with cold caches. SDKs retried into that cold path *en masse*, the reconnect storm overwhelmed the streaming load balancer, and server-side streaming SDKs hit roughly ninety-nine percent errors globally. The polling SDKs stayed up. Slower to converge, but they survived. The committed fix tells you everything: automatic **streaming-to-polling failover**. Speed and resilience are not the same property, and a serious design treats them separately.
+
+This is also exactly the consistency tradeoff [event-driven RBAC](/blog/event-driven-rbac) works through from the permissions side: pushing a flag flip and pushing a permission revocation are the same fan-out problem, and both force you to choose between a fast path that can storm and a steady path that lags. If you have read that piece, the propagation model here should feel like the same machine wearing different paint.
+
+Two corollaries a staff engineer raises unprompted. First, **fail-static is a policy, not a default**. "On disconnect, keep serving the last ruleset from memory" is a deliberate choice, and it is the right one for most flags, though not all. A kill switch you want to default *off* when the platform is unreachable has the opposite safe failure. Per-flag failure semantics matter. Second, **the staleness window needs a tail, not an average**. "Converges in 200ms p50" is a claim begging for its p99 on a flaky mobile network during a CDN incident. The honest spec states a *bound* and the behavior past it, which is the same discipline as writing [SLOs and error budgets](/blog/slos-error-budgets) instead of quoting a happy-path number.
+
+## Percentage rollout is consistent hashing with one non-obvious rule
+
+"Roll it out to ten percent" sounds like sampling. It is not. If you flipped a coin per request, a single user would see the feature on one page load and gone the next, which is a broken experience and a ruined experiment. Percentage rollout is **deterministic hashing**, and the mechanism is precise.
+
+You take a stable key (a user id), combine it with the flag's identity, hash the result into a fixed bucket space, and compare the bucket to a threshold. Unleash uses a 32-bit MurmurHash3 normalized to 1 through 100; the user is in if their number is at or below the rollout percentage. Optimizely hashes into ten thousand buckets and maps the percentage to a contiguous range. Same inputs, same bucket, every single time. The user is stable because the hash is stable.
+
+Now the rule the naive version gets wrong. When you raise the rollout from 10% to 20%, the original 10% **must keep the feature**. You are only allowed to *add* users. Threshold-on-a-fixed-hash gives you this monotonicity for free: at 10% the users with a normalized value in [1, 10] are in; at 20% the users in [1, 20] are in; the first group is a strict subset of the second, so nobody loses what they had. A per-request coin flip, or any scheme that rehashes when the percentage changes, destroys this and reshuffles your population on every adjustment. Monotonic growth is not a nicety. It is the difference between a rollout and a flicker.
+
+There is a second knob hiding in "combine it with the flag's identity," and it is the one people omit. If every flag hashed the user id *alone*, the same users would land in the same bucket position for *every* flag. Your "random 10% beta" would be the identical 10% of people for every feature, so one unlucky cohort eats all the risk of everything you ship, and your experiments confound each other. Mixing the flag name (Unleash calls it the `groupId`, Optimizely puts the experiment id in the hash) **decorrelates** the assignments so each flag scatters its cohort independently. And because it is a knob, you can also *deliberately correlate*: set a shared group id when two flags must roll out to the same users together. The default decorrelates; the override coordinates.
+
+```
+user "u_8842", three flags, hashed independently
+
+  hash(u_8842 + "new-checkout")   -> bucket 07   IN  at 10%
+  hash(u_8842 + "dark-theme")     -> bucket 63   OUT at 10%
+  hash(u_8842 + "promo-banner")   -> bucket 28   OUT at 10%
+
+raise new-checkout 10% -> 20%: bucket 07 still in. nobody re-rolled.
+```
+
+## Experiments are where a flag platform and an experimentation platform split
+
+You can run an A/B test with the bucketing above, and for a while it works. Then someone changes the traffic allocation on a *live* experiment, from 10% to 5% to 15%, and the whole thing quietly corrupts.
+
+Here is why. Deterministic hashing keeps a user stable only *as long as the inputs do not change*. Move the bucket boundaries mid-flight and some users silently cross from one variant to another. They see the UI change under them, and worse, your analysis is now polluted by people who were counted in both arms. The fix is a **sticky-bucketing store**, sometimes called a User Profile Service: a persisted map of user id to assigned variation that overrides the hash, so once a user is in a bucket they stay there regardless of later allocation changes. This is the exact seam where a feature-flag platform and a real experimentation platform diverge. Flags need deterministic assignment; experiments need *pinned* assignment that survives reconfiguration.
+
+And once you are making ship-or-kill decisions on the numbers, you need a tripwire for when the assignment pipeline is lying to you. That tripwire is **Sample Ratio Mismatch**. You designed a 50/50 split; you observe 52/48 on a million users. A chi-squared test at p < 0.01 tells you that gap is not chance, which means *something in assignment or logging is broken*, and roughly six to ten percent of A/B tests trip it. SRM is the canary for a broken bucketing or exposure pipeline, and a senior practitioner gates every experiment on it before trusting a single result. One more distinction in the same vein: **assignment is not exposure**. A user being *eligible* for the treatment is not the same as having *seen* it, and if you log the former as the latter your denominator is wrong and your effect sizes wash out. Log exposure at the moment the user is actually shown the variant.
+
+## Flag debt is the dominant long-term failure mode
+
+Everything so far is about making flags work. This section is about the fact that flags rot, and that rot, not any propagation bug, is what actually kills flag platforms over years.
+
+Hodgson's framing is exact: treat flags "as inventory which comes with a carrying cost and seek to keep that inventory as low as possible." Every live release flag is not free. It doubles the number of code paths your tests must cover, because both branches are reachable. It leaves a dead `else` that no one dares delete because no one remembers what it guarded. Multiply that by a few hundred stale flags and your codebase is a maze of conditionals describing rollouts that finished two years ago.
+
+The mature practice has four parts, and they are unglamorous on purpose. Every flag gets an **owner**. Every transient flag gets a real **expiry date**. CI **fails the build** when a flag is past expiry, which turns each temporary flag into a time bomb that forces a decision instead of rotting quietly. And the deletion itself gets **automated**: Uber's Piranha walks the abstract syntax tree, finds the dead branch a fully-rolled-out flag left behind, and generates the diff that removes it, which is how they cleared roughly two thousand stale flags across their Android and iOS apps. The part that ties back to the taxonomy: this discipline applies to *release and experiment* flags, which are meant to die. Ops and permissioning flags are legitimately permanent, and an expiry alarm on a kill switch is just noise. Knowing which flags are inventory and which are infrastructure is the whole skill.
+
+## Observability is "why this value," not "what value"
+
+When a flag "is not working," the unhelpful version of observability tells you the value it served. The useful version tells you *why*. Did a targeting rule match? Did the user fall in the percentage bucket? Or did the SDK never initialize, so everything fell through to the code default? Those are three completely different bugs that produce the same wrong value, and without the reason you cannot tell them apart.
+
+This is what OpenFeature, the CNCF's vendor-neutral flag standard, gets right with its `EvaluationDetails` contract: every evaluation returns the value, the variant, a **reason**, and an error code. Its Hooks mechanism is the one clean seam to emit that for *every* evaluation without instrumenting each call site by hand, and the OpenTelemetry semantic conventions standardized `feature_flag.result.reason` for exactly this. If you are choosing how the SDK talks to your control plane and your telemetry, this is the same kind of interface decision as picking between [REST, gRPC, and GraphQL](/blog/api-design-styles): the contract you expose determines what you can debug later, and "value plus reason" is the contract that keeps a 2 a.m. flag mystery from being unsolvable.
+
+## How to choose
+
+The decisions stack in a sensible order, and most of them are about choosing the failure you can live with.
+
+| Concern | Default move | Why |
+| --- | --- | --- |
+| Where evaluation runs | In-memory local eval against a cached ruleset | The network must be off the request path; a flag read is a hash-table lookup |
+| Server vs client SDK | Draw the trust boundary first | A client must never receive the full ruleset; segment membership is sensitive |
+| Getting changes to SDKs | Stream for speed, keep polling as failover | Streaming converges fast but storms on reconnect; polling is slower and survives |
+| Disconnect behavior | Fail static to last-known-good, per-flag | Most flags want last value; a kill switch may want to default off |
+| Percentage rollout | Threshold on `hash(userId + flagName)` | Deterministic, monotonic, decorrelated; coin flips flicker and reshuffle |
+| Live experiments | Sticky-bucketing store + SRM gate | Allocation changes re-bucket users; SRM catches a broken assignment pipeline |
+| Flag lifecycle | Owner, expiry, CI time bomb, automated deletion | Flags are inventory with a carrying cost; debt is the long-term killer |
+| Debuggability | Emit an evaluation reason on every read | "Why this value" separates a rule match from an uninitialized default |
+
+None of these is exotic. What separates a platform that survives production from one that demos well is whether the unglamorous choices are present and deliberate: the local cache, the fail-static posture, the monotonic hash, the expiry that fails the build. They are the parts no demo exercises and every incident does. The same instinct shows up when you size one of these for real in [capacity estimation](/blog/capacity-estimation): the interesting number is never the happy-path average, it is the cost of the tail and the failure.
+
+If you want to see the propagation half of this play out under harder real-time constraints, the WebSocket hub in [NomadCrew](/case-study/nomadcrew) fans chat, presence, and live-location updates to connected clients with the same eventual-consistency tradeoffs a flag stream lives with, and the design notes in [Aladeen](/case-study/aladeen) and [IntelliFill](/case-study/intellifill) wrestle with the same "ship the binary, gate the behavior" discipline from the product side. The flag platform is just the most distilled version of a pattern that is everywhere once you see it.
+
+## The honest landing
+
+You do not get to make deploy and release the same event. They were never the same event; fusing them was a habit, and the habit is what made shipping scary. A flag platform's entire job is to keep them apart and make the second one a data change you control.
+
+Put the evaluation in memory so a flag is a lookup, not a network call. Draw the trust boundary before you pick a client model, because a leaked ruleset is a breach. Choose eventual consistency and *say* your staleness window, fail static on purpose, and keep a slow path that survives when the fast one storms. Make percentage rollout a monotonic hash so users never flicker, decorrelate flags so one cohort does not eat every risk, and pin experiment buckets so a live tweak does not poison the result. Then treat every transient flag as inventory with an expiry, because the platform that ships you a clean release on Friday is the same one that buries you in dead branches by next year if you let it. Decouple the two events, design for the moment the control plane is unreachable, and the scariest part of shipping becomes the most boring part of your week.
+
+## FAQ
+
+<FAQ />

@@ -1,0 +1,189 @@
+export const meta = {
+  slug: 'distributed-locks',
+  title: 'Distributed Locks: Why They Are Harder Than They Look',
+  description:
+    "A lock with a timeout is a lease, and leases break silently. Why SET NX PX is unsafe for correctness, what Redlock cannot fix, and where safety really lives.",
+  headline: 'Distributed Locks: Why They Are Harder Than They Look',
+  deck: 'The timeout that saves you from deadlock is the exact thing that lets two clients hold the lock at once.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['distributed-systems', 'distributed-locks', 'redis', 'redlock', 'concurrency', 'system-design'],
+  faq: [
+    {
+      q: 'Is SET NX PX a safe distributed lock?',
+      a: "It is a safe way to acquire mutual exclusion when nothing goes wrong, but the PX timeout makes it a lease, not a lock. The timeout exists to break deadlock if the holder dies, and that same timeout lets the lock expire while a slow-but-alive holder still believes it owns it. A garbage-collection pause, a paused VM, or a 90-second network delay can all strand a holder past expiry. For an efficiency lock that is fine. For a correctness lock it is not safe on its own.",
+    },
+    {
+      q: 'Does Redlock make distributed locking safe?',
+      a: "Redlock improves the availability of the lock when a Redis node fails, because it needs a majority of five independent nodes rather than one. It does not close the process-pause and clock-jump safety hole, and it does not produce a strictly monotonic number a resource can use to reject stale writes. Martin Kleppmann argues it is neither cheap enough for efficiency locks nor safe enough for correctness locks. For efficiency, a single Redis node is simpler.",
+    },
+    {
+      q: 'What is a fencing token and why does it matter?',
+      a: "A fencing token is a strictly increasing number the lock service hands out on each successful acquisition. The client attaches it to every write, and the protected resource remembers the highest token it has seen and rejects any write carrying a lower one. The key consequence is architectural: the resource has to participate. A lock sitting off to the side can never be safe, because a stranded process can always wake up and write. Fencing makes the resource safe, not the lock.",
+    },
+    {
+      q: 'Should I just increase the lock timeout to be safe?',
+      a: "No. A longer timeout shrinks the window where a paused holder overruns its lease, but it never closes it, and it makes liveness worse: a holder that actually died now blocks every other client for longer. You are trading a safety risk you cannot eliminate for a liveness cost that grows. The race is structural, not a tuning parameter. The real fixes are fencing at the resource or removing the need for the lock through idempotency.",
+    },
+    {
+      q: 'When do I actually need a distributed lock instead of idempotency?',
+      a: "Idempotency handles duplicates of the same operation: process the same event twice, reach the same end state. It does not resolve two different concurrent writers racing to change the same thing in incompatible ways. That genuine mutual-exclusion case is where coordination earns its keep, and even there you fence at the resource. A large share of requests that sound like locks are really idempotency in disguise, so check which one you have before reaching for a coordination service.",
+    },
+  ],
+}
+
+The first distributed lock you write looks correct, passes review, and ships. It runs `SET NX PX`, does the work, deletes the key, and returns. In every test it holds: one client takes the lock, the critical section runs once, the key is released. Then one night a holder freezes for a few seconds longer than its timeout, a second client takes the lock it still thinks it owns, and both of them write to the same row. Nothing in the code was wrong. The assumption underneath it was: that a lock with a timeout behaves like a lock.
+
+It does not. A lock with a timeout is a lease, and a lease can be violated without anyone noticing. This piece is about why the obvious lock is unsafe for the cases that matter, what the famous Redlock argument actually settled, and where the safety boundary really lives once you look closely. If you have read [the idempotency piece](/blog/idempotency-exactly-once), you already know the punchline in a different key: most of the time the lock was never the thing keeping you safe.
+
+## The lock that is secretly a lease
+
+Start with the primitive everyone reaches for, straight from the Redis docs:
+
+```
+SET resource_name <unique_random_value> NX PX 30000
+```
+
+`NX` sets the key only if it does not already exist, so exactly one client wins the race to create it. `PX 30000` makes it expire on its own after thirty seconds. The random value is the holder's signature, and you need it for release, because the only safe way to let go is to delete the key *if it still holds your value*:
+
+```lua
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+```
+
+Never release with a bare `DEL`. If your lease quietly expired and someone else acquired the lock, a bare `DEL` deletes *their* lock, and now two clients run the critical section while you congratulate yourself on a clean shutdown. Compare-and-delete on your own signature is not a nicety. It is the difference between releasing your lock and stealing someone else's. (Redis 8.4 collapses the script into a single `DELEX key IFEQ <value>`, but the reasoning is identical.)
+
+Now look hard at that `PX 30000`. Why is the expiry there at all? Because without it, a client that crashes mid-critical-section holds the lock forever and deadlocks everyone behind it. The timeout is a liveness hack: it guarantees the lock eventually frees even if the holder dies without releasing.
+
+Here is the trap. The same timeout that frees the lock when a holder *dies* also frees it when a holder is merely *slow*, and the lock manager cannot tell the two apart. It sees a thirty-second-old key, the key expires, and the lock goes to the next client. The original holder, frozen but very much alive, has no idea its lease lapsed. The moment it thaws, it resumes exactly where it left off, mid-write, with a lock it no longer owns. Gray and Cheriton named this construct a *lease* back in 1989: a lock granted for a bounded time precisely so a dead holder cannot block forever. Calling it a lock hides the property that bites you. It is a lease, and a lease can expire under a holder who is still working.
+
+## Springing the trap
+
+The canonical failure is worth walking through slowly, because once you see it you cannot unsee it. Two clients, one shared resource, a thirty-second lease.
+
+```
+Client 1 ── acquire lock (token=33) ──► [holds lease, TTL=30s]
+Client 1 ── STOP-THE-WORLD GC PAUSE (45s) ─────────────────────────►
+                          (lease expires at 30s while C1 is frozen)
+Client 2 ──────────────── acquire lock (token=34) ──► writes "X"  ok
+Client 1 ── resumes, still believes it holds the lock ── writes "Y"  CORRUPTION
+```
+
+Client 1 grabs the lock and starts working. Partway through, its runtime triggers a stop-the-world garbage-collection pause that freezes every application thread for forty-five seconds. The lease expires at thirty. Client 2, seeing a free lock, acquires it cleanly and writes. Then Client 1 thaws, with no signal that any time has passed, and finishes its write on top of Client 2's. Two clients held the lock at once and the data is now wrong.
+
+The reflex is to call the GC pause exotic. It is not. Kleppmann documents stop-the-world pauses lasting *several minutes* in production HBase. And the pause is only one entry on a list of entirely normal events that all produce the same outcome:
+
+- **Process pauses.** GC is the obvious one, but a `SIGSTOP` from an operator, a VM freezing during live migration, or a slow synchronous disk flush stalls the process just as effectively. The pause can land at *any* instruction, including the single worst one: the line right before your write.
+- **Network delays.** Kleppmann cites a real incident where packets were delayed roughly ninety seconds. Your acquire confirmation arrives long after the lease it referred to has expired.
+- **Clock jumps.** Redis expiry leans on `gettimeofday`, a wall clock subject to discontinuous jumps when NTP steps it, an admin corrects it, or a leap second lands. The lease's safety is anchored to a clock that can move sideways underneath it.
+
+None of these is a bug you can fix. They are the ambient conditions of running software on real machines. The lease does not malfunction in any of them. It does exactly what you told it to: it expires after the timeout, whether or not the holder is done.
+
+## The distinction the whole topic turns on
+
+Before reaching for a heavier lock, ask the question that actually sorts the design: **what happens if the lock fails and two clients run the critical section at once?**
+
+Kleppmann splits locks into two kinds by that answer, and it is the most useful cut in the entire subject:
+
+- An **efficiency lock** exists to avoid redundant work. If it fails, you do something twice that only needed doing once. A user gets the same email twice. A cache gets recomputed by two workers. Mildly wasteful, nobody is harmed. For this, a single Redis node with `SET NX PX` is genuinely fine. You do not need anything fancier, and reaching for it is over-engineering.
+- A **correctness lock** exists because a double execution causes real damage: data loss, permanent inconsistency, a double charge, the wrong dose of a drug administered to a patient. Here a violated lease is an incident, and the obvious lock does not give you the guarantee you are implicitly relying on.
+
+This is why "just make the timeout bigger" is the wrong instinct for correctness. Put numbers on it. Say the lease is ten seconds, and a heap-pressured service pauses longer than that on one in ten thousand lock-protected operations. At ten thousand lock operations per second, you violate mutual exclusion about once per second. For an efficiency lock, shrug. For a billing write, you are paging someone. Doubling the TTL cuts the violation rate but never to zero, and now a holder that genuinely crashed blocks everyone for twenty seconds instead of ten. You are trading a safety risk you cannot eliminate against a liveness cost that grows with every second you add. The race is structural. No timeout value makes it disappear. [The system design interview framework](/blog/system-design-interview-framework) is built around exactly this move: name the failure, name the workload, name what you are trading.
+
+## Redlock, and the argument that clarified everything
+
+The obvious next move, once a single Redis node feels too fragile, is more nodes. That is Redlock, the algorithm antirez (the author of Redis) designed:
+
+```
+       ┌──────────────► Redis 1  ──┐
+       │                Redis 2  ──┤
+Client ┼──────────────► Redis 3  ──┼──► need majority (3 of 5)
+       │                Redis 4  ──┤    AND elapsed < TTL
+       └──────────────► Redis 5  ──┘
+              validity = TTL − elapsed − clock-drift margin
+```
+
+Five independent Redis masters, no replication between them. The client sends `SET NX PX` to all five in parallel, each with a tiny per-node timeout of a few milliseconds against a lock TTL on the order of ten seconds. It holds the lock only if it got a majority, at least three of five, *and* the total acquire time is still under the TTL. The effective validity is the TTL minus the acquire time minus a margin for clock drift. On failure it unlocks all five, even the ones it thinks already failed. A crashed node stays down longer than the maximum TTL before rejoining, so its forgotten locks have all expired before it can hand the same key to someone new.
+
+It is a genuinely clever protocol, and in 2016 it produced the most instructive argument in distributed-systems blogging. Steelman both sides, because the resolution is the lesson.
+
+**Kleppmann's charge.** Redlock buys you availability of the lock under node failure, and nothing about safety. The GC-pause timeline above does not care how many Redis nodes you have, because the failure is on the *client* side, after the lock was granted. Worse, Redlock "does not produce any number that is guaranteed to increase every time a client acquires a lock." Its token is a random value, and a random value has no order, so a resource has no way to look at two of them and reject the older. His verdict: Redlock is "neither fish nor fowl," too heavyweight to justify for an efficiency lock, not safe enough to trust for a correctness lock.
+
+**antirez's rebuttal, which is not weak.** Three real points. First, you can make that random token do fencing work through check-and-set: before doing the work, write the resource's state keyed to your token, and commit your change only if the token is still unchanged at write time; if a competitor overwrote it, your transaction aborts. Second, and this is sharp, the order in which locks are *granted* does not necessarily match the order clients actually *reach* the resource, so a strictly increasing token is not the clean guarantee it appears to be. Third, Redlock re-checks the clock after acquisition, which he argues makes it immune to unbounded message delays between client and server. He also conceded ground: he agreed Redis should move to a monotonic clock API and thanked Kleppmann for the analysis he had originally asked for.
+
+Now the resolution, which is more useful than either position alone. antirez is right that the GC-pause hole is not unique to Redlock. A client can be paused after the server grants the lock but before it even hears "OK," with the lease already expired, under *any* lock implementation. That is the point. Fencing does not make the *lock* correct. It makes the *resource* correct. The lock can still be violated; fencing ensures the violation is harmless because the stale write gets rejected. Both of them, read carefully, are circling the same conclusion from opposite ends: the safety boundary is not the lock.
+
+## What fencing actually is, and why it changes the architecture
+
+A fencing token is a strictly monotonically increasing number the lock service hands out on every successful acquisition. The client attaches it to every write. The protected resource **remembers the highest token it has ever seen and rejects any write carrying a lower one.**
+
+Replay the corruption timeline with fencing turned on:
+
+```
+Client 1 ── acquire (token=33) ── GC PAUSE ──────────────────► writes "Y" with token=33
+Client 2 ── acquire (token=34) ──► writes "X" with token=34
+Resource:  has seen max_token=34  ──►  REJECTS token=33   (safe)
+```
+
+Client 1 still wakes up stranded and still tries its stale write. But the resource has already accepted token 34, so a write tagged 33 is from the past by definition, and it bounces. The mutual-exclusion violation still *happened* at the lock layer. It just stopped mattering.
+
+Sit with the consequence, because it is the whole game. **The resource has to participate.** A lock that lives off to the side, in Redis or anywhere else, can never be sufficient on its own, because a stranded process can always wake up and write, and a lock has no way to reach into the resource and stop it. Only the resource, at the moment of the write, can compare tokens and refuse the stale one. This is why a random UUID is not a fencing token even though it works fine for safe *release*: release only checks equality with your own value, but fencing needs *order*, and random values have none. You cannot ask "is 9f2a older than c7b1." Monotonicity is the entire requirement.
+
+The good news is that real coordination systems hand you a fencing token for free if you use the right field:
+
+- **ZooKeeper** gives each lock an ephemeral sequential znode whose monotonic sequence number is your token. The correct lock recipe also has each waiter watch only its immediate predecessor, which sidesteps the herd effect where every waiter wakes on every release. Do not hand-roll this; Curator's `InterProcessMutex` is the battle-tested implementation, and it is reentrant and fair on top.
+- **etcd** gives you the key's `mod_revision`, checked inside a transaction.
+- **A plain database** gives you `UPDATE ... WHERE version = :token`. That is optimistic concurrency, and it *is* fencing, expressed in SQL you already know.
+
+## Even consensus-backed locks need it
+
+You might think the whole problem is that Redis is the wrong tool, and a "serious" consensus system like etcd, built on Raft, would simply be safe. The evidence says otherwise, and it is empirical rather than rhetorical.
+
+Kyle Kingsbury's Jepsen testing found etcd's registers non-linearizable and its locks unsafe back in 2014, on a Raft system people already trusted. The modern etcd analysis lands the nuance with surgical precision: an etcd lock "only guarantees mutual exclusion within etcd's own keyspace," and against an *external* resource it is weaker, with a dependency on timing, unless you carry the revision through as a fence. Read that twice. An independent verifier, testing a consensus-backed lock, arrives at exactly Kleppmann's conclusion. The instant the protected resource lives *outside* the lock service, the lock alone cannot keep you safe.
+
+This generalizes the Redis argument into a law that does not mention Redis at all: a distributed lock is only as safe as the resource's willingness to reject stale writers. Switching from Redis to etcd does not change that. It gives you a better-quality token to fence with, if and only if you actually fence. [Consensus and Raft](/blog/consensus-raft) matters here: Raft buys you a linearizable *keyspace*, which is real and hard-won, but linearizable agreement inside the coordinator is not the same as serialized writes against a database three network hops away.
+
+## The fault line a staff engineer names
+
+There is a deeper reason the obvious lock inverts safety, and naming it is the highest-signal thing you can say about this topic.
+
+A well-designed consensus lock keeps its *safety* property under *zero* timing assumptions. No bound on clock skew, no bound on pause length, no bound on network delay. Timing only affects *liveness*: if the network is slow, the lock might take longer to grant, but it will never let two clients hold it. Redlock inverts this. Its *safety* depends on timing, on the clock-drift margin being accurate, on pauses staying bounded, on delays staying bounded. That inversion is the whole disagreement compressed into one sentence: good distributed algorithms let timing endanger liveness but never safety, and a lease lets timing endanger safety.
+
+Underneath that sits FLP impossibility. Any lock that auto-releases on a timeout is, every time it expires, implicitly deciding "is the holder dead or just slow?" That is a consensus question, and FLP says no asynchronous consensus algorithm can guarantee termination if even one process can crash. So the TTL is not a tunable you can perfect. It is the visible scar of an impossibility result. You are forced to guess "dead," because waiting forever for certainty is the deadlock the timeout was added to avoid. No timeout is both always-safe and always-live, because the thing you are deciding cannot be decided in bounded time. [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) live in the same neighborhood: under a partition you must choose, and a lock's TTL is that choice, made silently, in favor of liveness over safety.
+
+There is an honest dilemma hiding in all this, raised on the original Hacker News thread and worth saying plainly. If the resource can reject stale tokens with a conditional write, then the resource can already serialize its writers by itself. So why is the external lock load-bearing at all? The mature answer is that the two do orthogonal jobs. The fence provides *safety*: stale writes get rejected, full stop. The lock provides *liveness and throughput*: it stops every client from retry-storming the resource and losing the same conditional-write race over and over. They are not redundant. They are different concerns that the naive design conflates into one component and then over-trusts.
+
+## The senior reframe: most locks are idempotency in disguise
+
+Here is the move that separates a senior answer from a competent one. The fix that buys the most is usually not a safer lock. It is removing the need for mutual exclusion entirely.
+
+Go back to the corruption timeline one final time. Why was the double write a problem? Because the two writes conflicted. But suppose the operation were idempotent, so running it twice produced the same end state as running it once. Then Client 1's stale write, landing after Client 2's, would be a no-op or a harmless rewrite of an identical value, and the expired lease would be a non-event. You would not need fencing or exclusivity. You would only need the write to be *safe to repeat*.
+
+A surprising share of "we need a distributed lock" requests are really "we need this operation to be safe under retries," which is an idempotency requirement wearing a lock's clothes. The toolkit is the one from the [idempotency piece](/blog/idempotency-exactly-once): an idempotency key stored *transactionally* with the business write so the claim and the work commit together, a conditional or compare-and-set write so a stale writer loses cleanly, a transactional outbox so an external effect happens effectively once. None of these needs a coordination service. All of them push safety into the resource, which is exactly where this whole argument has been pointing.
+
+But hold one line of precision, because blurring it is the shallow tell that undoes the entire reframe. Idempotency defeats *duplicates of the same operation*. It does **not**, by itself, resolve two *different* concurrent writers trying to change the same thing in incompatible ways. "Charge invoice 1234 once" is idempotent and needs no lock. "Two services racing to assign the last seat on a flight" is genuine mutual exclusion, and there you do need coordination, and even there you fence at the resource. Conflating "process this event twice safely" with "two writers want incompatible outcomes" is how people talk themselves into believing idempotency replaces all locks. It replaces the large, boring majority of them. The genuine ones remain, and they deserve a real coordination service plus a fence.
+
+That same distinction is why the exactly-once dream stays a dream. Exactly-once *delivery* is impossible across an asynchronous network, the same way two clients holding a lock is possible across one. What you can build is at-least-once delivery plus idempotent processing, which adds up to *effectively once*. A lock is the wrong tool for that, for the identical reason a lease is the wrong tool for correctness: both make a timing-dependent mechanism carry a guarantee that has to live somewhere timing cannot touch it.
+
+## The decision, made out loud
+
+Walk the same path a senior engineer walks, in order:
+
+| Question | If yes | If no |
+| --- | --- | --- |
+| Is a double execution harmless? | Single-node lock, or skip the lock and just make the op idempotent | Keep going, you have a correctness problem |
+| Can you make the operation idempotent? | Do that; the expired-lease race becomes a non-event | Keep going, you need real mutual exclusion |
+| Can the resource enforce conditional or fenced writes? | Fence at the resource; the lock is now a throughput optimization, not the safety boundary | You have a deeper design problem to solve before any lock helps |
+| Do you genuinely need coordination for throughput? | ZooKeeper or etcd via Curator's `InterProcessMutex`, fencing with the sequence or revision; never hand-roll | A single Redis efficiency lock is plenty |
+
+The litmus test for whether you have understood this topic is one sentence: **the lock is not the safety boundary, the resource is.** If your design stops at "use five Redis nodes," it has missed the entire point, no matter how correct the quorum math looks. Five nodes give the *lock* better availability. They give the *resource* nothing. Safety lives at the bottom of the stack, in the thing that actually performs the write, and a lock sitting above it can prevent contention but can never prevent corruption.
+
+So the obvious lock was never lying to you. `SET NX PX` does exactly what it says: it grants a lease that expires on schedule whether or not the holder is finished. The mistake was reading "lease" as "lock" and trusting it with correctness it was never built to provide. Name the kind of lock you actually have. For efficiency, take the cheap one and move on. For correctness, make the work idempotent if you possibly can, and where you truly need mutual exclusion, fence at the resource and demote the lock to what it has always really been: a way to keep clients from stampeding, not a wall between your data and the duplicate that arrives at the worst possible instruction.
+
+## FAQ
+
+<FAQ />

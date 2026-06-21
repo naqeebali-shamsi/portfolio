@@ -1,0 +1,130 @@
+export const meta = {
+  slug: 'capacity-estimation',
+  title: 'Capacity Estimation on a Napkin (Without Fooling Yourself)',
+  description:
+    'Back-of-the-envelope estimation is a decision filter, not arithmetic. Its only product is an order of magnitude, and its only value is the moment a number flips an architecture choice.',
+  headline: 'Capacity Estimation on a Napkin (Without Fooling Yourself)',
+  deck: 'The estimate that cannot change your decision should never be computed. Everything else is theater with extra significant figures.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '13 min',
+  tags: ['system-design', 'capacity-planning', 'estimation', 'distributed-systems', 'scalability', 'interviews'],
+  faq: [
+    {
+      q: 'What is back-of-the-envelope estimation actually for?',
+      a: 'It is a decision filter, not a capacity-planning spreadsheet. Jeff Dean introduced it as the skill of estimating a design\'s performance without building it, so you can compare two designs and kill the worse one for free. The deliverable is an order of magnitude, not a precise number. If the result cannot change which architecture you pick, the estimate is theater and you should skip it.',
+    },
+    {
+      q: 'Should I memorize the latency numbers?',
+      a: 'Memorize the ratios, not the digits. The absolute values decay exponentially: SSD and network figures from the 2012 latency tables are already wrong, and even Jeff Dean and Peter Norvig rounded the same operations differently. What stays roughly invariant is the ladder of ratios: L1 cache is far below main memory, which is far below a datacenter round trip, which is far below a disk seek, which is far below a cross-continent round trip. The hierarchy survives hardware; the rungs do not.',
+    },
+    {
+      q: 'Why do I keep getting estimates wrong by orders of magnitude?',
+      a: 'Almost never arithmetic. The errors come from wrong unit costs and skipped multipliers: sizing on average load instead of peak, collapsing read QPS and write QPS into one number, counting raw payload bytes while ignoring replication and indexes and overhead, and plugging in a memorized latency without knowing if it still reflects current hardware. Dean said it plainly: if you do not understand the implementation, you cannot do a decent estimate.',
+    },
+    {
+      q: 'How do I know when to stop estimating?',
+      a: 'Flex your shakiest assumption by ten times and ask whether the decision changes. If 8 TB versus 40 TB both clearly exceed a single node, the exact figure is irrelevant and you stop. If the answer crosses a threshold (single-node to sharded, sync to async, one region to multi-region), you have found the variable worth measuring for real. Sensitivity analysis is the discipline that keeps you from fooling yourself with false precision.',
+    },
+    {
+      q: 'Is estimation a substitute for measuring?',
+      a: 'No. Dean\'s very next slide after the numbers was "Write Microbenchmarks." The napkin builds intuition and narrows the search; a ten-line benchmark validates a unit cost when the cost is load-bearing and cheap to check. You estimate to decide what to measure, not to avoid measuring. Two independent estimates landing in the same order of magnitude is your free verification.',
+    },
+  ],
+}
+
+There is a slide Jeff Dean has shown for the better part of two decades, and the most important line on it is not a number. It reads: "Important skill: ability to estimate performance of a system design without actually having to build it."
+
+The table of latency numbers underneath that line is the part everyone screenshots. It is the part nobody needed to memorize. The skill is the sentence above it, and the numbers are just the vocabulary you spend to write the sentence.
+
+Most people get this exactly backwards. They memorize "L1 cache reference is 0.5 nanoseconds" and "main memory is 100 nanoseconds," recite them in an interview like a party trick, and never once use them to make a decision. That is the theater this piece is trying to talk you out of. Capacity estimation done honestly has one job, and it is not producing a number. It is producing a decision, and refusing to produce one when the number cannot change anything. This is the napkin work that supports [the system design interview framework](/blog/system-design-interview-framework): the moment in a design conversation where you stop describing boxes and start proving, on the back of an envelope, which box you actually need.
+
+## The estimate's only job is to kill a design cheaply
+
+Look at what Dean actually does with the numbers, because it tells you what they are for.
+
+He poses a question: how long to generate an image results page of thirty thumbnails? Then he prices two designs.
+
+Design 1 reads the images serially and thumbnails 256K originals on the fly. Thirty disk seeks at ten milliseconds each, plus thirty reads of 256K at thirty megabytes per second, comes to about 560 milliseconds. Design 2 issues the reads in parallel: one seek, one read, about 18 milliseconds. Dean immediately annotates his own answer: "ignores variance, so really more like 30 to 60 milliseconds, probably."
+
+That is the whole exercise. The napkin did not tell him the page renders in exactly 18 milliseconds. It told him serial is roughly thirty times worse than parallel, and that the parallel version needs padding for variance. The decision is made: go parallel, budget for the slow shard. Zero lines of code written. No prototype. No load test. The estimate's entire value was flipping one architecture choice before anyone paid to build the wrong one.
+
+This is the reframe that makes estimation worth doing. It is not a forecast. It is a filter you run over candidate designs to eliminate the ones that cannot possibly work, so you spend your real engineering budget on the survivors. Educative's Fahim ul Haq frames it the same way: estimation lets you evaluate alternative designs without prototyping each one. The number is disposable. The comparison is the product.
+
+And the corollary is the load-bearing idea in the title. If two designs are on the same side of every threshold, there is no comparison to make, and computing the number to two significant figures is just decoration. The honest skill is knowing when the napkin has a decision to flip and when it does not.
+
+## Order of magnitude is the deliverable. The digits are noise.
+
+Dean's other worked example is sorting a gigabyte. He runs it two ways.
+
+The branch cost: sorting 2^28 four-byte numbers takes about 28 passes, roughly 2^33 comparisons, half of them mispredicting at five nanoseconds each, which lands near 21 seconds. The bandwidth cost: 28 passes over a gigabyte is 28 gigabytes moved, at four gigabytes per second of memory bandwidth, about 7 seconds. He adds them and says "about 30 seconds to sort one gigabyte on one CPU."
+
+He is not claiming 30.000 seconds. He is claiming tens of seconds. Not milliseconds, not hours. That claim is enough to decide whether you sort on one box or shard the sort across a cluster, and that is the only decision the estimate exists to inform.
+
+Carrying four significant figures through a napkin calculation is a tell. It signals that the person does not understand the error bars on their own inputs. Every unit cost in an estimate is itself approximate, every assumption is a guess, and the honest output is a power of ten with a "give or take 2x" attached. The systemdesign.one rule captures the discipline: round 83 up to 100, treat a day as 10^5 seconds even though it is 86,400, convert everything to per-second before you combine it, and label every unit. You are within sixteen percent on the day approximation, and sixteen percent never changed an architecture decision in the history of computing.
+
+The instinct to add precision is the instinct to fool yourself. Precision feels like rigor. In an order-of-magnitude estimate it is the opposite of rigor, because it hides how much you are actually guessing.
+
+## Memorize the ladder, not the rungs
+
+Here is the part that frees you from flashcards. The numbers decay. The ratios endure.
+
+Colin Scott built an interactive version of the latency table at Berkeley precisely because a colleague quoted him a figure an order of magnitude off from what he had memorized. His tool sweeps the numbers from 1990 to 2020 and shows you the embarrassing truth: almost every absolute value has moved, some by orders of magnitude. SSD latency, network throughput, and CPU cycle time fell off a cliff over thirty years. The "2012" numbers most engineers carry are vintage. The popular jboner gist that everyone cites already quietly revised Dean's own slide: mutex lock dropped from 100 nanoseconds to 25, the network line item changed from sending 2K bytes to 1K, and a whole SSD tier got bolted on that Dean's older slide predates. Even Dean and Norvig, the two source authors, disagree: Norvig lists a disk seek at 8 milliseconds, Dean rounds it to 10. There was never one canonical set of digits.
+
+What does not move is the shape of the ladder. From fastest to slowest, the order has been stable for the entire history of the field: L1 cache, then main memory roughly two hundred times slower, then a datacenter round trip, then a disk seek, then a cross-continent round trip about three hundred times slower than the datacenter hop. Those ratios are the durable knowledge. If you internalize "memory is hundreds of times slower than cache, and crossing an ocean is hundreds of times slower than crossing a datacenter," you can reconstruct any specific number well enough for a napkin, and you will never be wrong by the order of magnitude that actually matters.
+
+There is one trend that does more than survive: it bends architecture. CPU clock speed plateaued around three gigahertz circa 2005, while memory and disk latency improved far more slowly. The gap that opened up has a name, the memory wall, and its consequence is the single most decision-relevant fact in the whole table. Compute got cheap relative to moving bytes around. Modern system design is dominated by where the byte lives and how far it travels, not by how many instructions you execute. That is why the latency ladder is more useful than the throughput numbers for reasoning about most systems: the bottleneck is almost always distance and data movement, not arithmetic.
+
+And there is a floor under the bottom rung that no amount of engineering moves. Light travels about 11.8 inches in a nanosecond. A round trip from California to the Netherlands is roughly 150 milliseconds because the distance divided by the speed of light is already tens of milliseconds, before any queuing. If a design needs sub-ten-millisecond responses across continents, the napkin has already told you the design is impossible. No cache, no protocol tweak, no kernel-bypass networking beats physics. The correct response is to move the data closer, not to optimize the hop. That is an architecture decision the estimate hands you for free, and it is the kind of decision that propagates straight into the multi-region tradeoffs in [event-driven RBAC](/blog/event-driven-rbac), where every cross-region permission check pays that speed-of-light tax.
+
+## The four multipliers juniors skip
+
+When estimates are wrong by orders of magnitude, it is almost never the arithmetic. It is wrong unit costs and missing multipliers. Four of them account for most of the damage.
+
+Peak is not average, and peak is what sizes the system. Average QPS is the number that melts under real traffic. The standard senior move is to size for peak, estimated as roughly twice the average, or as ten percent of the day's traffic concentrated in the busiest hour. A design that survives average load and collapses at peak has failed the only test the estimate was supposed to run. State your multiplier out loud, because it encodes an assumption that someone should be allowed to challenge.
+
+Reads and writes are different physics. Collapsing them into one "QPS" hides both the bottleneck and the architecture. A hundred-to-one read-to-write ratio tells you to cache hard, because the database barely sees writes and the read path is everything. A one-to-one ratio tells you the write path is your problem and no cache will save you. The ratio is the architecture signal. Ingress and egress bandwidth split the same way, and egress usually dominates, which is what makes a CDN mandatory rather than optional.
+
+Storage is not payload bytes. Raw payload is the floor, not the answer. Multiply by your replication factor, commonly three for durability. Add indexes, metadata, and protocol overhead. Add headroom. Skip these and you undercount by three to ten times, which is exactly the size of error that puts you on the wrong side of a sharding threshold.
+
+The unit cost might be stale. If you plug in a memorized latency without knowing whether it reflects current hardware, you have imported someone else's 2012 into your 2026 estimate. Know the vintage of your numbers, and state the assumption.
+
+Dean's blunt version of all of this: "If you don't know what's going on, you can't do decent back-of-the-envelope calculations." The estimate is only ever as good as your mental model of the system underneath it. Juniors are not bad at arithmetic. They are working from wrong unit costs because they do not yet understand the implementation they are pricing.
+
+## A full estimate, worked, to show the cascade
+
+Take the canonical one from Alex Xu's system design book, because it shows how a chain of rounded numbers produces a decision.
+
+Start with assumptions, stated explicitly so they can be argued with: 300 million monthly active users, half of them daily, so 150 million DAU. Two posts per user per day. Ten percent contain media. Five-year retention.
+
+Write QPS is 150 million times 2, divided by 100,000 seconds in a day, which is about 3,500 posts per second. Peak write QPS is roughly twice that, about 7,000 per second. Media per day is 150 million times 2 times ten percent times one megabyte, about 30 terabytes a day. Over five years that is 30 terabytes times 365 times 5, about 55 petabytes.
+
+Every number in that chain is rounded. None of them is defensible to two digits. And it does not matter, because the conclusion is not a number, it is a decision: 55 petabytes is not a single-machine problem and not a single-region problem. It forces an object store, sharding, and tiered cold storage. That decision is what the estimate bought. Whether the true figure is 50 or 60 petabytes changes nothing about it.
+
+Now watch the move that separates a senior estimate from a junior one: propagate one assumption through the whole stack and see what flips. This is sensitivity analysis, and it is the cascade.
+
+Say the read path is a hundred times the write path, and twenty percent of objects serve eighty percent of reads, the usual hot-set skew. Introduce a cache sized to the hot twenty percent. That cache now absorbs roughly eighty percent of read QPS. Backend read load drops by 5x. Fewer database replicas. Smaller connection pools. A different cost model, and different failure modes, because the database is no longer the hot path. One assumption, introduced at the top, rippled through six layers. A single-point estimate stops at the first number. A senior estimate watches the change cascade and reports which architectural decisions move when it does. The same skill shows up in the [idempotent webhooks](/blog/idempotent-webhooks) design, where a single "what is the retry rate" assumption cascades into dedup-table write load, index pressure, and how aggressively you can ack.
+
+## How to not fool yourself
+
+Everything above is a single discipline applied repeatedly: produce a decision, and verify it without trusting yourself.
+
+Two independent estimates that agree is your verification. Dean reaches "about 30 seconds" for the sort from two orthogonal paths, branch cost and bandwidth cost, and the agreement is the proof. When two unrelated derivations land in the same order of magnitude, trust the answer. When they diverge by 100x, you have not failed, you have found a wrong assumption, which is itself the most valuable thing a napkin can surface.
+
+Variance is the silent killer of any parallel estimate. Dean's parallel design computed at 18 milliseconds but he wrote "really more like 30 to 60." The mean of a fan-out is a lie, because the operation finishes when the slowest shard finishes, not the average one. Any scatter-gather estimate has to budget for the tail, not the mean. That is the napkin-scale shadow of tail-at-scale, and it gets its own treatment in the sibling piece on [latency, throughput, and tail](/blog/latency-throughput-tail).
+
+Sensitivity is the test that makes the whole thing honest. Pick your shakiest input, the DAU guess, the item size, the fan-out width, and flex it by ten times. If the decision survives, the estimate holds and you stop. If it flips, you have found the one variable worth measuring for real. This is the rigorous form of "without fooling yourself," and it is also the answer to "when do I stop": you stop when no plausible error in your inputs changes the architecture.
+
+And the estimate never replaces measurement. Dean's slide immediately after the numbers is "Write Microbenchmarks." The napkin's job is to build intuition and narrow the search so you know what to measure, not to excuse you from measuring. A ten-line benchmark validates the one unit cost your whole estimate hinges on, when that cost is load-bearing and cheap to check. Estimate to decide what to measure. Then measure.
+
+There is one more subtlety worth holding: the direction you round encodes your risk tolerance. Under-provisioning causes an outage; over-provisioning wastes money. Those are not symmetric. Round up where failure is catastrophic and down where waste is the only downside, and the rounding itself carries the risk model. If you want the formal version of why concurrency, not raw QPS, is often the number that actually sizes a box, Little's Law is the bridge: concurrency equals arrival rate times latency. A QPS estimate and a latency estimate multiply directly into "how many requests are in flight," which is the figure that sizes thread pools, connection limits, and memory. That is the kind of derived number that decides whether a service tier needs ten boxes or a hundred, the way the throughput math behind [NomadCrew](/case-study/nomadcrew) and [Aladeen](/case-study/aladeen) set their initial instance counts long before either had real traffic to measure.
+
+## The honest landing
+
+Capacity estimation is not arithmetic. It is a decision filter, and its only honest product is an order of magnitude. The number matters in exactly one circumstance: the moment it crosses a threshold and flips an architecture choice. Single-node to sharded. Sync to async. One region to multi-region. Cache to no-cache. Everywhere else, computing it to two digits is theater, and the precision is a costume for rigor you do not have.
+
+So memorize the ladder of ratios, not its decaying digits. Round without shame. Separate reads from writes and peak from average, because the ratios are the architecture. Multiply in replication and overhead, because raw bytes lie. Flex your worst assumption tenfold and stop the instant the decision stops moving. And keep the senior discipline that the whole title rests on: the estimate that cannot change your decision should never be computed. That is back-of-the-envelope done honestly, which is the only way it is worth doing at all.
+
+## FAQ
+
+<FAQ />

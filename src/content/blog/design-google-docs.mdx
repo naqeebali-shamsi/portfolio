@@ -1,0 +1,144 @@
+export const meta = {
+  slug: 'design-google-docs',
+  title: 'Design Google Docs: Collaborative Editing Without Losing a Keystroke',
+  description:
+    'How collaborative editors converge many typists on identical text: OT, CRDTs, the server as sequencer, and why convergence is not the same as correctness.',
+  headline: 'Design Google Docs: Collaborative Editing Without Losing a Keystroke',
+  deck: 'Two people typing at the same spot is a distributed systems problem wearing a text cursor, and the answer is never to silently drop one of them.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['system-design', 'crdts', 'operational-transformation', 'real-time', 'collaboration', 'distributed-systems'],
+  faq: [
+    {
+      q: 'What is the difference between OT and CRDTs for collaborative editing?',
+      a: 'Both make concurrent edits converge, but they pay the cost in different places. Operational transformation rewrites each incoming operation against the concurrent ones so they apply in any order and still agree, which puts the cost in transform-function complexity on the server. CRDTs give every character a globally unique, totally ordered identity so the merge is commutative by construction, which puts the cost in per-element metadata and tombstones that live in memory forever. Google Docs uses OT; Figma and Yjs use CRDT-inspired structures.',
+    },
+    {
+      q: 'Why does Google Docs not just pick a winner when two people edit the same spot?',
+      a: "Because text is not a last-writer-wins value. If two people insert a character at the same position, both characters must survive, or someone watches their keystroke vanish. Picking a winner is correct for atomic properties like font or fill color, where one value replaces another. For a character stream the job is to deterministically order both inserts so every replica agrees on the same final string, not to drop one of them.",
+    },
+    {
+      q: 'What does the central server actually do in a collaborative editor?',
+      a: 'It acts as a sequencer. It assigns a single global total order to every operation by stamping a monotonic revision or sequence number as it applies each one. That one decision collapses the hardest correctness obligation: with a global order, two operations are never transformed in different orders, so the system only needs the easy transform property (TP1) and never the notoriously hard one (TP2). It also gives you authentication, persistence, and a single authority that prevents split-brain.',
+    },
+    {
+      q: 'Why are tombstones a problem in CRDT text editors?',
+      a: "When you delete a character in a sequence CRDT, you cannot remove it, because a concurrent operation might still reference it. You flag it deleted and keep the metadata, which is a tombstone. A document edited for years accumulates tombstones for every character ever deleted, and you can only garbage-collect one once every replica has acknowledged the deletion (causal stability). Early CRDTs spent hundreds of bytes of memory per character largely because of this.",
+    },
+    {
+      q: 'How do remote cursors stay in the right place while people type?',
+      a: 'Cursor and selection positions must be transformed by the same operations as the text, or they drift off the characters they were anchored to. A remote cursor at offset 40 has to shift to 45 when someone inserts five characters before it. The fix that holds is to anchor cursors to operation positions or CRDT item IDs rather than raw integer offsets. Presence itself rides a separate, lossy, out-of-band channel and does not go through the document operation log.',
+    },
+  ],
+}
+
+Open a document, watch a colleague's cursor blink three paragraphs up, and start typing into the same sentence they are editing. Nothing stutters. Nothing you type disappears. The two streams of keystrokes braid into one string that you both see identically, over a network that is reordering and occasionally dropping your packets the whole time. That smoothness is not a UI trick. It is the surface of one of the harder problems in distributed systems, and the whole problem fits in one question: when two people insert a character at the same position at the same instant, what is the final text, and how does every replica agree on it without anyone ever asking?
+
+This is the design that separates people who have read about consensus from people who have shipped it. [The system design interview framework](/blog/system-design-interview-framework) is the scaffolding for talking through it in a room. This piece is the part that framework points at and hands off: the coordination protocol that makes collaborative editing feel keystroke-lossless.
+
+## The one thing you must never do
+
+Start with what failure looks like, because the failure is the whole motivation. The document is the string `"abc"`. User X inserts `"x"` at position 0. At the same moment, with no knowledge of X's edit, User Y inserts `"y"` at position 0. Each client echoes its own edit locally, so X sees `"xabc"` and Y sees `"yabc"`. Now the edits cross the wire and each side applies the other's literally at position 0: X lands on `"yxabc"`, Y lands on `"xyabc"`.
+
+The two documents now disagree, with no force pulling them back together. That is divergence, the thing a collaborative editor exists to prevent.
+
+Notice the trap a junior answer falls into: "just pick a winner." Pick a winner and you get `"xabc"` or `"yabc"`, which means one user watched a character they typed silently evaporate. That is the cardinal sin. Text is not a value you overwrite. Both insertions are real intent, both must survive, and the only open question is the *order* of the two surviving characters, decided the same way on every replica. Convergence here means everyone agrees the answer is `"xyabc"`, not that someone loses a keystroke to make the strings match.
+
+There are two production-grade families of answers. They look like opposites and are really the same idea paying its bill in two different currencies.
+
+## Approach A: operational transformation, and the diamond that defines it
+
+Operational transformation is the older answer, born in 1989 with Ellis and Gibbs, and it is what Google Docs, Microsoft's Office co-authoring, and Etherpad still run today. The premise is stubbornly simple: do not change the edits, change how they are *applied*. When an operation arrives that was generated concurrently with one you already applied, you transform it so its effect lands correctly in your now-different document.
+
+Walk the example through it. When X's `insert("x", 0)` reaches Y, OT does not apply it raw. It computes a transform: X inserted at a position less than or equal to Y's insert, so X's character sits to the left and Y's already-applied `"y"` shifts right. Symmetrically, Y's operation reaching X becomes `insert("y", 1)`, because X's `"x"` already occupies position 0. Both converge on `"xyabc"`. The tie, when both insert at the identical spot, is broken by a stable site-ID rule so both replicas shift the *same* direction rather than each politely yielding and diverging anyway.
+
+The iconic picture is a diamond. Start at a shared state, two operations branch off it, each side transforms the other's against its own, and the two paths rejoin at one identical state. The name for "the diamond always closes" is **transform property 1**, or TP1: for two concurrent operations on the same state, `op1` then the transform of `op2` lands where `op2` then the transform of `op1` does. That is the easy one.
+
+The hard one is TP2, which governs three or more concurrent operations and demands that the *order* in which you transform them never changes the result. TP2 is where decades of published OT functions, including the originals from Ellis and from Sun, were later proven buggy. It is famously difficult to satisfy. And here is the senior move that makes the whole thing tractable.
+
+## The server is a sequencer, and that is the entire trick
+
+A staff engineer asks one question that collapses this design: *where is your total order?* Answer it well and TP2 evaporates.
+
+Google Docs is not peer-to-peer. There is a central server, and its real job is not "store the document." Its job is to be a **sequencer**: it assigns one global total order over every operation by stamping a monotonic revision number as it applies each one. The Apache Wave whitepaper, documenting the OT protocol Google actually shipped, describes the server as maintaining "a single state space, which is the history of operations it has applied." Every client operation arrives, gets transformed against that linear history, gets applied, gets a revision number, and gets broadcast.
+
+Because the server linearizes everything into one sequence, no two operations are ever transformed in different orders. There is exactly one order: the server's. So you only ever need TP1. The brutal TP2 obligation never arises, because the deployment removed the only condition that triggers it. This is the lesson that runs through every distributed design where you can afford an authority: a single sequencer turns a consensus problem into a queue. It is the same move underneath [Kafka vs queues](/blog/kafka-vs-queues), where a partitioned, ordered log *is* a sequencer and everyone replays the global order.
+
+## How a keystroke never blocks on the network
+
+Naming the mechanism precisely is what "without losing a keystroke" actually means. Each client holds two things: the last revision number it has seen acknowledged, and a **buffer of unacknowledged local operations**. When you type, the client appends the operation to that buffer and echoes it into your document *immediately*, at zero perceived latency, without waiting for the server. The Wave protocol has clients wait for acknowledgement before sending the *next* batch, and while they wait they **compose** the queued operations, defined so that `(B∙A)(d) = B(A(d))`, then send in bulk. When a concurrent operation arrives, the client transforms it against everything still in the buffer before applying it; on acknowledgement, it pops the buffer. The typist is never blocked on a round trip. The network can be slow, can reorder, can briefly drop, and the cursor keeps moving, because the operation that matters to *you* already landed locally and reconciliation happens behind the glass.
+
+This optimistic-local-echo is the same instinct as a write-through cache serving the local value while the authoritative write settles, which I dug into in [the distributed cache](/blog/distributed-cache): show the user your best prediction of the eventually-consistent state and let the truth catch up.
+
+## Approach B: CRDTs, where the order is baked into identity
+
+The other family flips the cost. Instead of transforming operations so they apply correctly in a changed document, you give every character an identity so unbreakably ordered that the merge is commutative by construction. No transform function, no diamond to prove. This is a Conflict-free Replicated Data Type, formalized by Shapiro and colleagues in 2011, and it buys Strong Eventual Consistency: replicas that have seen the same operations reach the same state through merges that are commutative, associative, and idempotent. The data-structure half, how a sequence CRDT actually stores characters and resolves intra-structure ordering, is its own deep topic that I treat properly in the piece on [CRDTs](/blog/crdts). Here I want only the shape.
+
+In Yjs, each character is an **Item** with a globally unique `id` of `(clientID, clock)` plus the IDs it was inserted *between*. Replay the divergence example: both `"x"` and `"y"` are inserted between the same neighbors, and the integration algorithm (YATA) breaks the tie deterministically by `clientID`. Both replicas independently compute the same order, with no server round trip and no transform function in sight. The order was never negotiated. It was implied by identity.
+
+The bill comes due in two line items. First, deletion. You cannot actually remove a deleted character, because a concurrent operation might still reference it as an `origin`, so you flag it deleted and keep it: a **tombstone**. The content collapses to a length, but the metadata persists. A document edited for years carries a tombstone for every character anyone ever deleted, and the real editing traces make this visceral: a LaTeX paper in the eg-walker corpus is 779,000 events producing 307 kB of final text; the eg-walker paper itself is 2.3 million events for 119.5 kB. The keystroke history dwarfs the surviving document by ten to twenty times, and early CRDTs famously spent "hundreds of bytes of memory for each character" largely to carry it. Garbage-collecting a tombstone is only safe once *every* replica has seen the deletion, a condition called causal stability, which a central server tracks cheaply and a peer-to-peer mesh tracks with real pain.
+
+Second, the cost asymmetry that decides architectures. CRDTs merge in commutative time even after a long offline divergence, exactly where OT falls apart. Merging a real Git Makefile's editing history with OT took roughly **one hour**; the hybrid eg-walker did the equivalent about **160,000 times faster**. That is the concrete answer behind the hand-wave "OT is bad offline": OT must transform your operation against the *entire* concurrent history since the fork, and that history is enormous, while a CRDT just merges, because commutativity does not care how long you were gone.
+
+## The decision: where do you want to pay?
+
+Put the two families on one ledger and the choice stops being religious.
+
+| Cost | OT | CRDT |
+| --- | --- | --- |
+| Server CPU | High: transform every op against history | Low: server just orders and broadcasts |
+| Per-character metadata | None: positions are plain integers | High: id, origin, originRight, tombstones |
+| Offline / async merge | Catastrophic: ~1 hour on real traces | Commutative: merges regardless of gap |
+| Correctness-proof difficulty | TP1 easy, TP2 brutal (skip it with a sequencer) | Tie-break rule, but tombstone GC is subtle |
+| Peer-to-peer without a server | Effectively no (TP2 territory) | Yes, at the cost of metadata forever |
+
+Here is how a senior engineer actually decides. If you have a central server, which a hosted product almost always does, OT is a completely defensible choice: you collapse TP2 with the sequencer and you pay zero tombstone memory, which is why Google Docs still runs it three decades on. If your product is offline-first or genuinely peer-to-peer, where there is no global order to lean on, CRDTs stop being a preference and become close to a requirement, because the alternative is the one-hour merge. This is the reasoning behind Joseph Gentle's public reversal: the developer who built Google Wave's OT and then wrote ShareJS announced "I was wrong, CRDTs are the future," and the nuance everyone skips is that he scoped it to the peer-to-peer and offline world. He did not declare OT dead. The religious-war framing is the tell of someone who has not run the trace.
+
+And the field has already moved past the binary. The eg-walker work caches the final text on disk and replays an event graph *only at merge time*, landing one to two orders of magnitude below the best pure CRDT on steady-state memory while keeping OT-class merge speed. Knowing that hybrid exists is the difference between reciting two options and understanding the actual frontier.
+
+## Figma's lesson: not everything is a character stream
+
+The most useful production counterexample is Figma, because it refuses to use one merge strategy for everything, and that refusal is the insight. Figma deliberately rejected OT, with Evan Wallace writing that OTs carry "a combinatorial explosion of possible states which is very difficult to reason about" and that they "didn't need the power of OTs." They use a system "inspired by multiple separate CRDTs in combination," then make the same move Google makes: "Since Figma is centralized (our server is the central authority), we can simplify our system by removing this extra overhead." The central server lets them drop the hardest, consensus-free part of CRDT metadata. They run CRDT-shaped structures with a sequencer doing the ordering.
+
+The part worth stealing is *which conflict resolution they use where*. When two clients edit the same property of an object, the font, the fill color, Figma uses a last-writer-wins register that needs **no timestamp**, because the server defines the order of events. Server state is literally `Map<ObjectID, Map<Property, Value>>`. LWW is right here, because a fill color is an atomic value where one setting genuinely replaces another. The senior distinction the table-stakes answer misses: LWW is correct for whole-value properties and *catastrophic* for text, where it would silently drop characters. You must know, field by field, which things are LWW registers and which need sequence semantics. Getting that wrong is how you ship an editor that loses keystrokes while passing every test that edits one property at a time.
+
+Ordering children is its own subproblem, solved with **fractional indexing**: each child's position is a fraction in `(0, 1)`, and inserting between two siblings averages their positions. Children at `0.25` and `0.5`? Insert at `0.375`. No re-indexing, no array shift, no operation touching the siblings. The staff-level caveat is that repeated insertion at the *same* spot exhausts floating-point precision in roughly fifty inserts, which is why production fractional indexing uses arbitrary-precision string keys. And the parent link plus position must be one atomic property, with the server rejecting any update that would create a cycle, because a tree with a loop is no longer a tree. It rhymes with how [consistent hashing](/blog/consistent-hashing) places keys on a ring: you insert without disturbing your neighbors.
+
+## Presence is a different system, and pretending otherwise drifts your cursors
+
+Here is the architectural decision the shallow version gets exactly backwards. Cursors, selections, who-is-online, comments: these do **not** belong in the document operation log. Presence is high-frequency, ephemeral, and loss-tolerant. A cursor position thirty milliseconds stale is fine; a dropped cursor update is fine. Forcing that traffic through the same durable, ordered, exactly-once pipeline as the edits is both wasteful and wrong. Figma's answer is two separate sync systems: a **document multiplayer server**, one authoritative in-memory process per file, for the design tree; and **LiveGraph**, a Go service that rides the Postgres write-ahead log to push comments, permissions, presence, and file lists. Cursors travel the LiveGraph path. The design tree and the social layer are different problems with different consistency needs, and unifying them is a mistake that looks like elegance.
+
+But there is a subtlety the "just put cursors on a side channel" instinct misses. A cursor *position* still has to be transformed by the document operations, or it drifts. If a remote cursor sits at offset 40 and someone inserts five characters before it, that cursor must move to 45, or it ends up pointing at a different word than its owner is looking at. The fix is to anchor cursors to operation positions or CRDT item IDs rather than raw integer offsets. So routing and correctness live in different places: presence *rides* the lossy out-of-band channel, while cursor *anchoring* obeys the same transformation rules as text. Get that split right and remote cursors stay glued to the characters they belong to.
+
+This is the same architecture I built into [NomadCrew](/case-study/nomadcrew), where presence, typing indicators, and live location ride a WebSocket hub as ephemeral fan-out, deliberately kept off the durable message path. Presence is lossy by nature, and conflating it with the durable layer buys nothing but coupling.
+
+## Convergence is not correctness, and this is the part everyone skips
+
+The deepest idea in this whole design is one sentence: **two replicas can agree on a final state that is wrong.**
+
+The CCI model, from Sun and Ellis, names three obligations a collaborative editor owes: Causality preservation, Convergence, and Intention preservation. The shallow treatment stops at convergence, declares "it converges," and calls it done. But convergence only means everyone agrees on *some* answer. It says nothing about whether that answer is the one the users meant. You can converge, on every replica, byte-identically, to interleaved characters that spell garbage neither person typed.
+
+The live example is the **interleaving anomaly**. Two users concurrently paste two words, one types "hello," the other "world," and a naive ordering rule braids them character by character into "hwoerllldo." Every replica agrees on "hwoerllldo." It converged perfectly. It is also nonsense, and it preserves neither user's intention. Intention preservation is a separate, strictly harder property than convergence, and the frontier algorithms, Peritext and Fugue, exist specifically to defeat this anomaly. Walk out of a design discussion thinking "it converges" was the finish line and you have missed the property that matters most. The bar is that both edits survive *and* land where their authors meant them.
+
+This is the same shape as the lie at the heart of distributed messaging, where "exactly-once delivery" is impossible and the real goal is exactly-once *processing*, which I pull apart in [idempotency and the exactly-once lie](/blog/idempotency-exactly-once). The easy property fails to be the one you actually need.
+
+## The unglamorous half: durability and exactly one authority
+
+Two operational requirements decide whether your beautiful merge algorithm survives a Tuesday.
+
+First, **single-writer per document**. If two server instances both accept writes for one file, you get split-brain: two authorities, two divergent histories, no truth. Figma states it plainly, that all clients opening a file connect to the one instance, "otherwise we'd get split brain," and enforces it with a lock row keyed by lock-UUID and file-key. Any collaborative design needs an explicit answer to "exactly one authority per document," and that answer is a leader-election problem wearing a text editor. The tradeoff is pure [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum): per document you favor a single consistent writer over availability during a partition, because two available writers means a corrupted document.
+
+Second, **durability without losing the tail**. Replaying the entire operation history to compute current state is O(history) and, given the bloat, hopeless, so real systems checkpoint. But a checkpoint alone loses the thirty to sixty seconds of edits since the last one on a crash. Figma's fix is a transaction log where every change gets an incrementing sequence number; on recovery you load the latest checkpoint and replay journal entries with a higher sequence. They validated it by reconstructing byte-identical blobs across roughly 400,000 consecutive checks before rollout, and hold a durability target of 95% of edits persisted within 600 milliseconds. That journal tailing a checkpoint is the same checkpoint-plus-log pattern that keeps databases honest, and the 600-millisecond figure is a [latency and the tail](/blog/latency-throughput-tail) decision: you budget the percentile at which a crash turns lossy, where the average tells you nothing.
+
+One more the table-stakes answer never reaches: **undo is per-user**. A single global undo stack is wrong in a shared document, because undoing the most recent edit might undo a *collaborator's* work. Undo has to be intention-aware and scoped to the user who pressed it. A global stack breaks the instant two people share a document.
+
+## The shape of the whole answer
+
+Strip it to the load-bearing decisions. Both edits at the same spot survive, deterministically ordered, with no winner picked for text. A central server sequences every operation into one global order, collapsing the hard correctness obligation into the easy one. Each client keeps an unacknowledged-operation buffer with instant local echo, so no keystroke ever blocks on the network. Choose OT to save memory when you have a server, choose CRDTs to survive offline and peer-to-peer, and know the hybrid frontier exists. Reserve last-writer-wins for atomic properties and give character streams real sequence semantics. Route presence over a separate lossy channel while still transforming cursor anchors by document operations. Enforce exactly one authority per document, backed by a checkpoint plus a sequence-numbered journal. Above all, hold the idea the whole field circles back to: convergence is not correctness, and everyone agreeing on garbage is still garbage.
+
+The companion designs in this batch lean on the same primitives. [Design WhatsApp](/blog/design-whatsapp) is the messaging-fan-out version of the ordering problem; [Design Twitter](/blog/design-twitter-feed) and [Design Instagram](/blog/design-instagram) push the timeline-merge side; [Design YouTube](/blog/design-youtube), [Design Netflix](/blog/design-netflix), and [file storage and sync](/blog/file-storage-sync) carry the durability story into media and bytes. The thread connecting all of them is the one this piece is really about: when independent actors mutate shared state concurrently, somebody has to decide the order, and the entire art is deciding *where* that somebody lives and *what* it is allowed to forget.
+
+## FAQ
+
+<FAQ />

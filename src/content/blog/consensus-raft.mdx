@@ -1,0 +1,138 @@
+export const meta = {
+  slug: 'consensus-raft',
+  title: 'Consensus for Builders: How Raft Actually Works',
+  description:
+    'Raft keeps a cluster agreeing on one ordered log despite crashes and lost packets. How leader election, log replication, and the safety rules actually fit.',
+  headline: 'Consensus for Builders: How Raft Actually Works',
+  deck: 'Consensus sounds like a theory problem until a stale leader serves a customer the wrong balance, and then it is your problem.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['raft', 'consensus', 'distributed-systems', 'etcd', 'replication', 'system-design'],
+  faq: [
+    {
+      q: 'What problem does Raft actually solve?',
+      a: 'Raft solves the replicated state machine problem. You have N servers, each running an identical deterministic state machine, and you want them to stay in lockstep even when machines crash and the network drops, delays, and reorders packets. If every server applies the same commands in the same order, they end up in the same state. The hard part is not the state machine, it is getting the cluster to agree on one totally-ordered log of commands. Raft is a protocol for reaching that agreement. It assumes crash faults, not Byzantine ones, so it tolerates nodes that stop or lose messages, not nodes that lie.',
+    },
+    {
+      q: 'How does Raft decide what counts as committed?',
+      a: 'The leader appends a command to its log and replicates it to followers. Once a majority of the cluster has stored the entry, the leader marks it committed, which means it is durable forever and will eventually be applied on every machine. Majority overlap is the whole trick: any two majorities share at least one server, so a committed entry survives any minority failure. The subtle rule that trips up hand-rolled implementations is that a leader may only commit entries from its own current term by counting replicas. Entries left over from previous terms commit indirectly, once a current-term entry above them commits.',
+    },
+    {
+      q: 'Is reading from the Raft leader always linearizable?',
+      a: 'No, and this is the single most common production mistake. A leader can be silently deposed by a network partition and not know it yet, because its election timeout has not fired. If it serves a read from local state in that window, it can return data that a newer leader has already overwritten. Raft fixes this with ReadIndex, where the leader confirms it is still leader with one heartbeat round before serving the read, or with a lease read, which skips the round trip but assumes bounded clock drift. The lease trades a network hop for a clock-synchrony assumption, and if the clocks drift past the bound you get stale reads.',
+    },
+    {
+      q: 'Why are randomized election timeouts so important in Raft?',
+      a: 'Without randomization, followers that lose their leader all time out at roughly the same instant, all become candidates, all vote for themselves, and split the vote so nobody reaches a majority. The cluster then repeats that failed election term after term and can livelock with no leader. Randomized timeouts, canonically 150 to 300 milliseconds, make one server almost always fire first, win its election, and shut the others down before they start. They are load-bearing for liveness, not a minor optimization.',
+    },
+    {
+      q: 'How does Raft scale write throughput past a single leader?',
+      a: 'A single Raft group does not scale writes, because there is one leader and one log, so every write serializes through one machine. Production databases run many independent Raft groups per node, one per shard of the keyspace. CockroachDB runs one group per Range, TiKV runs one per Region, with split and merge as the data grows and a placement layer rebalancing leaders. The hard problems then move up a level to cross-group atomicity, usually two-phase commit layered over the groups, and to heartbeat amplification, which production systems handle by coalescing heartbeats across groups.',
+    },
+  ],
+}
+
+A distributed system is a group of computers pretending to be one computer, and consensus is the lie they tell to pull it off. Five machines, each with its own disk, its own clock, its own view of a network that drops and delays and reorders their messages, somehow have to agree on a single sequence of events as if they were one box with one truth. Raft is the protocol that makes that lie hold.
+
+Most explanations of Raft stop at "nodes elect a leader and the leader replicates a log." That is true the way "a plane stays up because of lift" is true: the shape of the answer with the load-bearing parts removed. This piece is about the parts that bear load: why elections actually terminate, why a majority storing an entry is not enough to call it committed, and why reading from the leader can hand a customer stale data when nothing has crashed. Those details separate someone who has read the paper from someone who has run this in production. Consensus is also the machinery underneath half the answers in [the system design interview framework](/blog/system-design-interview-framework): anytime you said "and the database is replicated for durability," something like Raft keeps those replicas honest.
+
+## The problem is agreeing on a log, nothing else
+
+Start with the thing Raft is actually solving, because the framing does most of the work. It is called the replicated state machine problem, and it is simpler than it sounds.
+
+You have N servers. Each one runs an identical, deterministic state machine. Feed any of them the same sequence of commands and it lands in the same state, every time, because that is what deterministic means. So if you can get all N servers to apply the *same commands in the same order*, they stay in perfect lockstep without ever comparing their actual data. The state machine could be a key-value store, a config registry, a lock service, a SQL row. It does not matter. The machine is the easy part.
+
+The hard part is the word "same." Getting N machines to agree on one totally-ordered log of commands, while crashes and a hostile network actively try to make them disagree, is the entire game. Consensus is just agreement on that log. Everything Raft does serves one ordered, append-only sequence that every surviving machine eventually holds, byte for byte.
+
+Two assumptions bound everything that follows. First, Raft handles crash faults, not Byzantine ones. A node may stop, lose messages, delay them, reorder them, or restart with amnesia about anything it did not write to disk. A node may *not* lie or send corrupt data. If your threat model includes malicious nodes, Raft is the wrong tool and you want a Byzantine-fault-tolerant protocol, which costs far more. Second, the network is asynchronous, the polite way of saying there is no bound on how late a message can be. Raft never assumes a message arrives on time. It assumes only that *if* the network is healthy for long enough, progress happens.
+
+This is also where Raft sits relative to the tradeoffs in [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum). Raft chooses consistency over availability under partition: a minority partition cannot make progress, on purpose, because the alternative is two halves of the cluster diverging. The minority going dark is the feature.
+
+## Decomposition is the actual idea
+
+The genuinely clever part is a design decision more than an algorithm. The Raft paper's thesis is that consensus is hard to understand because Paxos presents it as one monolithic thing you swallow whole. Raft chops it into three near-independent pieces you reason about one at a time: **leader election** (exactly one leader, and the cluster picks a new one when it dies), **log replication** (the leader takes client commands, appends them to its log, and forces every follower to match), and **safety** (the rules guaranteeing a committed entry is never lost or contradicted).
+
+On top of those, one decision collapses the difficulty more than any other: a *strong leader*. Log entries flow in one direction only, leader to followers, never the reverse. There is no symmetric free-for-all where any node proposes anything and you reason about all the interleavings. One writer, passive followers, the same instinct behind a single-writer primary in [replication](/blog/replication-strategies), and load-bearing for the same reason: one timeline to reason about instead of a combinatorial explosion of them. The cost is that every write funnels through one machine, so a single group's throughput is capped at what one leader can push, which is exactly why real databases run many groups. Raft trades throughput-per-group for a state space a human can hold in their head, and for a consensus protocol that was the right call, because one nobody can implement correctly is worth nothing no matter how fast it looks on paper.
+
+## Election, and the detail every shallow explainer skips
+
+First, the concept that ties the protocol together: the *term*. Raft chops time into terms, numbered monotonically, each beginning with an election and holding at most one leader (or none, if the election split). Terms are not wall-clock time, they are a logical clock that lets the cluster talk about "before" and "after" without trusting anyone's actual clock. Every RPC carries the sender's current term, and one rule runs underneath everything: **any server that sees a term higher than its own immediately steps down to follower and adopts it.** That single line is how a stale leader discovers it was deposed: it sends a heartbeat stamped term 4, a follower replies "I am on term 5 now," and the old leader instantly knows the world moved on without it. Hold onto that rule, it is what makes the stale-read problem at the end both possible and fixable.
+
+Now the election. A follower expects regular heartbeats from the leader. If it hears nothing for a stretch called the *election timeout*, it assumes the leader is dead, bumps its term, votes for itself, becomes a *candidate*, and fires `RequestVote` RPCs at everyone. Collect a majority and you are the new leader; start heartbeating, and every other server falls back in line.
+
+That is the part everyone gets right. Here is the part that actually makes elections work.
+
+Picture five servers. The leader dies. Three followers notice at almost the same instant, because they were receiving the same heartbeats and all stopped at once. All three time out together, become candidates for the same new term, and vote for themselves. Each now sits on a single vote asking the others for support, and the others already spent their vote on themselves. Nobody reaches three. The term produces no leader, so the cluster rolls to the next term and does it again. And again. This is *livelock*: busy, doing work, electing nobody, forever.
+
+The fix is almost insultingly simple and completely load-bearing: **randomize the election timeout.** Instead of every follower waiting exactly 200 milliseconds, each waits a random duration in a window, canonically 150 to 300 milliseconds. Now the odds of two firing at the same instant are tiny. The server that drew 162 milliseconds times out first, requests votes, and collects its majority while the one that drew 250 milliseconds is still asleep. By the time the slower one would have started, it is already receiving heartbeats from the new leader and resets. One election, one leader, done.
+
+Internalize this: **randomized timeouts are not a performance tweak, they are what makes leader election terminate at all.** Strip the randomization out and Raft's liveness collapses into the split-vote loop. A surprising amount of Raft's apparent simplicity is this one trick quietly doing the hardest job in the protocol.
+
+## Commitment, and the trap that eats hand-rolled implementations
+
+Now the log. A client sends a command. The leader appends it as a new entry, tagged with the current term and its index, then sends `AppendEntries` RPCs to the followers, which double as heartbeats. Each follower appends and acknowledges. Once a **majority** of the cluster has it stored, the leader declares it *committed*: durable forever, and guaranteed to eventually apply on every machine.
+
+Majority overlap is the entire reason this is safe. Any two majorities of N servers must share at least one server, because two sets each larger than half of N cannot be disjoint. So whatever majority committed an entry, and whatever majority elects the next leader, those two sets *overlap* in at least one machine, and that machine carries the committed entry forward. The arithmetic is just `quorum = floor(N/2) + 1`: a 3-node cluster tolerates 1 failure, a 5-node cluster tolerates 2, a 7-node cluster tolerates 3 at the cost of waiting on a bigger quorum for every write.
+
+That sounds clean, and it is, right up until terms get involved. Here is the trap, the single most common way a from-scratch Raft introduces silent data loss.
+
+The naive rule you would write is: "an entry is committed once it is stored on a majority." That rule is *wrong across term boundaries*, and the failure is genuinely counterintuitive. The Raft paper devotes a whole figure to it (Figure 8) because it is exactly the kind of bug that passes every test and then loses a write in production. The scenario: an entry from an earlier term gets replicated to a majority. By the naive rule you call it committed. But a different node, holding a later-term entry at that same index, can still win the next election, because the election rules permit it, and when it becomes leader it *overwrites* that supposedly-committed entry. The majority count was real. The entry still vanished.
+
+The fix is precise and you have to get it exactly right: **a leader may only mark entries from its own current term as committed by counting replicas.** Older entries are never committed directly on a replica count. They commit *indirectly*, riding along for free the moment a current-term entry sitting above them gets committed, which (by Log Matching, below) retroactively locks in everything beneath it. Miss this and you have built a system that occasionally and silently eats committed writes, the hardest bug there is to debug, which is precisely why the paper spends a figure on it.
+
+## The safety chain, and the rule that powers it
+
+Raft's five safety properties get listed like trivia. They are a causal chain. The piece that does the work is the **election restriction**: a voter refuses its vote to any candidate whose log is less up-to-date than its own, where "up-to-date" means compare the last entry's term, higher wins, and if tied the longer log wins. Now watch the chain. Majority overlap means a new leader's electing majority intersects the majority that committed any given entry. The up-to-date check forces that winner to hold a log at least as current as that overlap, so the winner *must* already hold every committed entry. That property is **Leader Completeness**, and it is why a new leader never has to copy a committed entry from a follower. Combine it with **Log Matching** (two logs that share an entry at the same index and term are identical below it) and you get **State Machine Safety**: no two servers ever apply a different command at the same index. The properties are not a list, they are a proof that walks from "majorities overlap" to "the cluster never disagrees." It is also why "whoever asks first" or "whoever gets the most votes" is an incomplete description of who wins an election: a candidate has to be *current enough*, or no quorum will have it.
+
+## Reading from the leader can lie to you
+
+Here is the failure that surprises people who think the algorithm is the whole story. You would assume reading from the leader is trivially correct: it holds every committed entry by Leader Completeness, so just read its state and return. That is wrong, and the way it is wrong has shipped as a real bug in real systems.
+
+The problem is a *stale leader*. The leader gets partitioned away from the majority. The majority notices the silence, elects a new leader, and that new leader commits `x = 2`. But the old leader's election timeout has not fired yet. From its own point of view it is still the leader, everything is fine, and it has no idea it was deposed. A client reads `x` from it and gets `x = 1`, a value a committed write has already replaced. Nothing crashed. No rule was violated inside the old leader. It just answered from a past that no longer exists. This is the same exactly-once-versus-reality gap I dug into in [idempotency and the exactly-once lie](/blog/idempotency-exactly-once): the system *believes* something that stopped being true, and belief is not truth.
+
+Raft has two answers, and choosing between them is a real engineering decision.
+
+**ReadIndex.** Before serving a read, the leader records its current commit index, then sends one heartbeat round. If a majority acknowledges, the leader has just *proven* it is still the legitimate leader right now, because a deposed leader could not collect a majority of acks. It waits until its state machine has applied up to that index, and serves the read. One round trip, no disk write. The stale leader above cannot do this: its heartbeats go unanswered, so it never confirms, so it never serves the read.
+
+**Lease read.** Skip the heartbeat entirely. If the leader holds a time-bounded *lease* strictly shorter than the election timeout, no new leader can possibly have been elected yet, because nobody else starts an election until the timeout elapses, which is longer than the lease. So within its lease the leader reads from local state with zero round trips. Faster on every read, and here is the catch: **the lease trades a network round trip for an assumption about clock drift.** The whole argument rests on "the lease is shorter than the election timeout," measured against real clocks, so if clocks drift past the bound a deposed leader thinks its lease is still valid and serves stale data. That is a correctness bug wearing a performance optimization's clothes. Systems that use lease reads stay conservative, using a monotonic raw clock and wide margin (a common config is a 9-second lease under a 10-second timeout). The decision is workload-shaped: read-heavy traffic where tail latency matters can justify the lease; anything where a stale read is a correctness incident should pay the ReadIndex round trip. The framing in [latency and the tail](/blog/latency-throughput-tail) is the lens for that call.
+
+## Changing the cluster is where you actually get hurt
+
+Servers fail and get replaced, and the cluster's membership has to change. This looks routine and is the single most dangerous operation in the protocol, because the naive version produces *two leaders*.
+
+The trap: you cannot flip every node from the old configuration to the new one atomically, because they apply the change at different moments. For a window, some nodes believe the cluster is the old set and some believe it is the new set. If those two views can each independently form a majority, you get two leaders, each legitimately elected within its own view, each committing different writes. Split brain. The cluster has forked, and you are reconciling diverged data by hand.
+
+Raft's answer is **joint consensus**. You do not jump from old to new. You pass through a transitional configuration where *every decision requires a majority of the old set AND a majority of the new set, simultaneously*. No single view can act alone, so two disjoint majorities cannot exist, so you cannot get two leaders. Once the joint configuration is itself committed, you finish the transition. The window where split brain was possible never opens. The Raft thesis adds a simpler alternative for routine cases: change membership *one server at a time*, since a one-element difference in set size cannot produce two disjoint majorities. For "replace a dead node" that is simpler and entirely safe; production libraries still implement full joint consensus because it also handles atomic multi-replica swaps.
+
+This is not academic. CockroachDB has [written about needing joint consensus](https://www.cockroachlabs.com/blog/joint-consensus-raft/) for a geo-distributed failure: swapping a replica from one region to another transiently put two replicas in the same region, and if that region failed mid-swap the range would lose quorum. They contributed their implementation upstream to etcd's Raft library, and found and fixed real correctness bugs doing it, which is the honest footnote on "understandable": Raft being understandable does *not* mean it is trivial to implement correctly. Those are different claims, and conflating them is how teams ship broken consensus.
+
+## What production actually adds
+
+The paper is the protocol. Running it is a longer list, and the gap is where most operational reality lives. A few things every serious implementation, the kind that powers [etcd](https://github.com/etcd-io/raft), Consul, CockroachDB, and TiKV, ends up adding:
+
+**Pre-Vote.** A node partitioned away and rejoining comes back with a wildly inflated term, because it kept timing out and bumping its term the whole time it was isolated. On return, that high term forces the healthy leader to step down (higher term seen means step down), triggering a pointless election that disrupts a cluster that was working fine. Pre-Vote fixes it: before a candidate increments the real term, it runs a dry-run election asking "would you vote for me?" without bumping anything, and never disturbs the term unless it could actually win. Close to mandatory in production even though the core protocol does not strictly require it.
+
+**Multi-Raft.** The answer to the throughput ceiling the strong-leader model imposes. One group, one leader, one log, one bottleneck, so you run *many* groups. CockroachDB partitions the keyspace into [Ranges](https://www.cockroachlabs.com/docs/stable/architecture/replication-layer) and runs an independent group per Range; TiKV does the same per [Region](https://tikv.org/deep-dive/scalability/multi-raft/), thousands of groups on one node, with split and merge as data grows and a placement driver rebalancing leaders. Throughput now scales with the number of groups instead of the speed of one leader, and the hard problems move up a level: cross-group atomicity (a transaction touching two Ranges needs two-phase commit over the groups) and heartbeat amplification (thousands of groups each heartbeating would melt the network, so production systems coalesce heartbeats). This is the same partition-for-throughput move the log architecture in [Kafka vs queues](/blog/kafka-vs-queues) makes, applied to consensus.
+
+**Learners and durability.** A freshly added node starts far behind and would stall writes if it counted toward quorum before catching up, so new members join as *learners* first (replicate the log, do not vote) and get promoted once caught up; some systems keep permanent non-voting replicas to serve follower reads without joining the quorum. And the term, the vote, and the log must hit stable storage *before* the server answers any RPC, or a crash-restart can vote twice in one term and shatter the foundation the whole safety chain stands on. Batching those `fsync`s and pipelining `AppendEntries` are the throughput levers that never touch safety.
+
+## The protocol is correct. Your deployment might not be.
+
+Here is the distinction a staff engineer holds and a junior one collapses, and it is the most useful thing to walk away with.
+
+Raft-the-protocol is *formally verified*. There is a machine-checkable TLA+ specification of its safety properties, an independent mechanized proof of correctness, and reproduction studies confirming its latency and availability claims. The protocol is not "probably fine," it is proven.
+
+And yet. When Jepsen ran [adversarial testing against etcd](https://jepsen.io/analyses/etcd-3.4.3), the key-value core held up as strict-serializable, exactly as advertised. But etcd's distributed *locks* did not provide mutual exclusion. Two clients could believe they held the same lock at once, because a lock holder can be partitioned, lose its lease, and not find out before a second client acquires the lock, while the first keeps acting as if it still holds it. The fix is *fencing tokens*: every lock acquisition hands you a monotonically increasing number, you pass it to whatever resource you are protecting, and that resource rejects any operation carrying a token older than the highest it has seen. The lock alone is not safe. The lock plus the fencing token is.
+
+Both facts are true at once. The consensus protocol is correct, *and* a feature built on top of it can still be unsafe if you use it wrong. The protocol being proven does not buy you a correct system, it buys you a correct foundation, and what you build on it can still leak. That same humility runs through the determinism work in [Audex](/case-study/audex), where "the algorithm is correct" and "the system does the right thing under load" had to be verified as separate claims, and through [NomadCrew](/case-study/nomadcrew), where keeping a group's shared state consistent across flaky mobile connections is the replicated-log problem wearing different clothes.
+
+Two framings before you reach for any of this. Raft is *not* more powerful than Paxos; it tolerates the same failures and performs about the same, and the entire reason it exists is understandability, validated by a user study where students learned it more reliably. For distributed systems, "can be implemented correctly by a normal team" is worth more than a marginal capability edge, because a consensus bug is the kind that loses data silently. And the question that should come *before* Raft: do you even need consensus here? It is expensive in latency and operational weight, and it deliberately refuses availability under partition. If your workload tolerates eventual consistency, conflict-free replicated data types or other weaker models hand that availability back. The senior decision is not "how do I implement Raft," it is "is the consistency Raft provides worth what it costs for *this* workload," and often the answer is to pick a weaker model on purpose.
+
+## The shape of it
+
+The protocol is a strong leader, a log, a majority, and a logical clock made of integers. The depth is in the parts that do not fit on a slide: randomized timeouts that keep elections from livelocking, the current-term commitment rule that keeps majorities from lying to you, the stale-read problem that makes "just read the leader" a bug, and the membership change that forks your cluster if you do it the obvious way. Get those right and five machines hold the line as one. Get them wrong and you have built a very sophisticated way to lose data and not notice.
+
+## FAQ
+
+<FAQ />

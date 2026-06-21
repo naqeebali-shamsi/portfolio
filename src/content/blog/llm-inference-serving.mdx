@@ -1,0 +1,120 @@
+export const meta = {
+  slug: 'llm-inference-serving',
+  title: 'How LLM Inference Serving Works: Continuous Batching, KV-Cache, and Paged Attention',
+  description:
+    'Why LLM decode is memory-bandwidth-bound, why that makes batching the lever on GPU cost, and how the KV-cache, continuous batching, and PagedAttention cash in.',
+  headline: 'How LLM Inference Serving Works: Continuous Batching, KV-Cache, and Paged Attention',
+  deck: 'Generating a token is mostly waiting on memory, which is the one fact that explains every serving trick worth knowing.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['llm-inference', 'gpu', 'vllm', 'kv-cache', 'pagedattention', 'system-design'],
+  faq: [
+    {
+      q: 'Why is LLM decoding memory-bandwidth-bound instead of compute-bound?',
+      a: 'Decoding generates one token per forward pass, which turns the big matrix multiplies into matrix-vector products. To produce that single token, the GPU must stream the entire weight matrix (tens to hundreds of GB) from HBM to its compute cores, but it does very few FLOPs once the bytes arrive. The cores finish almost instantly and then sit idle waiting on the next chunk of memory. So decode is gated by how fast you can move weights, not by how fast you can multiply, which is the opposite of the prefill phase that processes the whole prompt at once.',
+    },
+    {
+      q: 'What is the KV-cache and why does it dominate GPU memory?',
+      a: 'The KV-cache stores the per-token Key and Value projections an attention layer has already computed, so each new token attends over the saved K and V instead of recomputing them. Without it, every step would re-attend over all prior tokens and cost would grow quadratically with sequence length. The cache grows with every token and every concurrent request, so at long context it overtakes the model weights: a single 2048-token request on OPT-13B needs about 1.6 GB, and four long LLaMA-2-13B sequences exceed the entire parameter footprint. That is why the KV-cache, not the weights, is what caps your batch size.',
+    },
+    {
+      q: 'What does PagedAttention actually do?',
+      a: 'PagedAttention manages the KV-cache the way an operating system manages virtual memory. Instead of reserving one contiguous slab per request sized to the maximum possible length, it splits the cache into fixed blocks of 16 tokens, stores them non-contiguously, and keeps a block table mapping logical positions to physical blocks. Blocks are allocated just-in-time as the sequence grows, which collapses the 60 to 80 percent of KV memory that older systems wasted to fragmentation down to near zero. It is a memory-management scheme, not a faster attention kernel, and it is what lets vLLM fit larger batches for 2 to 4 times the throughput.',
+    },
+    {
+      q: 'How is continuous batching different from regular dynamic batching?',
+      a: 'Regular batching groups requests, runs the whole batch to completion, and only then accepts new work, so the batch is held until its longest sequence finishes and early finishers leave their slots idle. Continuous batching schedules at the granularity of a single token: after every forward pass it can evict finished requests and admit waiting ones, so the GPU stays full. Making that work requires selective batching, because requests sit at different sequence positions and their attention cannot be fused into one uniform matrix even though the large feed-forward multiplies can.',
+    },
+    {
+      q: 'Does speculative decoding change the model output?',
+      a: 'No. A small draft model proposes several tokens cheaply, the large target model verifies all of them in one parallel forward pass, and a modified rejection-sampling rule accepts the longest correct prefix. That rule is constructed so the final output distribution is provably identical to sampling from the target model alone. You spend extra compute on draft tokens and verification, but you do not trade away quality, which is why it gives a 2 to 3 times wall-clock speedup that is safe to ship.',
+    },
+  ],
+}
+
+Generating one token from a large language model is mostly an exercise in waiting. The GPU you are paying for by the second spends most of a decode step idle, holding its compute cores still while it drags the model weights across a memory bus one slab at a time. That single fact, that decode is bound by memory bandwidth rather than by arithmetic, is the thing every serving optimization worth knowing is built to exploit.
+
+Get that fact wrong and the rest looks like a grab bag of unrelated tricks: caching, batching, paging, drafting. Get it right and they line up into one argument, from the two-phase shape of inference down to why a scheme called PagedAttention exists and what it actually buys.
+
+If you want the mechanics of the model itself first, [how LLMs work](/blog/how-llms-work) covers the forward pass and attention. Here we assume the model and ask a different question: given the weights, how do you serve thousands of requests through them without setting GPU money on fire?
+
+## Two phases, opposite bottlenecks
+
+Inference splits cleanly into two phases, and the whole systems story rides on the fact that they are bottlenecked by different resources. The first phase is **prefill**. You hand the model a prompt, and it processes every prompt token in a single parallel forward pass, building the cache it will generate from. Because many tokens flow through the weights at once, prefill is a sequence of large matrix-matrix multiplies, lots of arithmetic per byte of weight read, which is exactly what a GPU is built for. Prefill is **compute-bound**: it saturates the FLOPs.
+
+The second phase is **decode**. The model generates one token, appends it, and runs again for the next, autoregressively, until it emits a stop token. Each step processes a single new token, so the big matrix-matrix multiplies collapse into matrix-vector products. Here is the catch: to produce that one token, the GPU still has to stream every weight matrix from high-bandwidth memory (HBM) to its compute cores. Tens to hundreds of GB of weights moved, to do a trivial amount of math. The cores finish almost immediately and then stall, waiting on the next batch of weights. Decode is **memory-bandwidth-bound**: gated by how fast you can move bytes, not by how fast you can multiply. Anyscale put the asymmetry bluntly: it currently takes more time to load 1MB of data into the GPU's compute cores than it takes those cores to compute on 1MB of data. The hardware is starved on the read, not the math.
+
+This is the misconception to kill first. "Inference is compute-bound, buy more FLOPs" is true for prefill and false for decode, where extra FLOPs sit idle. What you are short on is memory bandwidth, and that single constraint reorganizes everything downstream.
+
+## The KV-cache, and why it dominates memory
+
+Decode would be far worse without a cache. When the model generates token number 500, its attention layers need to look back at the Keys and Values of all 499 prior tokens. The naive approach recomputes those K and V projections every step, so step *n* redoes the work of all earlier steps and total cost grows as the square of sequence length. The fix is to compute each token's K and V once and store them. That store is the **KV-cache**: each decode step now computes K and V for only the new token, appends them, and attends over the saved set. Quadratic recompute becomes linear lookup.
+
+The cache is not free, and its size is the hinge the entire serving stack turns on. It is large and *dynamic*: it grows by one token's worth of K and V every step, and is freed only when the request ends. For OPT-13B in FP16, the cache for a single token is 2 (one K, one V) times hidden size 5120 times 40 layers times 2 bytes, which is 800 KB per token, so a 2048-token request needs about 1.6 GB. The DeepMind scaling book runs the same arithmetic on LLaMA-2-13B at 8192 context and lands at 6.7 GB per sequence, then notes that just four such sequences exceed the memory footprint of the model's own parameters.
+
+The second misconception is "the model weights are the memory hog." At short context they are. At long context, or under heavy concurrency, the KV-cache dwarfs the weights, and it is the cache, not the parameter count, that caps how many requests you can run at once. Hold that thought, because batch size is about to become the game.
+
+## Static batching wastes the machine
+
+You batch because the weights are getting streamed from HBM anyway, so running several requests through the same read amortizes the cost. The question is *how* you batch, and the first instinct, **static batching** (also called request-level batching), bleeds utilization. Collect a batch, run the model on all of it until every sequence has finished, then return the results and accept the next batch. Simple, and it wastes the machine, because real requests have wildly different generation lengths.
+
+A batch of four requests generates 20, 100, 300, and 500 tokens. Static batching holds all four slots for the full 500 steps, because it cannot return the batch until the longest sequence is done. Request one finished at step 20 and then occupied a slot doing nothing for 480 steps. Across the batch, roughly 45 percent of the slot-time is wasted on sequences that already finished, and no queued request can take those idle slots until the whole batch drains. When generation lengths are unpredictable, which they always are, static batching leaves your most expensive hardware idling on purpose.
+
+## Continuous batching fills the gaps
+
+The fix came from the Orca paper (OSDI 2022): change the unit of scheduling. Instead of scheduling whole requests, schedule **iterations**. In Orca's phrasing, the scheduler invokes the engine to run only a single iteration of the model on the batch, so after each token control returns to the scheduler, which can evict any request that just finished and admit any that is waiting. This is **continuous batching**, also called in-flight or iteration-level batching.
+
+Replay the four-request example: when request one finishes at step 20, instead of holding its slot dead for 480 steps, the scheduler immediately drops in a queued request, and the batch stays full. Finished requests return the moment they are done rather than waiting on the slowest sibling. GPU utilization on real workloads jumps from the 30 to 40 percent typical of static batching into the 80s.
+
+This is the fourth misconception: continuous batching is not just "dynamic batch sizing." It recomposes the batch *every token*, which sounds impossible for a transformer, because the requests sit at different sequence positions with different lengths. Their attention computations are not the same shape, so you cannot fuse them into one uniform matmul.
+
+Orca's answer is **selective batching**, the unglamorous detail that makes the whole thing runnable. Batch only the operations that are position-agnostic. The large QKV projection and the feed-forward GEMMs do not care where a token sits in its sequence, so those get batched across all requests into one big efficient multiply. Attention, which depends on each request's own history, is computed per request. The expensive uniform work is batched and the awkward ragged work is handled individually. Without selective batching, iteration-level scheduling produces wrong attention; with it, you get the utilization win and correct outputs. That is the foundation everything later builds on.
+
+## PagedAttention: virtual memory for the cache
+
+Continuous batching keeps the GPU busy, but it runs straight into the KV-cache problem. To put a request into a batch slot, you have to allocate cache for it, and you do not know in advance how long it will run. The older approach reserved a single contiguous region per request, sized to the maximum possible output length. That reservation is where the memory went to die.
+
+The vLLM paper (SOSP 2023) measured the damage: in the systems that preceded it, only 20.4 to 38.2 percent of the KV-cache memory held actual token states. The other 60 to 80 percent was wasted, lost to three things: reserved-but-not-yet-used slots inside a request's region; **internal fragmentation** from over-provisioning every request to the maximum length it might reach; and **external fragmentation** from the allocator leaving unusable gaps between regions. You paid for HBM and used a third of it.
+
+PagedAttention borrows the oldest trick in operating systems: virtual memory and paging. The KV-cache is divided into fixed **blocks of 16 tokens** that live anywhere in HBM, non-contiguously, and each sequence carries a **block table** mapping its logical block positions to physical addresses, the page-table indirection exactly. Blocks are allocated **just-in-time** as the sequence grows, not reserved up front.
+
+Trace a 35-token sequence with block size 16. It occupies three logical blocks: 16, then 16, then 3. The block table maps logical [0, 1, 2] to scattered physical blocks, say [81, 12, 47]. Only the last block carries any waste, 13 of 16 slots empty, and that is it. Internal waste is capped at less than one block per sequence instead of ballooning to the gap between actual and maximum length. Drive the 60 to 80 percent waste to near zero and you fit several times more sequences in the same memory. That multiple *is* the throughput gain: 2 to 4 times over Orca and FasterTransformer at equal latency.
+
+There is a fifth misconception here, and it is common: that PagedAttention is a faster attention kernel. It is not. It is a memory-management scheme, about allocation and indirection. The kernel-level speedup, minimizing data movement between HBM and the tiny on-chip SRAM during the attention computation itself, is FlashAttention, a separate and complementary piece of work. One manages where the cache lives; the other speeds up the math over it. They stack.
+
+Indirection buys sharing for free. Because every sequence reaches its blocks through a table, two sequences can point at the *same* physical block. A shared system prompt, several samples drawn from one prompt, the branches of a beam search: all can share blocks and only copy a block when they diverge, copy-on-write style. vLLM measured 6.1 to 9.8 percent savings on parallel sampling and 37.6 to 66.3 percent on beam search depending on the dataset. The same mechanism generalizes to caching a long system-prompt's KV across every request that shares it, which is a large real-world win for [agentic workflows](/blog/agentic-workflows) and [RAG systems](/blog/rag-system) that prepend fat, identical context, often retrieved from [vector databases](/blog/vector-databases), to every call.
+
+## Why all of this collapses into "make the batch bigger"
+
+Now the bottleneck pays off, and the separate tricks resolve into one economic argument. In the memory-bandwidth-bound regime, the weight read for a decode step costs the same whether one request or sixty-four ride along on it. So every request you add is nearly **free FLOPs**, reusing weights already in flight, and throughput scales almost linearly with batch size. The arithmetic, from the DeepMind scaling book: decode OPT-13B at batch size 1 and you stream roughly 26 GB of weights to produce a single token, which at about 2 TB/s of HBM is a 13 ms read during which the cores do almost nothing. Batch 64 requests and it is the same 13 ms read, now amortized across 64 tokens, for about 64 times the throughput at nearly the same memory cost. You keep winning until the **critical batch size** (the ridge point on the roofline) where arithmetic finally catches up with bandwidth and you turn compute-bound: about 240 tokens on a TPU v5e, about 280 on an H100. Below that line, in the scaling book's words, use the largest per-chip batch size possible if you care about generation throughput.
+
+This is the punchline that ties the post together. Serving stacks fight so viciously for KV-cache memory because every GB you reclaim is more concurrent requests sharing the same fixed weight-streaming cost, and cost per token is just that fixed cost divided by how many requests amortize it. So KV-cache efficiency translates almost directly into effective batch size, and batch size into dollars per token. PagedAttention earns its keep as a *cost* optimization, raising the batch size you can afford to run.
+
+That is also why architecture-level cache reduction is a first-class lever, not a footnote. **Multi-query attention** (MQA, Shazeer 2019) and **grouped-query attention** (GQA, Ainslie 2023) shrink the KV-cache by sharing K and V heads across query heads, GQA giving roughly a 4 to 8 times reduction and uptrainable from an existing multi-head checkpoint with around 5 percent of pretraining compute. Less cache per token means more tokens in the batch on the same memory, which means lower cost per token by the exact chain above. MQA, GQA, and the newer multi-head latent attention are doing the same job as PagedAttention from a different angle, and they multiply together.
+
+## The tension nobody can optimize away
+
+If bigger batches were strictly better, serving would be solved. They are not, and the sixth misconception is believing they are. Larger batches raise throughput but degrade *per-request latency*, and production systems live on that Pareto frontier.
+
+The vocabulary you need for any serving design review is two numbers. **TTFT**, time to first token, is dominated by prefill and is what a user feels as "did it start." **TPOT** or **ITL**, time per output token or inter-token latency, is dominated by decode and is what they feel as "how fast is it typing." Push the batch larger and aggregate throughput climbs while each request's TPOT gets worse, because more sequences share each step. The right knob is the SLO, and the honest success metric is **goodput**: requests per second that actually meet their latency targets, not raw tokens per second. A stack hitting huge throughput while blowing its TTFT budget is failing with a flattering dashboard. That is the same tail-latency discipline that [latency and the tail](/blog/latency-throughput-tail) argues for, applied to GPUs, and the reason you instrument TTFT and TPOT as first-class signals across [the three pillars](/blog/observability-three-pillars).
+
+The sharpest version of the tension is **prefill-decode interference**. Drop a long prefill into a batch that is busy decoding and every decoder stalls while the prefill's heavy matmul runs, a visible TPOT spike for users mid-stream. Two camps answered this at OSDI 2024. **Sarathi-Serve** chops prefills into roughly equal chunks and interleaves them so no single step stalls the decoders, "stall-free" scheduling that works best when decode dominates. **DistServe** goes the other way and physically *disaggregates* the phases onto separate GPU pools, reporting up to 7.4 times more goodput and far steadier tail latency. Its cost: the KV-cache computed during prefill must now ship across the interconnect to the decode pool, so you trade interference for a transfer. How a senior engineer decides comes down to workload and SLO: decode-heavy traffic with a tight TPOT leans toward chunked prefill, while a strict TTFT SLO under bursty prompts justifies the disaggregation machinery. Chunked prefill also quietly dissolves the clean two-phase model this post opened with: once a step mixes partial-prefill tokens with decode tokens, the two phases become a scheduling continuum.
+
+## Speculative decoding: spend the idle compute
+
+One more lever attacks the latency side without touching output quality. The decode bottleneck leaves the compute cores idle while weights stream, and **speculative decoding** (Leviathan et al., ICML 2023) spends that idle compute. A small, cheap **draft** model proposes the next K tokens. The large **target** model verifies all K in a *single* parallel forward pass, which it can do because verification looks like prefill, the compute-bound work the starved GPU has spare capacity for. A modified rejection-sampling rule accepts the longest correct prefix and, critically, is constructed so the output distribution is **provably identical** to sampling from the target alone. Net result, 2 to 3 times wall-clock speedup.
+
+The seventh misconception, that this trades quality for speed, is exactly wrong. It is provably lossless: you spend extra compute on draft tokens and verification, but give up no output fidelity. Account for it: the draft proposes 5 tokens, the target verifies in one pass, 3 are accepted, so you produced 3 tokens for roughly the latency of one large forward pass plus five cheap draft passes, distribution unchanged.
+
+One regime caveat tells you when it stops helping. Speculation wins exactly where you are memory-bandwidth-idle, which is low batch size. At high batch you are already compute-bound and the slack it feeds on is gone, so the speedup shrinks. Speculation and batching compete for the same idle capacity: reach for speculation when you cannot fill the batch (latency-sensitive, low-concurrency serving) and lean on batching when you can.
+
+## Where this leaves you
+
+The thread through all of it is one sentence: decode is memory-bandwidth-bound, and almost every serving technique is a different way to make that constraint pay. The KV-cache makes generation linear, then grows large enough to cap your batch. Continuous batching keeps the GPU full by scheduling per token, with selective batching to stay correct. PagedAttention recovers the cache that fragmentation wasted, and that recovered cache turns straight into batch size, and batch size into cost per token. MQA and GQA shrink the cache from the model side; chunked prefill and disaggregation manage the interference bigger batches create; speculative decoding converts decode-phase idle compute into a lossless speedup.
+
+Carry the lineage as a map. Orca gave us iteration-level scheduling and selective batching, vLLM gave us PagedAttention on top of it, and DistServe and Sarathi-Serve are the frontier responses to the tension those two created, with MQA to GQA to MLA as the parallel architecture track. So when you next read a benchmark claiming a 23 times improvement, you can factor it: continuous batching is worth roughly 8 times on its own, and PagedAttention enabling far larger batches multiplies the rest. It was never one trick. It is the stack, and the stack only makes sense once you accept that generating a token is mostly waiting on memory.
+
+## FAQ
+
+<FAQ />

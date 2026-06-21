@@ -1,0 +1,193 @@
+export const meta = {
+  slug: 'payment-system',
+  title: 'The Payment System Nobody Sees Fail: Gateways, Idempotency, Retries and the Ledger',
+  description:
+    'Authorization holds funds, capture moves them, the ledger is the only truth. How payment systems survive duplicates, crashes, and retries without losing money.',
+  headline: 'The Payment System Nobody Sees Fail: Gateways, Idempotency, Retries and the Ledger',
+  deck: 'A payment system is judged by what it never does: lose a dollar, double a charge, or trust the gateway over its own books.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '17 min',
+  tags: ['payments', 'idempotency', 'ledger', 'double-entry', 'distributed-systems', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between authorization and capture?',
+      a: 'Authorization is the issuer approving a transaction and placing a hold on the cardholder funds, which reduces available credit but does not move money. Capture is the later request to actually collect those funds, and it can be for a lesser amount than the authorization. Settlement then transfers the net money to the merchant in a batch, usually days later, minus fees. Modeling this as a two-phase transfer in the ledger (pending, then post or void or timeout) keeps every state consistent.',
+    },
+    {
+      q: 'Why is an idempotency key not enough to prevent double charges?',
+      a: 'A key tells you two requests belong to the same logical operation, but two copies carrying the same key can arrive milliseconds apart, both check whether the charge already happened, both see nothing, and both charge. The fix is an exclusive lock on the key so one request proceeds and the other waits or gets a 409. The harder case is a crash after the charge committed at the processor but before you recorded it, which needs a recovery point so the retry resumes instead of recharging.',
+    },
+    {
+      q: 'Why store money as integers instead of decimals or floats?',
+      a: 'Floating point cannot represent most decimal cents exactly, so balances drift by fractions of a cent that compound across millions of transactions, and a ledger that fails to balance by a penny is a ledger you cannot trust. Store amounts as integer minor units (cents, pence, fils) and carry the currency explicitly alongside every amount. Decimal types are safer than float but integers remove the question entirely.',
+    },
+    {
+      q: 'If the payment processor supports idempotency, do I still need reconciliation?',
+      a: 'Yes. Idempotency protects a single request from being applied twice. Reconciliation is the independent check that your books, the processor records, and the bank deposits all agree, and it exists precisely because the external system should not always be assumed to be right. The classic implementation is a clearing account that must net to zero at steady state; a nonzero balance instantly surfaces a missing, late, or incorrect transaction.',
+    },
+    {
+      q: 'Why do payment systems choose consistency over availability?',
+      a: 'Under a network partition a distributed system can stay available or stay consistent, not both, and for money showing an incorrect balance is worse than showing an error. So payment systems pick consistency for the write path: balances and payment initiation run on a strongly consistent store with optimistic locking, while non-critical reads like transaction history can be served from eventually consistent replicas. The idempotency store specifically must be strongly consistent or the duplicate suppression has a hole.',
+    },
+  ],
+}
+
+A payment system is the rare piece of software judged almost entirely by its failures. Nobody writes a thank-you note because their card was charged the correct amount once. The whole job is to make sure a specific list of bad things never happens: a customer charged twice for one order, a merchant paid for a sale that never settled, a balance off by a cent, a dollar that exists on one ledger and not another. Get all of that right ten million times a day and the reward is that no one notices you exist.
+
+That inverted scorecard changes how you design. Most systems optimize for the happy path and treat failures as edge cases to clean up later. In a payment system the failure paths are the product. The interesting question is what happens when the charge succeeds but you crash before recording it, and a staff-grade answer to that looks nothing like the handler you would write on your first day.
+
+This piece walks the path money takes, then the four mechanisms that keep it honest under failure: idempotency for the request, locks and recovery points for the retry, a double-entry ledger for the truth, reconciliation for the parts you do not control. It is the sequel to [idempotency and the exactly-once lie](/blog/idempotency-exactly-once) and [idempotent webhooks](/blog/idempotent-webhooks), where those argue the principle and this one spends it on money.
+
+## Money does not move when you think it does
+
+Start with the actors, because most confusion about payments comes from collapsing five distinct parties into one thing called "the payment provider."
+
+When a customer pays, the request passes through a **gateway**, which encrypts and forwards it. The gateway hands it to an **acquirer** (the PSP or processor), the merchant's bank-side service that holds the merchant account. The acquirer routes through a **card network** (Visa, Mastercard, Amex) that connects the acquiring side to the issuing side. The network reaches the **issuer**, the cardholder's own bank, which decides whether to approve and, if so, places a hold. Five parties, four handoffs, and only one of them is your code.
+
+Here is the part that surprises people. The authorization that comes back in a second or two moves no money. It moves *information*: the issuer approves the transaction and places a hold that reduces available credit, while the funds stay in the cardholder's account. Money moves later, at capture and settlement, and settlement is a batched process that lands in the merchant's bank days afterward net of fees, T+2 being common.
+
+```
+Customer ─▶ Your service ─▶ Gateway ─▶ Acquirer/PSP ─▶ Network ─▶ Issuer
+                                                                    │
+   AUTH:        approval + hold on funds (information, no money) ◀──┘
+   CAPTURE:     request to collect the held funds (can be partial)
+   SETTLEMENT:  batched net transfer to merchant bank, T+N, minus fees
+```
+
+A single payment spans three facts arriving at three different times: authorization (an approval), capture (a request to collect), settlement (the transfer of net money). A system that treats "the card was authorized" as "we have the money" is wrong about its own balance sheet from the first second. The gap between auth and capture is a window your system has to model explicitly. The funds are reserved but not collected. You might capture less than you authorized (a partial shipment, a removed item), or never capture at all (a cancelled order, where the hold should expire and return the funds). Each is a state, and if your ledger cannot represent "reserved but not yet collected" as a first-class thing, you patch it with flags and nullable columns that drift out of sync the first busy weekend.
+
+## Authorization and capture are a two-phase transfer
+
+There is a clean way to model the auth/capture split, and it comes from the ledger layer: treat it as a two-phase transfer.
+
+TigerBeetle, a database built for double-entry accounting, formalizes this and it maps onto payments exactly. A *pending* transfer reserves an amount, moving the value into `debits_pending` and `credits_pending` without touching the posted balances. That is your authorization hold, and three things can resolve it: a *post* captures the funds (optionally for a lesser amount, restoring the remainder), a *void* cancels and restores the full amount, or a *timeout* elapses and restores the funds automatically. Those are capture, partial capture, reversal, and auth-expiry.
+
+Make it concrete. A pending transfer of 123 units reserves 123. Post for 100, and 100 moves to the posted balances while 23 returns to where it came from. Void, and all 123 come back. Let the timeout fire, and all 123 come back automatically. Four outcomes of one primitive that lives in the accounting layer where money cannot leak.
+
+The discipline this buys is that the unhappy paths conserve money by construction. A void returns reserved funds to their origin as a balanced operation, and an expired hold is a timeout rather than a cron job blindly subtracting a number. When the model guarantees reserved funds always return home, you stop writing the bug where a cancelled order quietly strands money in a clearing account.
+
+## Idempotency is the request-level promise
+
+Now the request itself. The customer clicks pay, the network hiccups, and the client does not know whether the charge happened. Stripe's framing, now the industry's, is that a network failure during a payment looks identical to the client in three situations: the connection was never established, the request failed partway through, or it *succeeded but the response was lost on the way back*. The third case is the dangerous one. The charge went through, your server recorded it, and the customer's browser sees a timeout. A naive client retries, a naive server charges again, and you have two charges for one logical payment with nothing in either side's logic wrong in isolation.
+
+The fix is an idempotency key. The client generates a unique identifier for the operation and sends it on every attempt, classically as an `Idempotency-Key` header. The server uses it to recognize a retry and returns the original response instead of re-executing. Stripe's definition is the one to memorize: an idempotent endpoint can be called any number of times while guaranteeing the side effects occur only once. It is the same property [idempotent webhooks](/blog/idempotent-webhooks) relies on, pointed the other way: there you dedupe events the provider sends you; here you dedupe requests your client sends the provider.
+
+The shallow version stops at "store the key, return the cached response," which holds only while nothing external has happened yet. The moment your request charges a real card, that model develops a hole, and closing it is what separates a toy from a payment system.
+
+## The hole is the foreign-state mutation
+
+Brandur Leach's deep dive on Stripe-style keys names what breaks the simple model: the *foreign-state mutation*, any side effect outside your own database, like charging the processor, sending an email, or publishing to Kafka. Local work is ACID, so you wrap it in a transaction and trust it to be atomic, but an external API call can never join that transaction. As Brandur puts it, once you make your first foreign-state mutation you are committed one way or another, and aborting a database transaction will not roll it back.
+
+This is why a payment cannot be one big transaction. It decomposes into *atomic phases* separated by foreign-state mutations: inside a phase you do local work in a real transaction, between phases you cross a boundary you do not control, and a crash can land in any of those gaps.
+
+The answer is a *recovery point*: after each atomic phase, persist a checkpoint recording how far the request got. On a retry you do not restart from the top and you do not blindly replay a cached response. You resume from the last checkpoint. Brandur's worked example is a Rocket Rides flow progressing `STARTED → RIDE_CREATED → CHARGE_CREATED → FINISHED`. Crash after `CHARGE_CREATED` and the retry sees the charge already happened, skipping straight to finishing rather than charging twice. The recovery point is the durable answer to "the charge succeeded but we crashed before recording the rest."
+
+```
+Phase boundaries are where crashes hurt:
+
+STARTED ──tx──▶ RIDE_CREATED ──[charge Stripe]──▶ CHARGE_CREATED ──tx──▶ FINISHED
+                              ▲ foreign-state mutation
+   crash here on retry: recovery point says CHARGE_CREATED → resume, do not recharge
+```
+
+The schema that backs this is small, and every column earns its place:
+
+```sql
+CREATE TABLE idempotency_keys (
+    id              BIGSERIAL   PRIMARY KEY,
+    idempotency_key TEXT        NOT NULL,
+    locked_at       TIMESTAMPTZ DEFAULT now(),
+    recovery_point  TEXT        NOT NULL,
+    response_code   INT         NULL,
+    response_body   JSONB       NULL,
+    user_id         BIGINT      NOT NULL
+);
+CREATE UNIQUE INDEX idempotency_keys_user_id_idempotency_key
+    ON idempotency_keys (user_id, idempotency_key);
+```
+
+The `recovery_point` is the checkpoint; `response_code` and `response_body` cache the final answer for completed requests; `locked_at` is how you survive concurrency, which is the next problem. The key is scoped per `(user_id, idempotency_key)`, and a known key arriving with a different request body should error rather than silently serve the old response.
+
+## The double-charge race, and the lock that ends it
+
+Two requests carrying the same key can arrive milliseconds apart, because a retry can overlap a slow original and your endpoint runs on more than one instance. Request A checks "already charged?" and sees no, request B checks the same and also sees no, both proceed, both charge. The check and the act are separate steps and the duplicate slips through the gap. This is the same time-of-check-to-time-of-use race that [idempotent webhooks](/blog/idempotent-webhooks) closes with a unique constraint, except the operation in the gap is a real charge, so losing the race costs a customer's money.
+
+More application code cannot close it, because the gap lives between your process and the store with another process inside it. You close it with an exclusive lock on the key. Brandur's implementation stamps `locked_at` and runs at `SERIALIZABLE` isolation, so when two requests collide on the same key the database aborts one of them. Request B then waits for A and returns A's result, or gets a `409 Conflict` saying that key is already in flight. The database is the one referee that decides who proceeds, and the duplicate cannot squeeze through.
+
+The client retry policy completes the picture. When a request fails ambiguously you retry, but with exponential backoff (delay growing as `2^n`) *plus jitter*, a random offset so a fleet of clients does not synchronize their retries into a thundering herd that hammers an already-struggling service at the same millisecond. Jitter is load-bearing; without it a transient blip becomes a self-inflicted spike. This is the tail-latency thinking [latency and the tail](/blog/latency-throughput-tail) develops: behavior under retry storms, not the median, decides whether you stay up.
+
+Idempotency has to be carried through the whole chain, not bolted onto one hop. Brandur passes a derived key like `rocket-rides-atomic-#{key.id}` down to Stripe, so even the foreign mutation is idempotent end to end. And when a downstream has *no* idempotency support and you see a failure, you often cannot retry safely at all, because you cannot tell whether it applied; the honest move is to mark the operation permanently errored and escalate to a human rather than risk a blind double charge.
+
+## The ledger is the only source of truth
+
+Underneath the request machinery sits the thing that defines correctness: the ledger. The single most important decision in a payment system is that the ledger is the source of truth, ahead of the processor, a cache, or any balance column you mutate in place.
+
+The model is double-entry bookkeeping, and its core invariant is that every movement is balanced. For each debit there is an equal and opposite credit, so the sum of all entries is always zero. Uber states the consequence plainly: the system cannot create or destroy money. That property, enforced structurally, is what lets a payment system claim it never loses a dollar. A dollar cannot vanish, because vanishing would require an unbalanced entry the schema rejects.
+
+Two ideas trip up almost everyone arriving from application development.
+
+The first: debits and credits are *directions*, not "subtract" and "add." Accounts have a *normal balance*. Asset and expense accounts are debit-normal, so a debit increases them; liability, equity, and revenue accounts are credit-normal, so a credit increases them. A debit therefore *increases* an asset and *decreases* a liability, and "debit means money out" is a folk theory that misleads you the moment you model a real flow. TigerBeetle puts it sharply: accounting is a type system, and debit/credit is the minimal schema that can represent any exchange of value.
+
+The second: you store immutable entries and *compute* the balance by summing them, rather than mutating a balance in place. Stripe's Ledger is explicit that transactions, once written, cannot be deleted or modified, and that past state can always be reconstructed by replaying events to a point in time. A mistake is fixed by writing a new *reversing entry*, never by editing history. This is the append-only instinct behind an event log, and it is what makes the ledger auditable: the history is the data.
+
+```
+One captured payment, as balanced entries (amounts illustrative):
+
+  Customer receivable      DEBIT   10000   (asset up: they owe us, now collected)
+  PSP clearing             CREDIT  10000   (we expect this from the processor)
+        ... on settlement ...
+  Cash (bank)              DEBIT    9700   (net money actually arrives)
+  Processing fees          DEBIT     300   (expense recognized)
+  PSP clearing             CREDIT  10000   (clearing nets to zero ✓)
+
+  Σ debits == Σ credits at every step.  Clearing account → 0 when settled.
+```
+
+Notice the clearing account: it carries a balance while money is in flight between the sale and the deposit, and it must return to zero once everything settles. That zero is the foundation of how you detect problems, which is the next section. (Computing balances by summing immutable entries sounds expensive, and it is the same read-vs-write tradeoff behind [Design Twitter](/blog/design-twitter-feed) and the caching pressure [the distributed cache](/blog/distributed-cache) relieves: snapshot running balances so reads stay fast, keep the entries as the authority you rebuild from.)
+
+## Reconciliation: the processor is a record, not the record
+
+Here is the claim that catches teams off guard: even when the processor supports idempotency, you still reconcile. The Pragmatic Engineer states the principle directly, that the external system should not always be assumed to be right. Idempotency keeps a single request from applying twice; reconciliation is the *independent* audit that your books, the processor's records, and the bank's deposits all agree. Different controls for different problems, and one cannot replace the other.
+
+The most elegant implementation already sits in your ledger: the clearing account that must net to zero. Stripe's data-quality platform runs a query that is, in spirit, "find the clearing accounts with a nonzero balance." A nonzero balance is a live alarm: money is in flight that has not resolved, a capture that never settled, a settlement that never matched a sale, a refund recorded on one side and not the other. The system tells on itself the moment the books stop balancing, continuously, well before month-end. Stripe frames the underlying questions as *clearing* (did every movement fully resolve?), *timeliness* (on schedule?), and *completeness* (do your records fully represent what upstream did?), and each maps to a concrete check.
+
+Two failure modes are where reconciliation projects sink. The first is *schema drift*: a processor changes its settlement-file format or renames a column and your matchers silently break. The harder one is *identifier resolution*: the same economic event surfaces under different IDs at different stages (auth, capture, settlement, refund, dispute), and stitching them into one story across multiple processors is the real normalization problem. Multi-processor reconciliation turns on agreeing *what counts as the same payment* before any number is matched.
+
+A scale note grounds the abstraction. Stripe's Ledger processes on the order of five billion events a day, fully ingests and verifies 99.99% of dollar volume within four days, and targets more than six nines of explainability for money movement. Uber's Gulfstream handles north of eighteen million requests a day across ten thousand-plus cities, active-active, using deterministic IDs and immutability for exactly-once behavior. These architectures exist so the books balance provably, and the proof is the clearing-account check running constantly in the background.
+
+## Status arrives asynchronously, and at least once
+
+Much of what happens to a payment, settlement completing, a dispute opening, a payout landing, reaches you asynchronously through webhooks. Delivery is at-least-once, so your handler *will* see duplicates, and the common cause is rarely network loss. It is your handler finishing the work and acknowledging a few milliseconds too late, so the provider assumes failure and resends.
+
+The reliability shape is the one [idempotent webhooks](/blog/idempotent-webhooks) lays out in full: verify the signature over the raw body with a timing-safe comparison, dedupe on the provider's event ID with a TTL, ack fast and push heavy work to a queue you control, and dead-letter anything that exhausts its retries instead of dropping it silently. For payments the stakes are higher, because the duplicate that slips through is a duplicate refund and the event you silently drop is a dispute you failed to answer.
+
+One retention detail people miss: two clocks run at once. Idempotency keys can be reaped in roughly seventy-two hours, but chargebacks and disputes resolve over weeks to months, and the *ledger* is the long-term truth across that whole window. The idempotency table is a short-lived guard on the write path; the ledger is the permanent record you reconcile against long after the keys are gone.
+
+## How a senior decides
+
+The decisions form a stack, each one a place where the shallow answer and the staff-grade answer diverge.
+
+| Concern | Shallow move | What a senior does instead |
+| --- | --- | --- |
+| Money representation | Store as decimal or float | Integer minor units, currency carried explicitly. Float corrupts cents at scale |
+| Double charge | Add an idempotency key, return the cached response | Lock the key, define 409-vs-wait, and keep a recovery point for the post-charge-pre-record crash |
+| Auth vs capture | Two booleans on the order row | A two-phase transfer: pending, then post (full or partial) / void / timeout, so funds always conserve |
+| Source of truth | A mutable balance column | Immutable double-entry entries; compute balances; corrections are reversing entries |
+| Processor trust | Trust the gateway response | Reconcile independently across internal, processor, and bank; clearing accounts must net to zero |
+| Consistency | "Use a database" | Explicit CP choice: strong for balances and initiation, eventual acceptable for history |
+| Webhooks | Listen for the event | At-least-once; verify on raw body, dedupe on event ID, ack fast, DLQ and alert |
+
+The consistency row frames all the others. Under a partition a distributed system can stay available or stay consistent, and for money, showing an incorrect balance is worse than showing an error. So payments are a CP system on the write path: balances and initiation run on a strongly consistent store with optimistic locking and versioning, while non-critical reads like transaction history can come from eventually consistent replicas, the same read/write split [replication](/blog/replication-strategies) is built to manage. The store that must never be eventually consistent is the idempotency store, because a stale read there is a hole the double charge walks straight through. This is the kind of explicit, defended tradeoff [the system design interview framework](/blog/system-design-interview-framework) asks you to make out loud, the instinct running through every building block from [consistent hashing](/blog/consistent-hashing) to [the URL shortener](/blog/url-shortener).
+
+The discipline generalizes past payments. The recovery-point pattern, resume from a durable checkpoint instead of replaying blind, is what makes the multi-agent pipeline in [IntelliFill](/case-study/intellifill) safe to retry, where the foreign-state mutation is an LLM call instead of a card charge but the failure shape is identical, and where you want the same view into in-flight state that [Aladeen](/case-study/aladeen) gives agent CLIs. Conserve-by-construction shows up wherever a system splits value among people, like the expense-splitting in [NomadCrew](/case-study/nomadcrew). The meta-lesson, the same one running through [how LLMs work](/blog/how-llms-work) and [RAG systems](/blog/rag-system): the model is the easy part, the failure handling is the system.
+
+## The honest landing
+
+A payment system earns its keep on the days the network drops your acknowledgment, the process crashes between charging and recording, the settlement file changes shape, and the same event arrives three times at 2 a.m. None of that is exotic. All of it is guaranteed, given enough volume and enough time.
+
+The defenses are unglamorous and they are the whole product. The table above is the checklist: integers for money, a locked key and a recovery point, auth and capture as a two-phase transfer, an immutable double-entry ledger as the source of truth, independent reconciliation with the clearing account as the alarm, and consistency over availability on the write path. Do all of it and the system disappears, which is the only review it was ever going to get. Skip any of it and you learn which one from the customer whose card you charged twice.
+
+## FAQ
+
+<FAQ />

@@ -1,0 +1,161 @@
+export const meta = {
+  slug: 'spatial-rtree-indexing',
+  title: 'R-Trees and Spatial Indexing: How "Find Nearby" Actually Works',
+  description:
+    'A B-tree orders one dimension; geography has two. Why "find nearby" needs R-trees, where overlap breaks them, and when a humble geohash column quietly wins.',
+  headline: 'R-Trees and Spatial Indexing: How "Find Nearby" Actually Works',
+  deck: 'A B-tree sorts one column; the plane has no sort order that keeps neighbors close, so proximity needs a structure that reasons about regions.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '16 min',
+  tags: ['spatial-indexing', 'r-trees', 'geohash', 'postgis', 'databases', 'system-design'],
+  faq: [
+    {
+      q: 'Why can a B-tree index on (lat, lng) not answer "find nearby"?',
+      a: "A B-tree keeps keys in total order along one axis, so a composite index on (lat, lng) can prune on latitude but must then scan every longitude inside that latitude band. There is no total order on the plane that keeps nearby points nearby in key space, so the second dimension cannot be pruned. For a 10M-point table, a 1 km query can land inside a latitude band of tens of thousands of rows spanning the whole globe's longitude, all of which get scanned. An R-tree or a grid restricts to the actual box and touches dozens of rows instead.",
+    },
+    {
+      q: 'What is the overlap problem in an R-tree?',
+      a: "An R-tree groups objects into minimum bounding rectangles (MBRs), but those rectangles are allowed to overlap. When a query point falls inside two overlapping MBRs, the search must descend both subtrees, and pruning fails. Overlap is the defining weakness of the R-tree, created by bad node splits, and it is exactly what the R*-tree was built to reduce. This is the opposite of a B+-tree, whose key ranges are disjoint, so a point lookup follows exactly one path.",
+    },
+    {
+      q: 'Does PostGIS index the actual polygon geometry?',
+      a: "No. PostGIS indexes the bounding box of each geometry inside PostgreSQL's GiST framework, where the default geometry opclass implements an R-tree. Every spatial query runs in two passes: a fast primary filter using the && (bounding-boxes-overlap) operator walks the index and returns candidates, then an exact secondary filter such as ST_Intersects or ST_DWithin runs the expensive geometry math only on those candidates. The PostGIS workshop measures a query dropping from 300 ms on a sequential scan to 50 ms with a GiST index.",
+    },
+    {
+      q: 'When should I use a geohash or H3 column instead of an R-tree?',
+      a: "Reach for a grid when you have billions of points, need to shard horizontally, can tolerate approximate proximity, and want analytics roll-ups. Geohash and H3 emit locality-preserving IDs, so a plain ordered index or a key-value store's sorted keyspace can serve spatial range scans, and the column travels across services and languages for free. Reach for PostGIS and GiST when you index arbitrary extents like polygons and delivery zones, need exact geometric predicates, and join spatially inside transactions. Points-on-a-grid and extents-with-exact-predicates are different workloads.",
+    },
+    {
+      q: 'Why does H3 use hexagons and why does it need pentagons?',
+      a: "Hexagons give every cell exactly six neighbors, all sharing an edge and all equidistant, so 'within one ring' is a single uniform notion of distance. A square grid has four edge-neighbors at distance d and four corner-neighbors at distance d times root two, which biases any flow or movement analysis. The catch is that you cannot tile a sphere with hexagons alone, so H3's icosahedron base forces exactly 12 pentagons at every resolution, and hexagon children do not perfectly tile their parent, so containment across resolutions is approximate rather than exact.",
+    },
+  ],
+}
+
+Here is a query every app you use answers a hundred times a day. Show me the restaurants within a kilometer. Show me drivers near this pin. Show me photos taken around here. It feels like the most ordinary thing a database could do, and it is the one thing the index backing almost every SQL table you have ever written cannot do at all.
+
+That index is a B-tree, or its B+-tree sibling. It keeps keys in total order along one axis, which is what makes `WHERE age BETWEEN 30 AND 40` a logarithmic walk to a leaf and a short scan from there. One dimension, sorted, fast. Geography is two dimensions at once, latitude and longitude inseparable, and the sorted-column trick has no answer for it. This piece is about why, what structures actually answer "near me," and the uncomfortable twist that the elegant tree everyone draws on the whiteboard frequently loses, in production, to a column of short strings.
+
+## The B-tree fails, and it fails on purpose
+
+Watch the thing people try first fail, because that is the whole intuition.
+
+You have a table of ten million points and a composite B-tree index on `(lat, lng)`, reasoning that latitude plus longitude is just a two-column key, and B-trees handle composite keys fine. Then you ask for everything within roughly a kilometer of Times Square, `(40.7128, -74.0060)`.
+
+The index does its job on the first column. The predicate `lat BETWEEN 40.703 AND 40.722` prunes to a thin horizontal band, and the tree walks straight to it. The trouble is what that band contains: every point on Earth inside that sliver of latitude, the entire ring of the planet at that height, London and Madrid and a stretch of the Pacific sitting in the same band as Manhattan. Say thirty thousand rows fall in it. The index hands you all thirty thousand, and now you scan every one to test longitude, because the index has nothing left to prune with. You wanted dozens of rows. You touched tens of thousands. An R-tree or a grid restricts to the actual kilometer-wide box and returns the dozens directly, roughly a thousandfold fewer rows off the same data.
+
+The reason is not a missing feature. It is geometry. There is no total order on the plane that keeps nearby points nearby in key space. Sort by latitude then longitude and the point one row north of you, a few meters away, can sit billions of entries from you in the sorted order, because between your latitude and its latitude lies the full longitude span of the world. Any single-axis ordering tears the plane somewhere, and "near me" is precisely the query that lands on the tear. This is the load-bearing fact for everything below, and it is why a composite `(lat, lng)` index giving you spatial search is the first misconception to kill. It prunes one axis and scans the band. It cannot prune a box.
+
+Two families of structure exist to fix this, and they fix it in opposite ways.
+
+## Group the regions: the R-tree
+
+The first idea is to stop indexing points and start indexing regions.
+
+Group nearby objects together, and for each group store the smallest axis-aligned rectangle that encloses all of them. That rectangle is the **minimum bounding rectangle**, the MBR, and it is the only thing the index reasons about. Group the groups the same way, recursively, and you get a height-balanced tree where each node holds a handful of MBRs, each MBR wrapping everything beneath it. Andrew Guttman described exactly this in 1984, in the paper that named the structure. Leaf entries are `(MBR, tuple-id)` pairs pointing at real rows; internal entries are `(MBR, child-pointer)` pairs pointing at subtrees; and every node except the root holds between `m` and `M` entries, with `m` no more than half of `M`, which keeps the tree balanced and the leaves reasonably full.
+
+The query is where the payoff lands. To find everything in a box, start at the root and, for each MBR, ask one cheap question: does this rectangle intersect my query box? If it does not, the entire subtree beneath it is pruned, untouched, however many million objects it holds. If it does, you descend. A range query becomes a walk down only the branches whose territory overlaps yours, and whole continents fall away without a single point inside them being inspected. The PostGIS docs call the structure self-tuning, automatically handling variable data density, differing object overlap, and varying object size, which is the practical reason it became the default rather than a textbook curiosity.
+
+And here is the quiet superpower the grids cannot match: the R-tree does not care what shape the MBR wraps. A point, a road, a river, a delivery polygon, a flight path. They all reduce to a bounding box, so one structure indexes all of them and answers real geometric predicates over them. The moment your problem involves *extents* rather than just points, the R-tree stops being optional.
+
+If you have read [the database mindmap](/blog/database-mindmap), file the R-tree next to the B-tree, not against it. The B-tree orders one dimension; the R-tree bounds two. They answer different questions, and a serious system often runs both.
+
+## Overlap is the whole game
+
+Now the villain. The reason the R-tree section is a story and not a feature list is one word: overlap.
+
+Nothing forces those bounding rectangles to be disjoint. When you insert a point and the leaf that should hold it is full, the node splits, and the splitting algorithm decides which entries go where. Split well and the two resulting MBRs barely touch. Split badly and they overlap heavily, two rectangles claiming the same territory. The cost lands at query time and it is brutal: a point in the overlapping region falls inside *both* MBRs, so the search cannot choose and must descend both subtrees. Overlap turns one path into many, and pruning, the entire reason the tree exists, quietly stops working.
+
+This is the misconception worth burning down. People assume an R-tree is "a B-tree in two dimensions," with the same clean property that one lookup follows one path. It is not. A B+-tree's key ranges are disjoint by construction, so a point lookup is always a single root-to-leaf walk. An R-tree's MBRs can and do overlap, and a single point query may legitimately visit several subtrees. Overlap is not a rare edge case to be handled later. It is the defining weakness, and the quality of your splits is the quality of your index.
+
+So the split algorithm *is* the index, and Guttman gave three. The optimal one tries every grouping and is exponential, theory only. The **quadratic** split, the one most implementations use, runs in `O(M^2)`: its PickSeeds heuristic finds the pair of entries that would waste the most area if forced into one rectangle, seeds the two new nodes with them, then assigns the rest. The **linear** split is `O(M)`, cheaper to build but sloppier and higher-overlap. That is the first real tradeoff a spatial system hands you: spend at build time for tighter rectangles and faster queries, or build fast and pay at every read. It is a [read-versus-write decision](/blog/lsm-tree-vs-btree), the same axis that separates LSM-trees from B-trees, applied to geometry instead of write amplification.
+
+## The R*-tree, and what it pays for the fix
+
+If overlap is the disease, the R*-tree is the most-used cure, and it is worth knowing exactly what it changes and what that costs.
+
+Beckmann and colleagues published it in 1990 with a sharper split. Where the plain R-tree minimizes one quantity, area, the R*-tree minimizes three at once: area, the **margin** (the perimeter, which favors square-ish rectangles over long thin slivers that overlap everything they pass), and **overlap** itself, directly. Squarer, tighter, less-overlapping rectangles mean fewer multi-path descents, the failure mode you actually care about.
+
+Its second trick is the clever one. When a node overflows, instead of immediately splitting, the R*-tree pulls a fraction of the entries out and reinserts them from the top. This **forced reinsertion** gives entries that were placed early, when the tree's shape was still forming, a chance to find a better home as the structure matures. The combined payoff is large for read-heavy work: depending on the variant compared, the R*-tree does on the order of thirty to fifty percent fewer disk accesses on range queries.
+
+Nothing is free. Reinsertion and three-way optimization make inserts more expensive, so you pay at build time for a structure that reads faster. The decision rule falls straight out of that. Read-heavy, batch-loaded or rarely updated, lots of range queries: pay it, take the R*-tree. Write-heavy and churning constantly: the build cost may outweigh the query win, and a plain R-tree, or a different structure entirely, can be the better call.
+
+Two variants round out the family. The **R+-tree** kills overlap by clipping boundary-spanning objects across multiple leaves, restoring single-path point queries at the cost of duplication. And when data arrives in bulk, **Sort-Tile-Recursive packing** builds a near-optimal, densely filled tree in one pass; dynamic-insertion overlap on a dataset you could have bulk-loaded is a self-inflicted wound.
+
+## PostGIS, where the theory meets a real database
+
+All of this stops being abstract the moment you open PostGIS, the extension that turns PostgreSQL into a serious geospatial engine. It is the cleanest place to watch an R-tree earn its keep, and it carries two details that overturn what most people assume is happening.
+
+The first: PostGIS does not index your geometries. It indexes their bounding boxes. Those boxes live inside PostgreSQL's **GiST** framework, the Generalized Search Tree, an extensible balanced-tree skeleton where the default opclass for a geometry type *is* an R-tree. So GiST and R-tree are not competing index types in Postgres: GiST is the framework, the R-tree is what the geometry opclass builds on it. Postgres once shipped a literal `rtree` access method, and removed it because GiST superseded it.
+
+The second, and the one that changes how you reason about performance: every spatial query runs in **two passes**.
+
+```sql
+CREATE INDEX nyc_census_blocks_geom_idx
+  ON nyc_census_blocks USING GIST (geom);
+```
+
+The **primary filter** walks the GiST index using the `&&` operator, which asks only "do these bounding boxes overlap or touch." Fast, approximate, and it returns a candidate set, every row whose box could possibly match. Then the **secondary filter**, the real computational-geometry predicate like `ST_Intersects` or `ST_DWithin`, runs the exact, expensive math, but only on those candidates. Cheap-and-approximate to shrink the field, exact-and-costly to confirm the survivors. This filter-and-refine shape is the pattern under nearly every approximate-then-exact spatial query, and missing it is why people expect the index to do work it never does. The index never touches the polygon. It touches the box and hands the polygon to the verifier.
+
+The workshop measures it: a query that ran 300 ms as a sequential scan, exact predicate on every row, dropped to 50 ms with the GiST index, roughly six times faster, and the bigger the table the bigger the relative win, because the sequential scan grows with the table while the candidate set does not.
+
+Nearest-neighbor deserves its own note, because it is a separate algorithm wearing the same syntax. Range search is native to the R-tree; "the 20 closest things" is not. PostGIS exposes it through the `<->` KNN distance operator, `ORDER BY geom <-> ST_Point(-74.0, 40.7) LIMIT 20`, which runs a best-first, branch-and-bound traversal with a priority queue that prunes by minimum possible distance. Convenient to call, genuinely different machinery underneath, the same way the patterns in [the system design interview framework](/blog/system-design-interview-framework) reward knowing what the convenient API is actually doing.
+
+PostGIS also ships alternatives for when the R-tree is the wrong tool. **SP-GiST** is space-partitioned, backing quadtrees and k-d trees, structures whose partitions never overlap. **BRIN**, the block-range index, is tiny and shines in one situation: rows physically clustered on disk by location, like append-only sensor data sorted by region, where a minuscule index storing the min and max per block range beats an R-tree that would be overkill. Crunchy Data's writeup on the many spatial indexes of PostGIS is the canonical map of which wins when.
+
+## The other family: draw the grid first
+
+Now the opposite idea, the one that powers more "find nearby restaurants" features than the R-tree ever has.
+
+Instead of grouping objects into rectangles that might overlap, impose a fixed, hierarchical, non-overlapping grid on the world up front. Give every cell an ID whose prefix encodes its ancestry, so a longer shared prefix means a smaller shared region, and "near me" reduces to "same cell, plus the neighboring cells." The trick that makes it fast is the **space-filling curve**: thread one continuous line through every cell so two-dimensional position collapses to a one-dimensional number, and nearby cells tend to get nearby numbers. The instant cell IDs preserve locality, a plain B-tree, or a key-value store's sorted keyspace, can serve spatial range scans again. The structure that failed at the top of this piece suddenly works, because you changed the key, not the tree.
+
+**Geohash** is the canonical version, invented in 2008 by Gustavo Niemeyer. It encodes a point in base32, using the alphabet `0123456789bcdefghjkmnpqrstuvwxyz`, deliberately dropping `a`, `i`, `l`, and `o` to avoid ambiguous characters. Each character is five bits, the bits alternate between longitude and latitude, and that interleave is exactly a **Z-order**, or Morton, code. Precision is just length:
+
+| Geohash length | Cell error (±) | Approx cell size |
+| --- | --- | --- |
+| 5 chars | ±2.4 km | ~4.9 × 4.9 km |
+| 6 chars | ±0.61 km | ~1.2 × 0.6 km |
+| 7 chars | ±76 m | ~153 × 153 m |
+| 8 chars | ±19 m | ~38 × 19 m |
+| 9 chars | ±4.8 m | ~4.8 × 4.8 m |
+
+Drop a `geohash` column, index it as an ordinary string, and proximity search looks like `WHERE geohash LIKE 'dr5ru%'`. No spatial extension, no R-tree, no GiST. It shards trivially because the IDs are just strings, survives across services and languages because everyone agrees what `dr5ru` means, and rolls up for analytics by truncating to a shorter prefix. That portability is why it shows up everywhere from caches to columnar warehouses.
+
+## The boundary bug that quietly drops half your neighbors
+
+Geohash has a flaw that demos never surface and production always does, and it is worth seeing in full because the same shape recurs in every grid.
+
+Take two points five meters apart, straddling a cell edge. They can share *zero* prefix characters. Wikipedia states it plainly: two close locations on opposite sides of the Equator, or the Greenwich meridian, will not share a long common prefix, and locations near each other across the 180th meridian produce geohashes with no common prefix at all. The consequence is unforgiving. A naive `LIKE 'prefix%'` search silently misses every neighbor sitting across a cell boundary from you, and boundaries are everywhere, so you lose a chunk of your true neighbors at every edge with no error, no warning, just quietly wrong results.
+
+This kills a tempting piece of intuition. "Longer common prefix means closer" is true. The converse, "no common prefix means far," is false, and code that assumes it is broken. The fix is to query nine cells, not one: compute the geohash's eight adjacent cells and search all nine prefixes together (Solr does exactly this). The cause traces back to the Z-order curve, which makes long jumps, two cells touching on the map can sit far apart on the curve, so the curve cuts a seam down every boundary. That seam is the bug, and it is exactly why Google's S2 chose a different curve.
+
+## S2 and H3: the two grids the giants ship
+
+Two production-grade grid systems are worth knowing by name, because they sit on opposite sides of a real tradeoff.
+
+**S2**, from Google, fixes the seam by swapping the curve. It projects the six faces of a cube onto the sphere, recursively quarters each face through 31 levels, and orders the cells along a **Hilbert curve** instead of Z-order. The Hilbert curve makes no long jumps: cells adjacent on the sphere stay adjacent on the curve, so geohash's boundary discontinuity is sharply reduced. Each cell becomes a 64-bit `S2CellId`, close IDs meaning close cells, and at level 30 there are about `6.9 × 10^18` leaf cells roughly a centimeter across. Because the squares nest perfectly, a region like Hawaii can be approximated by an `S2RegionCoverer` with as few as 22 mixed-level cells, which makes S2 outstanding at coverings and clean range scans.
+
+**H3**, from Uber, makes the opposite bet: it optimizes the shape of the cell. It tiles the world in hexagons on an icosahedron base, 122 base cells at resolution 0, and runs 16 resolutions down to sub-square-meter cells, each a 64-bit `H3Index` whose parent is a few bitwise operations away. The reason for hexagons is the cleanest argument in this whole space. On a square grid a cell has eight neighbors at *two* distances: four edge-neighbors at distance `d`, four corner-neighbors at `d√2`, about 1.41 times farther. "Within one ring" is lopsided, and any movement analysis inherits a diagonal bias. On a hex grid every cell has exactly six neighbors, all sharing an edge, all the same distance away, so adjacency is a single uniform notion and gradients stay smooth. That is why Uber built H3 for flow and movement, with neighbor queries on a clean `k-ring`, and why it maps so directly onto [designing Uber](/blog/design-uber), where bucketing riders and drivers into cells and scanning the ring is the core of the match.
+
+Hexagons charge a price. You cannot tile a sphere with hexagons alone, a topological fact, so H3 carries exactly 12 pentagons at every resolution, sitting at the icosahedron's vertices, which every algorithm must special-case. And a hexagon cannot be subdivided into smaller hexagons exactly, so under H3's aperture-7 scheme, each child about one-seventh its parent's area, the seven children only *approximately* cover the parent. Containment is not perfectly hierarchical, and code that assumes area is conserved exactly across resolutions is wrong. S2's squares nest perfectly, which is exactly what makes S2's set math clean and H3's only approximate.
+
+So the split is about workload, not quality. S2's squares and perfect nesting win for coverings, containment math, and range scans; H3's hexagons and uniform adjacency win for movement, flow, and ring queries. A senior engineer picks by the question, not the logo.
+
+## So which one, actually
+
+Here is the decision the whole piece has been circling, stated as a rule rather than a preference.
+
+Reach for **PostGIS and GiST** when you index *extents*: polygons, lines, delivery zones, anything with real shape. When you need exact geometric predicates, does this road cross this district, is this point inside this fence. And when you join spatially inside transactions, mixing geometry with the rest of your relational data under ACID guarantees. The R-tree bounds arbitrary shapes and the two-pass filter confirms them exactly, and nothing else gives you that with a transactional join.
+
+Reach for a **geohash or H3 column** when you have *points*, billions of them, and need to shard horizontally, tolerate approximate proximity, and roll up for analytics. Locality-preserving IDs mean a plain ordered index or a KV store's sorted keyspace serves your range scans, the column travels across every service that touches it, and it shards on a string with zero coordination. For point data specifically, a well-chosen grid frequently *beats* an R-tree in practice on insert throughput, cache behavior, and shardability, precisely because the ID partitions for free where the tree demands a shared, coordinated structure.
+
+The honest summary: most "find nearby" systems are points-on-a-grid problems wearing an R-tree costume in the demo and a geohash or H3 column in production. The pattern that ships is a hybrid: pre-bucket points into a grid column for cheap, shardable, coarse candidate selection, then run the exact distance filter in app code or in PostGIS. The grid is the index; the geometry engine is the verifier. Same filter-and-refine shape as the PostGIS two-pass, split across two systems.
+
+Two boundaries keep you off the wrong tool. R-trees degrade sharply past roughly 10 to 15 dimensions, where MBRs overlap nearly everything and pruning collapses, the curse of dimensionality. Geography lives at two or three dimensions, the safe zone, but do not carry this instinct into high-dimensional similarity search. The nearest-neighbor query over a thousand-dimensional embedding is a different toolbox entirely, the structures behind [vector databases](/blog/vector-databases) like HNSW and IVF, not an R-tree. And the same way [picking a consistency model](/blog/cap-pacelc-consistency-spectrum) is a workload decision rather than a hunt for the objectively best one, picking a spatial index is choosing the structure that fits the question you are actually asking, not the most elegant one on the page.
+
+The B-tree was never wrong. It answered a one-dimensional question with total confidence, and the plane is not one-dimensional. Once you see that the plane has no sort order that keeps neighbors together, every structure here reads as a different answer to the same problem: the R-tree bounds regions and verifies them exactly, the grid relabels space with a locality-preserving ID so the old sorted index works again. Pick by the failure mode you can live with, overlap and split cost on one side, boundary fuzziness on the other, and you will have made the call the way a staff engineer makes it, by which structure fits the question instead of which one wins on paper.
+
+## FAQ
+
+<FAQ />

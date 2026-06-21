@@ -1,25 +1,40 @@
-import React, { useState } from 'react';
+import { Link } from 'react-router-dom';
 import useMediumBlogs from '@/hooks/useMediumBlogs';
 import SectionLabel from '@/components/atoms/SectionLabel';
 import ExternalLink from '@/components/atoms/ExternalLink';
-import ExpandableEntry from '@/components/molecules/ExpandableEntry';
-import BlogList from '@/components/molecules/BlogList';
+import { blogPostsByDate } from '@/content/blog/registry';
 import './Blogs.css';
 
+function formatPostDate(iso) {
+    if (!iso) return 'LATEST';
+    const d = new Date(`${iso}T00:00:00`);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+// On-domain MDX posts surfaced ahead of the Medium feed so the canonical
+// (naqeebali.me) versions are what readers and crawlers land on.
+const onDomainPosts = blogPostsByDate.map((m) => ({
+    title: m.meta.title,
+    description: m.meta.description,
+    url: `/blog/${m.meta.slug}`,
+    date: formatPostDate(m.meta.datePublished),
+    internal: true,
+}));
+
 const Blogs = ({ blogData }) => {
-    const [expanded, setExpanded] = useState(false);
     const { blogs, isLoading, error } = useMediumBlogs(
         blogData.displayMediumBlogs === "true" ? 'naqeebali-shamsi' : null
     );
 
     if (!blogData.display) return null;
 
-    const displayBlogs = blogData.displayMediumBlogs === "true"
+    const mediumPosts = blogData.displayMediumBlogs === "true"
         ? (isLoading ? blogData.blogs : blogs)
         : blogData.blogs;
+    const displayBlogs = [...onDomainPosts, ...mediumPosts];
 
     const featured = displayBlogs.slice(0, 2);
-    const rest = displayBlogs.slice(2);
 
     return (
         <section className="blogs" id="blogs">
@@ -48,35 +63,29 @@ const Blogs = ({ blogData }) => {
                         </div>
                         <h3>{blog.title}</h3>
                         <p>{blog.description}</p>
-                        <ExternalLink
-                            href={blog.url}
-                            className="blog-link"
-                            arrow="→"
-                        >
-                            Read More
-                        </ExternalLink>
+                        {blog.internal ? (
+                            <Link to={blog.url} className="blog-link">
+                                Read More<span className="link-arrow">→</span>
+                            </Link>
+                        ) : (
+                            <ExternalLink
+                                href={blog.url}
+                                className="blog-link"
+                                arrow="→"
+                            >
+                                Read More
+                            </ExternalLink>
+                        )}
                     </div>
                 ))}
             </div>
 
-            {rest.length > 0 && (
-                <div className="blogs-archive">
-                    <ExpandableEntry
-                        isOpen={expanded}
-                        onToggle={() => setExpanded(!expanded)}
-                        trigger={
-                            <button className="blogs-archive__toggle" type="button">
-                                <span>View all posts ({displayBlogs.length})</span>
-                                <span className={`blogs-archive__chevron ${expanded ? 'blogs-archive__chevron--open' : ''}`}>
-                                    &#9660;
-                                </span>
-                            </button>
-                        }
-                    >
-                        <BlogList blogs={rest} />
-                    </ExpandableEntry>
-                </div>
-            )}
+            <div className="blogs-archive">
+                <Link to="/blog" className="blogs-archive__toggle">
+                    <span>View all posts</span>
+                    <span className="link-arrow">→</span>
+                </Link>
+            </div>
         </section>
     );
 };

@@ -1,0 +1,217 @@
+export const meta = {
+  slug: 'threat-modeling',
+  title: 'Threat Modeling for System Design: The Security Pass a Senior Runs',
+  description:
+    "Threat modeling finds design holes before an attacker does. The four-question frame, STRIDE against a data-flow diagram, a threat-to-defense map, and the LLM threats STRIDE misses.",
+  headline: 'Threat Modeling for System Design: The Security Pass a Senior Runs',
+  deck: 'Most security work happens after the breach. Threat modeling is the half hour at the whiteboard that moves the fight earlier, before any code exists to attack.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['security', 'threat-modeling', 'stride', 'system-design', 'owasp', 'llm-security'],
+  faq: [
+    {
+      q: 'What is threat modeling in one sentence?',
+      a: "Threat modeling is a structured walk through a design that answers four questions: what are we building, what can go wrong, what are we going to do about it, and did we do a good enough job. It is a design-review activity done by the people building the system, not a separate audit run by a security team at the end. STRIDE, attack trees, and the OWASP Top 10 are interchangeable tools you plug into the second question.",
+    },
+    {
+      q: 'What does STRIDE stand for and when do you use it?',
+      a: "STRIDE is six threat categories: Spoofing, Tampering, Repudiation, Information disclosure, Denial of service, and Elevation of privilege. Each is one of the six security properties (authentication, integrity, non-repudiation, confidentiality, availability, authorization) read as its failure mode. You apply it per element of a data-flow diagram: external entities get spoofing and repudiation, data flows and stores get tampering, information disclosure, and denial of service, and processes are susceptible to all six.",
+    },
+    {
+      q: 'Where do threats concentrate in a system design?',
+      a: "At trust boundaries, the lines on the diagram where control changes hands and you stop trusting what is on the other side. A senior draws those boundaries first, between the client and your server, between two microservices, between tenants in a multi-tenant system, between your app and its own database role, and hunts for threats at the crossings rather than spread evenly across every box.",
+    },
+    {
+      q: 'Why does STRIDE miss LLM threats like prompt injection?',
+      a: "STRIDE inspects each component in isolation, but a language model processes instructions and data in the same channel with no separation between them, so untrusted input can become a privileged instruction. An attack like EchoLeak, the 2025 zero-click prompt injection in Microsoft 365 Copilot, passes a per-component STRIDE pass because every box looks fine on its own. You catch it only by modeling the attack path across components, and by reaching for an AI-specific frame like the OWASP Top 10 for LLM Applications or MAESTRO.",
+    },
+    {
+      q: 'Is threat modeling a separate security audit?',
+      a: "No, and treating it as one is the most common way teams get it wrong. The output of an audit is a report. The output of threat modeling is changed design and a list of mitigations tracked as requirements you can actually build. It lives in the design review, takes thirty to sixty minutes, gets checked into source control next to the code, and is revisited on every significant design change.",
+    },
+  ],
+}
+
+Every design you draw is a claim about who is allowed to do what. The boxes trust each other, the arrows carry data nobody tampers with, the database only answers questions it should. Threat modeling is the half hour where you stop believing that claim and start testing it, before there is any running code for an attacker to test it for you.
+
+The friction is that most teams reach for security in the wrong order. They ship, then they pen-test, then they patch the holes the pen-test found, then they get breached through the one it missed. Each step happens after the design has hardened into code, which is exactly when fixing a structural flaw is most expensive. The thing that runs first, and costs almost nothing, is a whiteboard and four questions.
+
+This piece is about those four questions, the checklist that makes the second one finite instead of infinite, the map from each threat to its defense, and the senior moves that turn the whole exercise from an audit you dread into a habit you barely notice. It closes on the place this method goes blind: the language model in your architecture that STRIDE was never built to reason about.
+
+## The four questions, and why the wording is load-bearing
+
+Adam Shostack's frame is four questions, and people skim past how carefully they are phrased. The current canonical wording:
+
+1. What are we working on?
+2. What can go wrong?
+3. What are we going to do about it?
+4. Did we do a good job?
+
+Read them again and notice the word choices, because each one is a correction of a way teams get this wrong. It is **we**, not you, because the moment security becomes an interrogation the engineers who understand the system stop volunteering what scares them. Question three asks what we **are** going to do, not what we should do, because a list of hypothetical mitigations nobody commits to is theater. And it is **working on**, not building, deliberately, to kill the assumption that this is a one-time gate at the start of a project. You threat-model the design you have today, again when it changes, not once at a milestone called "build."
+
+Question four hides the sharpest point. The real question is whether you did a good *enough* job, and Shostack's own gloss on it is the line worth pinning to the wall: the goal is not to do a good job at threat modeling, it is to drive improvement to a system. A perfect document that changes nothing failed. A rough one that closed a real hole succeeded.
+
+This frame is the reason the field is navigable at all. OWASP maps its four-phase process onto these same questions. Microsoft maps its tooling onto them. STRIDE, DREAD, attack trees, PASTA, LINDDUN are interchangeable answers to question two, and anyone who tells you their method is the only correct one is, in the words of the people who built STRIDE, mistaken. Learn the frame first. The tools plug into it.
+
+## What can go wrong, made finite
+
+The second question is where junior work falls apart, because "what can go wrong" sounds like infinite brainstorming and infinite brainstorming produces a list of attacks somebody saw on the news, not the holes in this design. STRIDE exists to make the question finite and auditable.
+
+The trick is that STRIDE is not really a list of attacks. It is the six security properties read as their failure modes:
+
+| Threat | Property it violates | What it means |
+| --- | --- | --- |
+| **S**poofing | Authentication | Pretending to be someone or something you are not |
+| **T**ampering | Integrity | Modifying data in storage or in transit |
+| **R**epudiation | Non-repudiation | Denying you did a thing, with no proof you did |
+| **I**nformation disclosure | Confidentiality | Exposing data to people not allowed to see it |
+| **D**enial of service | Availability | Making the system unusable for valid users |
+| **E**levation of privilege | Authorization | Gaining access you were never granted |
+
+That mapping is why STRIDE is complete enough to trust. It is the negative space of the properties any secure system needs. Confidentiality, integrity, availability, authentication, authorization, non-repudiation, the whole CIA-plus-AAA set, each flipped into the way it breaks. If you have an answer for all six, you have not proven the system is secure, but you have covered every category of thing that could make it insecure.
+
+## Draw the diagram first, and get it right
+
+Before STRIDE has anything to chew on, you need a picture, and the picture is not your architecture slide with the nice icons. It is a data-flow diagram: four shapes, drawn honestly.
+
+```
+  [External entity]  ----data flow---->  ( Process )  ----> [ Data store ]
+   user, 3rd party        the arrow         your code          DB, cache,
+   (rectangle)         (network call)        (circle)         queue (lines)
+```
+
+External entities are the things you do not control: users, third-party APIs. Processes are your code. Data stores are databases, caches, queues, files. Data flows are the arrows between them. That is the whole vocabulary, and the discipline that makes a senior's diagram different is that every data store has a reader and a writer. No data appears from nowhere. Nothing moves between two boxes without an arrow that says how. The rule Shostack teaches as a joke carries the weight: no psychokinesis as a data transport. If you cannot draw the arrow, you do not understand the system well enough to secure it.
+
+Then you draw the lines that matter most, the ones a junior leaves out entirely. A **trust boundary** is the place where control changes hands, where you stop trusting what is on the other side. The client-server line is the obvious one. The non-obvious ones are where the real work is: between two of your own microservices, between tenants in a multi-tenant database, between your application and the database role it connects as, between the main process and a sandboxed plugin. A junior draws one boundary at the firewall. A staff engineer draws them at every point where the level of trust steps down, and there are always more than you expect.
+
+The single most useful instinct in this whole method: threats concentrate where a data flow *crosses* a trust boundary. Your eye goes to the dotted lines first. Everything inside a boundary you mostly trust. Every arrow that pierces one is a place an attacker gets a vote. The 2006 Microsoft team that formalized this had a brutal move for the client side, model it as nothing but external entities you do not control, because that reflects the truth that an attacker is free to do whatever they choose with anything running on their machine.
+
+## STRIDE per element, not STRIDE as a vibe
+
+Here is where the method earns its keep, and where most people misuse it. You do not stand at the whiteboard and ask all six STRIDE questions about the whole system as a general feeling. You ask each element the threats that element type is actually susceptible to. The susceptibility is not uniform, and that asymmetry is the entire efficiency of the approach:
+
+| DFD element | S | T | R | I | D | E |
+| --- | :-: | :-: | :-: | :-: | :-: | :-: |
+| External entity (user, 3rd party) | x | | x | | | |
+| Process (your service) | x | x | x | x | x | x |
+| Data store (DB, cache, queue) | | x | x | x | x | |
+| Data flow (network call) | | x | | x | x | |
+
+Read the table and the shape of the work appears. An external entity can be spoofed and can repudiate, so those are the two questions you ask it. A data flow can be tampered with, read, or flooded, so it gets tampering, information disclosure, and denial of service. A data store adds repudiation when it is a log or audit store, because a tampered log is how someone denies what they did. And the process, your code, is the most sensitive element on the board, susceptible to all six, because it is the thing that holds privilege and makes decisions.
+
+That asymmetry is what turns "what can go wrong" from infinite into countable. A seven-element diagram does not generate forty-two questions. It generates the twenty or so that the element types actually warrant, and you can walk every one of them out loud in a meeting and check it off. This is the difference between threat modeling that finishes and threat modeling that gets abandoned because it felt boundless.
+
+## The decoder ring: every threat maps to a defense
+
+The reason this is a *design* activity and not an anxiety exercise is that each STRIDE category points straight at the class of control that answers it. Microsoft's own framing is that recasting the threat list in terms of available technology tells you what mitigations you need. The map:
+
+| Threat | The defense class | Concrete moves |
+| --- | --- | --- |
+| Spoofing | Authentication | Passwords to MFA, mutual TLS, signed tokens, service identity |
+| Tampering | Integrity | Hashes and signatures, anti-replay nonces and counters, TLS, input validation |
+| Repudiation | Audit | Append-only, time-stamped, tamper-evident logs; signed receipts |
+| Information disclosure | Encryption + authZ | TLS in transit, encryption at rest, least-disclosure responses |
+| Denial of service | Availability | Rate limiting, quotas, timeouts, load shedding, autoscaling |
+| Elevation of privilege | Authorization | Least privilege, RBAC and ABAC, sandboxing, input validation against injection |
+
+This is the column that connects threat modeling to the rest of how a system gets built. Spoofing is the question that the whole machinery of the [auth deep dive](/blog/auth-deep-dive) exists to answer, and the spot to decide between session tokens and signed JWTs is right here, when you have named the threat instead of after a library picked for you. Denial of service is what the [rate limiter](/blog/rate-limiter) and the [API gateway](/blog/api-gateway) are for, and threat modeling is where you discover which flows need a quota before a traffic spike discovers it for you. The defenses are not new inventions. They are the components you already know how to build, pulled in at the moment the design tells you which one a given arrow needs.
+
+Two of these rows deserve a closer look, because they are the ones teams skip.
+
+Repudiation is the forgotten letter. Most teams quietly drop the R, because "someone denies they did it" feels like a lawyer's problem, not an engineer's. It is an engineer's problem the first time a customer disputes a charge and your logs cannot prove what happened. The defense is append-only, tamper-evident audit logging, and notice the dependency that chains two STRIDE categories together: if your audit log can be tampered with, which is a tampering threat on a data store, then it cannot defeat repudiation, because a forged log proves nothing. STRIDE threats are not independent. They feed each other, and a senior tracks the chain to the root instead of patching each downstream symptom.
+
+Elevation of privilege is the one that shows up most in the wild. In the OWASP Top 10 for 2021, Broken Access Control moved to the number one position, with more occurrences in the analyzed data than any other category, and it held that top spot in the 2025 edition built from analysis of over a hundred and seventy-five thousand CVE records. Broken Access Control is Elevation of Privilege wearing a production hat. It is the IDOR where changing an ID in the URL returns someone else's record, the missing object-level authorization check, the admin endpoint with no role gate. The mitigation is least privilege and total mediation, check every access every time, and the place to design that in is the threat-modeling pass on your process element, not the incident review six months later.
+
+## A worked pass, fast enough to fit in a meeting
+
+Take an ordinary design. A user hits an API gateway over HTTPS, the gateway calls a service, the service reads and writes Postgres, caches in Redis, and calls a third-party payment API across a trust boundary.
+
+```
+ [User] --HTTPS--> (API Gateway) --> (Service) --> [Postgres]
+                                          |   \
+                                          |    --> [Redis]
+                                  - - - - | - - - - - - - - -  trust boundary
+                                          v
+                                  [Payment API]
+```
+
+Walk it element by element, asking only the threats each one warrants.
+
+The user is an external entity, so spoofing and repudiation. Spoofing is credential stuffing, and the defense is MFA. Repudiation is a disputed purchase, and the defense is a signed audit log of what they did.
+
+The flow from user to gateway crosses into your system, so tampering, information disclosure, denial of service. Tampering and disclosure in transit are answered by TLS. Denial of service is answered by rate limiting at the gateway and a WAF in front.
+
+The service is a process, so all six, and the loud one is elevation of privilege. SQL injection and IDOR both live here, and they map to parameterized queries, role-based access control, and object-level authorization checks on every read. This is the row that becomes a Broken Access Control headline if you skip it.
+
+Postgres is a data store, so tampering, information disclosure, denial of service. The answers are encryption at rest, a least-privilege database role so a compromised service cannot drop tables, and backups so a destructive write is recoverable.
+
+The whole pass is twenty minutes. The output is not a feeling that the system is "pretty secure." It is a short table with a row per threat, a named defense, and a status, the kind of artifact a reviewer can actually sign off:
+
+| Element | Threat | Defense | Status |
+| --- | --- | --- | --- |
+| Service | EoP via IDOR | Object-level authZ check | Needs work |
+| User to Gateway | DoS | Rate limit + WAF | Mitigated |
+| Postgres | Info disclosure | Encryption at rest | Mitigated |
+| User | Repudiation | Signed audit log | Not started |
+
+That table is the deliverable. Not a report about the system. A list of changes to the design, tracked like any other work.
+
+## The non-obvious threat that justifies the whole exercise
+
+Per-element STRIDE tells you a tampering threat exists on a given flow. The payoff is what happens when you push on that and ask the leading questions a threat tree supplies: is this flow signed, is it MAC'd, does it carry an anti-replay defense like a timestamp or a counter?
+
+Microsoft's canonical example is a system where a sales force submits weekly numbers to a server for analysis. Walking the tampering threat on the submission flow surfaces something the problem statement never mentioned: a salesperson could submit the same set of numbers twice to inflate their totals and win the sales trip. Nobody designed that attack in. It fell out of asking, mechanically, whether the flow had anti-replay protection. The answer was no, and a replay attack appeared.
+
+That is the moment threat modeling pays for itself. The replay bug is the kind of thing that survives code review, survives the happy-path tests, and gets found in production by the person exploiting it. Idempotency and replay protection are not exotic, the same anti-replay discipline runs through [idempotent webhook handling](/blog/idempotent-webhooks), but you only know to apply it here because the structured pass forced the question. Brainstorming "what could an attacker do" never gets there. The checklist does.
+
+## Make it a design review, not a separate audit
+
+The most common way teams get threat modeling wrong is treating it as a security-team activity that happens at the end. That framing is wrong in a way the primary sources are unusually blunt about. OWASP says it should be a standard and necessary step, not an add-on, integrated into the normal development process. The Threat Modeling Manifesto values doing threat modeling over talking about it, and continuous refinement over a single delivery.
+
+The tell that you are doing it right is where the output lives. An audit produces a PDF that lands in someone's inbox and dies there. Threat modeling produces changed design and a list of mitigations checked into source control next to the code, revisited when the design changes. In Microsoft's own worked example, a product manager and a developer walk a diagram, a tester joins and finds the missed corner cases in about five minutes, and they commit the document to version control and keep building. Five minutes, because varied viewpoints catch what one person misses. The tester saw the edge cases precisely because testing edge cases is how their mind already works.
+
+This is also why a few anti-patterns are worth naming so you can catch yourself in them. The Hero Threat Modeler, one expert doing it alone, finds less than a mixed group. Admiration for the Problem, analyzing endlessly and fixing nothing, produces a beautiful threat list and a system no safer than before. Perfect Representation, refusing to start until the diagram is flawless, is how the whole exercise slips past the point where it could have changed anything. A good-enough diagram that surfaces a real threat beats a gorgeous one that ships late, every time.
+
+## Ranking, and why the math is mostly political
+
+Once you have a list of threats, the instinct is to rank them, and the textbook answer is likelihood times impact. OWASP says exactly that, the ranking should be the product of likelihood and impact, and then quietly admits practitioners fold in remediation effort, because a catastrophic threat that takes a year to fix gets triaged differently from a moderate one you can close this afternoon.
+
+You will see DREAD offered as a scoring system here: Damage, Reproducibility, Exploitability, Affected users, Discoverability, each rated one to ten and averaged. Damage eight, Reproducibility seven, Exploitability nine, Affected six, Discoverability eight gives you a 7.6, which looks precise and is not. Every input is a guess, two engineers will score the same threat differently, and Microsoft deprecated DREAD for exactly that subjectivity. Treat any such number as a conversation starter, not a measurement. For known vulnerabilities with public scores, lean on CVSS. For design-stage threats, a plain high-medium-low bar that the team argues about openly beats a decimal that launders a guess into false authority. A staff engineer does not over-fit the math. The ranking's job is to order the work, not to be correct to one decimal place.
+
+## Where STRIDE goes blind: the model in your architecture
+
+STRIDE was designed in 1999 for systems where instructions and data lived in separate channels. A language model breaks that assumption at the foundation, and that is why a per-component STRIDE pass walks right past the threats that actually take down AI features.
+
+The structural problem is simple and not yet solved by anyone: a model processes instructions and data in the same channel, with no separation between them. Untrusted input, a web page the model fetches, a PDF it summarizes, a support ticket it reads, can carry text that the model interprets as a privileged instruction. That is prompt injection, and it has been the number one entry on the OWASP Top 10 for LLM Applications for two editions running. STRIDE has no clean box for it. It looks like tampering on the instruction channel crossed with elevation of privilege, but the per-element pass that serves you so well for a database never asks the question, because each component, examined alone, looks fine.
+
+The cleanest way to see the failure is an attack path. EchoLeak, disclosed in 2025, was a zero-click data-exfiltration chain in Microsoft 365 Copilot. A crafted email sat in a mailbox. The user never clicked anything. When Copilot pulled that email into its context to do ordinary work, the embedded instructions redirected the model to gather sensitive data and leak it out. Run STRIDE on each component and every box passes: the mail store stores mail, the model processes text, the connector connects. The attack lives in the path that threads them together, not in any single node. As the framing goes, if you STRIDE each component, an EchoLeak-style attack looks compliant. If you STRIDE the attack path, it does not.
+
+So for AI systems the senior move is to model the path, the full chain from untrusted input through the model's context to whatever tool or output it can reach, and to bring a frame built for it. The OWASP Top 10 for LLM Applications names the threats STRIDE elides: Sensitive Information Disclosure, Excessive Agency from giving a model too much autonomous tool access, System Prompt Leakage, [embeddings](/blog/embeddings) and vector weaknesses in your retrieval layer, unbounded consumption. MAESTRO offers a seven-layer decomposition for agentic systems where the threats are intent misalignment and autonomous scope creep, things a data-flow diagram has no symbol for.
+
+And the defense for prompt injection is layered, because no single fix exists when instructions and data share a channel. Least-privilege tooling so a hijacked model can do little. Input and output filtering, knowing it is incomplete. Human-in-the-loop approval for high-risk actions. Adversarial testing before you ship. This is the same defense-in-depth posture that [AI guardrails](/blog/ai-guardrails) are built around, applied because the threat model told you the model is an untrusted-instruction sink the moment it reads anything you did not write. The plumbing around the model still gets a normal STRIDE pass. The model itself needs the attack-path lens, and pretending STRIDE covers it is how the EchoLeaks of your own system get built.
+
+## How to choose
+
+The method has a natural order, highest payoff first.
+
+| Question | The move | Why it is first |
+| --- | --- | --- |
+| What are we building? | Draw the data-flow diagram, every store with a reader and writer | STRIDE has nothing to analyze without it |
+| Where is trust lost? | Mark trust boundaries, including the ones inside the perimeter | Threats concentrate at the crossings |
+| What can go wrong? | STRIDE per element, not as a vibe | Turns infinite brainstorming into a countable list |
+| What do we do about it? | Map each threat to its defense class, track it as a requirement | A mitigation nobody builds is theater |
+| Did we do enough? | Mixed group reviews, measure by whether the system improved | The document is not the goal; the safer system is |
+| Is there a model in the loop? | STRIDE the attack path, add an AI-specific frame | Per-component STRIDE goes blind to prompt injection |
+
+None of this is exotic, and that is the point. What separates a design that survives contact with an attacker from one that looks fine in review is whether the unglamorous steps happened: the diagram got drawn honestly, the boundaries got marked, the six questions got asked of each element, and the mitigations became tracked work instead of good intentions. This same structured instinct shows up across the rest of system design, the [system design interview framework](/blog/system-design-interview-framework) rewards the candidate who names trust boundaries and failure modes out loud, and the staleness-budget reasoning in [event-driven RBAC](/blog/event-driven-rbac) is what authorization looks like once you have taken its threats seriously.
+
+## The honest landing
+
+You do not get to know every way your system will be attacked. New classes of threat arrive faster than any checklist absorbs them, the prompt-injection problem is two years old and still has no clean fix, and a sufficiently motivated attacker will find the seam you did not draw. Threat modeling does not promise security. It promises something narrower and more useful: that you spent thirty minutes thinking like the attacker before the attacker had to do it for you, and that the obvious holes, the missing authorization check, the unencrypted flow, the replay nobody guarded, got caught at the whiteboard where they cost a sentence to fix.
+
+Draw the diagram. Mark the boundaries. Ask the six questions of each element and write down the answers as work. Run the path, not just the box, anywhere a model can read what you did not write. Do that, and the design review absorbs the security pass instead of deferring it to an incident channel at 2 a.m. Skip it, and the first person to threat-model your system will be the one exploiting it, and they will not check their findings into your repo.
+
+## FAQ
+
+<FAQ />

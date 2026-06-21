@@ -1,0 +1,165 @@
+export const meta = {
+  slug: 'unique-id-generation',
+  title: 'Generating Unique IDs at Scale: UUIDs, Snowflake, and ULID',
+  description:
+    'Random UUIDs wreck index locality, sequential IDs leak your business, and one ID rarely fits both jobs. How to choose between UUIDv7, Snowflake, and ULID per workload.',
+  headline: 'Generating Unique IDs at Scale: UUIDs, Snowflake, and ULID',
+  deck: 'Picking an ID scheme is a three-way bet between coordination, sortability, and index locality, and no scheme wins all three.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['system-design', 'databases', 'distributed-systems', 'postgresql', 'uuid', 'scalability'],
+  faq: [
+    {
+      q: 'Why are random UUIDs bad for database performance?',
+      a: "A version-4 UUID is random, so each inserted row lands on a different leaf page of the primary-key B-tree. While the index fits in RAM that is tolerable. Once it exceeds the buffer pool, every insert becomes an IO-bound read-modify-write, because there is no hot page to keep cached. Percona measured this transition directly: random-key pages settle around 50% full versus roughly 90% for ordered keys, the table grows about 50% larger than an ordered-UUID equivalent, and worst-case comparisons run about 28 times slower than integers. Time-ordered IDs (UUIDv7, ULID, Snowflake) recover the locality because new keys cluster at the right edge of the index.",
+    },
+    {
+      q: 'What is the difference between UUIDv7 and ULID?',
+      a: "They share the core idea: 48 bits of millisecond timestamp in the most-significant position, so lexical sort equals chronological sort. The differences are real but small. ULID carries 80 random bits and encodes as a 26-character Crockford base32 string; UUIDv7 carries about 74 random bits after its version and variant nibbles and encodes as the familiar 36-character hex UUID. The deciding factor is usually ecosystem: UUIDv7 is an IETF standard (RFC 9562) with first-class database support, including a native uuidv7() function in PostgreSQL 18. ULID is a community spec. If your stack speaks UUID natively, v7 is the path of least resistance.",
+    },
+    {
+      q: 'Is a UUID secure to expose in a public URL?',
+      a: "Only a version-4 UUID, and even then only because of its 122 random bits. RFC 9562 is explicit that UUIDs must not be used as security capabilities. Time-ordered versions leak the record creation time by design, which is a correlation and privacy vector even when the ID itself is unguessable. Sequential integer IDs are worse: they invite enumeration (IDOR) and let an observer estimate your production volume from two timestamped samples, the German tank problem. If an ID is exposed, separate the internal sort key from the external identifier, or mask the timestamp with a technique like UUIDv47.",
+    },
+    {
+      q: 'When should I use Snowflake instead of a UUID?',
+      a: "Reach for Snowflake when you want a 64-bit ID (half the storage and index width of a 128-bit UUID), coordination-free generation across many nodes, and a worker or shard ID embedded in the value so a row self-describes which node owns it. That last property gives you routing without a lookup table, which is why Instagram, Discord, and Mastodon all ship Snowflake variants. The cost is a one-time worker-ID assignment at boot (Twitter used ZooKeeper) and a hard ceiling of 4,096 IDs per millisecond per machine before the generator must block for the next tick.",
+    },
+    {
+      q: 'What happens to time-ordered IDs when the server clock moves backward?',
+      a: "This is the failure mode people forget. UUIDv7, ULID, and Snowflake all trust the wall clock, and NTP corrections, leap-second handling, and VM live-migration can move it backward. A naive generator will then emit an ID that sorts before one it already produced, breaking monotonicity. The specifications give the rule: freeze the embedded counter and refuse to advance the stored timestamp until real time catches up, only bumping it forward on counter overflow. A staff-grade implementation asks how the system behaves under that backpressure rather than assuming the clock is sane.",
+    },
+  ],
+}
+
+Sign up for a service, place an order, and read the URL you land on: `/orders/154822`. Come back tomorrow, order again, and you are at `/orders/161203`. You just learned that this company processed about 6,381 orders in a day, and you did it with zero intrusion, no scraping, no leaked dashboard. Two numbers and a subtraction. That is the German tank problem in its simplest two-sample form, and the sequential integer in the URL handed it to you.
+
+That leak is one reason teams reach for something other than `AUTO_INCREMENT`. It is not the only reason, and the cure most people pick has a cost they discover three years later when inserts mysteriously slow to a crawl.
+
+Generating unique IDs looks like a solved problem until you generate them at scale. Then it turns into one of the cleanest examples of a real engineering tradeoff, where every choice you make to buy one property quietly sells another. This piece is about that tradeoff, the three schemes worth knowing (UUIDv7, Snowflake, ULID), and how a senior engineer decides between them per workload instead of reaching for one favorite. If you want the broader interview lens this sits inside, [the system design interview framework](/blog/system-design-interview-framework) frames where ID generation usually surfaces.
+
+## The thing the auto-increment column was quietly doing for you
+
+A `BIGINT` auto-increment primary key is the default for a reason. It is eight bytes, it is strictly increasing, and because every new key is larger than the last, every insert appends to the right-most leaf page of the B-tree. The database keeps that page hot in memory, and writes hit cache instead of disk. You get dense pages, tight indexes, and cheap inserts, for free, without thinking about it.
+
+It buys all of that with one assumption: that there is a single writer handing out the next number. The moment you have many writers, that assumption is the bill coming due.
+
+The first failure is coordination. A single sequence is a single source of truth, so every writer that wants an ID has to round-trip to it, or to the primary that owns it. At low volume you never notice. At high volume the sequence becomes a serialization point, every insert queuing behind the same counter. You sharded your database to spread load and then funneled all of it back through one number generator.
+
+The second failure is the leak you already saw. Sequential IDs are enumerable, and enumerable IDs are an attack surface. OWASP catalogs this as Insecure Direct Object Reference: if `/orders/154822` is yours, `/orders/154823` is somebody else's, and a missing authorization check turns a guess into a breach. Even with airtight authorization, the IDs still leak business intelligence, because anyone holding two of them can do the subtraction from the opening of this piece.
+
+So you go looking for an identifier that any node can mint without coordinating, that nobody can enumerate. The obvious answer is a UUID. The obvious answer is also where most teams walk straight into the second cost.
+
+## The index physics nobody warned you about
+
+Here is the move that sounds right and ages badly: swap the auto-increment key for a version-4 UUID. It is 128 bits of randomness, globally unique with no coordination, and impossible to enumerate. Three problems solved in one line of migration. Ship it.
+
+The problem is that randomness is exactly the property a B-tree index hates.
+
+Walk through what a random key does on insert. Because a v4 UUID is uniformly random, the next row is equally likely to belong on any leaf page in the index. There is no right edge to append to, no hot page to keep cached. Percona's benchmark on InnoDB states the mechanism plainly: with random UUIDs, "all b-tree leaf pages are susceptible to receive the new row, there are no hot pages." While the whole index fits in the buffer pool, you get away with it. The instant the index outgrows RAM, the curve breaks. Each insert now needs to read the target page from disk, modify it, and write it back, roughly two IO operations per row, and your throughput falls off a cliff that has nothing to do with CPU.
+
+The damage does not stop at insert speed. Random inserts scatter across pages that are already partially full, forcing the database to split pages mid-way to make room. Pages settle around 50% full instead of the 90% to 94% you get from ordered keys. Percona measured the fallout end to end: a random-UUID table runs almost 50% larger than an ordered-UUID table and about 30% larger than the BIGINT version, UUIDs and their indexes consumed roughly 70% of total storage in one schema, and UUID comparisons clocked about 28 times slower than integer comparisons in the worst case. The same dynamics play out on Postgres, where 8 KB pages split under random insertion and `fillfactor` becomes a knob you suddenly care about.
+
+Two corrections people make here, both right, both insufficient on their own.
+
+First, store the bytes, not the string. A UUID rendered as `CHAR(36)` triples the storage of the 16 raw bytes and drags every comparison through 36 characters instead of 16 bytes. Use `BINARY(16)` in MySQL or the native `uuid` type in Postgres. Storing UUIDs as text is the most common self-inflicted version of this wound.
+
+Second, and this is the real fix, stop using a random UUID as the key. The locality problem is caused by randomness in the high-order bits, so put time there instead. That single change is what UUIDv7 and ULID exist to do, and it is why "just use UUIDs" is only half an answer. The half that matters is which UUID.
+
+## Put the clock in front
+
+Every modern time-ordered ID is built on one idea: move a timestamp into the most-significant bits so that sorting the IDs sorts them by creation time. Lexical order becomes chronological order, and chronological order means new keys cluster at the right edge of the index, which hands you back the locality the auto-increment column was giving you all along.
+
+Three schemes implement this idea, and the differences are mostly about how many bits they spend and what else they pack in.
+
+```
+Snowflake (64 bits)
+| 0 | 41-bit timestamp (ms)        | 10-bit machine | 12-bit sequence |
+
+UUIDv7 (128 bits)
+| 48-bit timestamp (ms) | ver | 12-bit rand_a | var | 62-bit rand_b   |
+
+ULID (128 bits)
+| 48-bit timestamp (ms) | 80-bit randomness                          |
+```
+
+Read those three strips on the same axis and the family resemblance is obvious. The timestamp leads in all three. What follows the timestamp is the design decision.
+
+**Snowflake** spends only 64 bits, the same width as a BIGINT, which keeps your indexes half the size of any 128-bit scheme. Twitter built it in 2010 with three requirements: IDs had to be roughly sortable so tweets posted near the same time got nearby IDs, they had to fit 64 bits, and they had to be generated in an uncoordinated way. The layout is one sign bit, 41 bits of millisecond timestamp from a custom epoch, 10 bits of machine ID, and 12 bits of sequence. That gives 4,096 IDs per millisecond per machine, 1,024 machines, and about 69.7 years of timestamp headroom from the chosen epoch. The 10 machine bits are the quiet genius: the ID self-describes which node produced it, so you get routing without a lookup table. Worker numbers were handed out once at startup through ZooKeeper, and after that every node generates IDs entirely on its own, lock-free.
+
+**UUIDv7** is the standards-track answer, defined in RFC 9562 (May 2024), which obsoletes the old RFC 4122. Its layout is 48 bits of `unix_ts_ms`, a 4-bit version nibble, 12 bits of `rand_a`, a 2-bit variant, and 62 bits of `rand_b`, leaving roughly 74 random bits after the timestamp. Because it is a real IETF standard, the ecosystem support is the selling point: PostgreSQL 18 ships a native `uuidv7()` function, and MySQL 8 has had `UUID_TO_BIN(uuid, 1)` to reorder version-1 bytes into time order. The "generate in the app or in the database" debate has shifted now that the database can do it for you.
+
+**ULID** is the community spec that predates v7 and inspired much of it. It is 48 bits of millisecond timestamp plus 80 bits of randomness, encoded as 26 Crockford base32 characters (the alphabet drops I, L, O, and U to stay human-readable) against a UUID's 36 hex characters. More entropy than v7, a shorter and friendlier string, and a timestamp range valid until the year 10889. What it lacks is v7's first-class database and library standardization.
+
+The honest summary: UUIDv7 and ULID are close cousins, and the choice between them is usually an ecosystem decision rather than a technical one. If your stack already speaks UUID, v7 is the path of least friction. If you want compact human-readable strings in logs and URLs, ULID earns its place. Snowflake is the different animal, the one you choose when 64 bits and self-routing matter more than the convenience of a UUID.
+
+## "Sortable" is doing a lot of work in that sentence
+
+This is where shallow takes and staff-grade takes split, so it is worth slowing down.
+
+When people say UUIDv7 or Snowflake IDs are "sortable," they usually imagine the guarantee a single auto-increment counter gives you: every new ID is strictly greater than the last, with no exceptions. Distributed ID generators do not give you that. They give you something weaker and precisely defined, called k-sorted, or "roughly sorted" in Twitter's original phrasing.
+
+The distinction is about resolution. A single auto-increment sequence is strictly monotonic, but only within one writer. Snowflake, v7, and ULID across many nodes are k-sorted: IDs generated in different milliseconds always order correctly, but two IDs minted in the same millisecond on two different machines have no defined order relative to each other. Picture two generators emitting on a shared time axis. Between milliseconds, the ordering is exact. Within a single millisecond, the IDs interleave with no guarantee about which comes first. That is the visual definition of k-sorted, and it is the strongest ordering any coordination-free generator can honestly promise. Strict global ordering would require the generators to coordinate, which is the exact thing you adopted them to avoid.
+
+Within a single generator, you can tighten this back up to strict monotonicity, and the specs tell you how. RFC 9562 section 6.2 gives three methods for UUIDv7: a dedicated counter in the left of `rand_a`, a randomly-seeded counter incremented in the least-significant bits each tick, or substituting up to 12 bits of sub-millisecond clock precision for finer ordering down to about 244 nanoseconds. ULID's monotonic mode does the analogous thing, incrementing the random component by one bit (with carry) for each ID minted inside the same millisecond.
+
+And both specs answer the question a senior engineer asks next: what happens when that counter overflows? You cannot mint more than `2^80` ULIDs or roll a v7 counter past its width inside one millisecond. The rule is to freeze the counter and wait for the timestamp to advance. Zendesk's analysis of ULID's monotonic option quantifies exactly when this collision-or-overflow edge becomes real, and the answer is that it only bites if you burst an enormous number of IDs through one generator inside a single millisecond. For most systems it never triggers. The point is that you know the boundary and what the system does at it, rather than discovering it under load.
+
+This connects directly to a payoff that makes the whole exercise worthwhile. Because v7, ULID, and Snowflake all sort by time, `WHERE id > $last ORDER BY id LIMIT n` gives you stable keyset pagination and "newest first" for free. Instagram leaned on exactly this, dropping a separate `created_at` index because `ORDER BY id` already meant `ORDER BY created_at`. The ID is not just an identifier, it is your time-ordering, your cursor, and on Snowflake your shard router, all in one value. The same locality thinking shows up when you spread keys across nodes, which is the territory of [consistent hashing](/blog/consistent-hashing).
+
+## Snowflake is a budget, not a layout
+
+The most useful thing to internalize about Snowflake is that its 64-bit layout is not sacred. It is a budget you reallocate to fit your workload, and the famous variants prove it.
+
+Instagram's IDs are 41 bits of time, 13 bits of shard, and 10 bits of sequence, generated inside Postgres in PL/pgSQL. They spent bits on a shard ID because their architecture is sharded and they wanted every ID to name its own shard. Discord uses the standard 41-10-12 split with its own epoch of January 1, 2015. Mastodon went a different way entirely, 48 bits of timestamp and 16 bits of sequence, trading machine identification for a longer time range and more IDs per tick. Same 64-bit envelope, three different answers, each correct for the system that chose it.
+
+That is the senior move with Snowflake: decide what each segment is worth to you. More machine bits buy more concurrent generators. More sequence bits buy more IDs per millisecond before you have to block for the next tick. More timestamp bits buy more years before the epoch wraps. The arithmetic is concrete. Twelve sequence bits at 1,000 milliseconds per second is 4,096,000 IDs per second per machine, and across 1,024 machines that is about 4.19 billion IDs per second fleet-wide, all coordination-free after a single ZooKeeper handout at boot. If those numbers do not fit your workload, you move the bit boundaries until they do.
+
+This is also why the "Snowflake needs a central server, so it is coordinated like auto-increment" objection is wrong. The only coordination is the one-time worker-ID assignment when a node starts. ID generation itself is fully local and lock-free, which is the entire point. The coordination cost is paid once, at boot, not once per ID.
+
+## One ID rarely does two jobs
+
+Here is a trap that survives code review: using a single ID for both your internal primary key and your external public identifier. Those two roles want opposite things.
+
+Your internal key wants index locality, which means a time-ordered ID, v7 or ULID or Snowflake. Your external identifier wants unguessability and minimal information leakage, which a time-ordered ID actively works against, because the embedded timestamp leaks the record's creation time to anyone holding the ID. That is a real correlation vector. An attacker who collects your public IDs learns when each object was created, and can often infer ordering and volume from nothing else.
+
+The misconception underneath this is that "UUIDs are random, therefore secure." Only the v4 UUID is high-entropy. Versions 1, 6, and 7 embed time, and historically v1 embedded the generating machine's MAC address. RFC 9562 says it directly: UUIDs MUST NOT be used as security capabilities, and only v4 is appropriate when unguessability is the requirement. A v7 in a public URL is unguessable in practice but still tells the world when the row was born.
+
+So the senior pattern is to split the two identities on purpose. Use v7 or ULID internally for the locality your database wants. Expose a v4, or a masked value, externally for the opacity your security model wants. The cleanest implementation of this split is UUIDv47, a 2025 technique that stores a sortable v7 in your database and emits a v4-looking ID on the wire by XOR-masking only the timestamp field with a keyed SipHash-2-4 hash. It is deterministic and invertible, so you store one column, get locality on disk, and present an opaque identifier outside, with no second ID to keep in sync. This is the same instinct behind every well-designed [URL shortener](/blog/url-shortener): the key you store and the token you expose are different objects chosen for different reasons. The privacy-versus-locality tension here is a small instance of the broader consistency tradeoffs in [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum).
+
+## The clock is a dependency, and dependencies fail
+
+Every scheme in this piece trusts the wall clock, which means every scheme inherits the wall clock's failure modes. This is the question that separates someone who has read the spec from someone who has run the system.
+
+Unix millisecond time ignores leap seconds by design, but the clock can still move backward. NTP corrections step it. Leap-second smearing perturbs it. VM live-migration can resume a guest with a clock behind where it was. When the clock goes back, a naive time-ordered generator emits an ID that sorts before one it already produced, and monotonicity is broken at the exact moment your keyset pagination and your "newest first" ordering depend on it holding.
+
+The specs give the discipline. Freeze the embedded counter and refuse to advance the stored timestamp until real time catches up, advancing the stored value only on counter overflow rather than blindly trusting every clock reading. A correct generator treats its own last-emitted timestamp as a floor and never goes below it. The failure to implement this is invisible in every test where the clock behaves and catastrophic in the one production incident where it does not.
+
+There is a subtler clock-adjacent point that Marc Brooker of AWS raised in 2025, and it is the kind of thing only shows up at real scale. If every writer in your fleet feeds one strictly-increasing global v7 stream, you have quietly reintroduced a write hotspot, the same right-edge contention that perfectly sequential keys always create, except now it is distributed and your nodes all collide on the same new page. You may actively want per-shard or per-region streams instead, trading some global ordering for write spread. Brooker's fix is to XOR the timestamp with a keyed hash of an infrastructure ID, `unix_ts_ms ^ H(id, unix_ts_ms >> N)`, which lets you dial the locality radius (how wide a time window clusters together) against spread, per shard or region or customer. It is a reminder that "time-ordered" and "globally monotonic" are not the same goal, and that the second one can hurt you.
+
+## How to decide
+
+The decisions stack in a sensible order, and the right answer depends entirely on which properties your workload actually needs.
+
+| Your situation | Reach for | Why |
+| --- | --- | --- |
+| Single writer, IDs stay internal | `BIGINT` auto-increment | Densest index, cheapest insert, simplest thing that works |
+| Many writers, IDs internal, want DB locality | UUIDv7 or ULID | Time-ordered keys recover right-edge locality without coordination |
+| Stack already speaks UUID | UUIDv7 | IETF standard, native `uuidv7()` in Postgres 18, zero friction |
+| Want compact human-readable IDs | ULID | 26-char base32, more entropy than v7, friendlier in logs and URLs |
+| IDs exposed publicly | Split internal v7 / external v4, or UUIDv47 mask | The sort key and the public ID want opposite properties |
+| Need 64-bit IDs that self-route across shards | Snowflake (or a variant) | Half the index width, embedded machine or shard bits, lock-free |
+| Burst-heavy, single generator | Any time-ordered + monotonic mode | Know the per-millisecond ceiling and the counter-freeze behavior |
+
+None of these is exotic, and there is no universal winner, which is the entire point. The mistake is not picking the "wrong" scheme, it is picking one scheme for every situation because it is the one you know. A random v4 in a hot insert path is a performance bug. A sequential integer in a public URL is an information leak. A 128-bit UUID where a 64-bit Snowflake would route itself is wasted index width. Each of these is the right tool used in the wrong place.
+
+## The honest landing
+
+You cannot have all three properties at once. Coordination-free generation, strict global sortability, and perfect index locality pull against each other, and every scheme in this piece is a specific bet about which two matter most for the work in front of it. Auto-increment buys locality and strict order by paying with coordination. v4 buys coordination-free opacity by paying with locality. v7, ULID, and Snowflake buy coordination-free locality by accepting k-sorted instead of strictly-sorted, and Snowflake spends a self-routing machine ID out of its bit budget on top.
+
+So decide on purpose. Put time in the high bits when your database has to absorb the writes. Split the internal sort key from the external public ID when one of them faces the world, because the timestamp that helps your index betrays your users. Reallocate Snowflake's bits to the dimension your system actually stresses. And before you ship any of it, ask the unglamorous question, the one no demo will ever surface: what does this generator do when the clock steps backward at 2 a.m.? Answer that, and the ID is infrastructure. Skip it, and it is the page that wakes you up.
+
+## FAQ
+
+<FAQ />

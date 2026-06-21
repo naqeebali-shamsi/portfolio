@@ -1,0 +1,162 @@
+export const meta = {
+  slug: 'rag-system',
+  title: 'Designing a RAG System: From Chunk to Answer, and Every Way It Breaks',
+  description:
+    "RAG is a chain of lossy stages, and each one multiplies the next stage's error. A staff-grade walk through chunking, hybrid retrieval, reranking, the seven failure points, and how to evaluate it.",
+  headline: 'Designing a RAG System: From Chunk to Answer, and Every Way It Breaks',
+  deck: 'Retrieval and generation fail independently, so you have to instrument both or you will blame the model for a retrieval miss.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '16 min',
+  tags: ['rag', 'llm', 'retrieval', 'embeddings', 'vector-search', 'system-design'],
+  faq: [
+    {
+      q: 'Does RAG eliminate hallucination?',
+      a: 'No. RAG reduces hallucination and makes it auditable, but it does not remove it. The canonical failure taxonomy from Barnett et al. lists Missing Content as failure point one: when nothing relevant is retrieved, the model still emits a fluent, plausible answer. There is a separate, nastier failure called Not Extracted, where the correct evidence is sitting in the context window and the model answers wrong anyway. RAG gives you a faithfulness score you can check the answer against, which is the real win. It does not give you a guarantee.',
+    },
+    {
+      q: 'Does a bigger context window make RAG obsolete?',
+      a: 'No, and the reason is measured, not theoretical. Liu et al. (Lost in the Middle) showed model accuracy follows a U-shaped curve over where the answer sits in the prompt: GPT-3.5 scored 75.8% with the gold document first and dropped to about 54% with it buried in the middle of 20 documents, which is below the 56.1% it got with no documents at all. Long context and RAG are complementary. The usual win is to retrieve wide, rerank hard, and shrink the context the model has to reason over, rather than dumping everything in.',
+    },
+    {
+      q: 'Why use hybrid search instead of just vector similarity?',
+      a: 'Because dense and sparse retrieval fail on different queries. Vector search captures meaning and paraphrase but misses exact tokens like error codes, SKUs, and function names. BM25 nails those exact matches but misses synonymy. You run both and fuse the results. The non-obvious part is that BM25 scores and cosine similarities live on incompatible scales and cannot be averaged, which is why the standard fix, Reciprocal Rank Fusion, combines the two lists on rank position alone and ignores the raw scores.',
+    },
+    {
+      q: 'How do you actually evaluate a RAG system?',
+      a: 'You split the metric, because retrieval and generation fail independently. The RAGAS framework uses four scores: Context Precision and Context Recall measure the retriever, while Faithfulness and Answer Relevancy measure the generator. Faithfulness, the fraction of answer claims entailed by the retrieved context, is your hallucination gauge. The trap is that faithfulness and answer relevancy can both look high while context recall is low, meaning the model answered well from its own memory and ignored your documents, which is precisely the silent failure RAG was supposed to prevent. Measure all four.',
+    },
+    {
+      q: 'When should you not build a RAG pipeline at all?',
+      a: "When your whole knowledge base fits in the prompt. Anthropic's guidance puts the rough fork at about 200K tokens: below that, load the corpus into the context window and skip the vector database, the chunking decisions, and the retrieval failure points entirely. RAG earns its operational complexity only when the corpus is too large to fit, or large enough that retrieval cost and latency beat paying for a giant prompt on every call. Building a retrieval pipeline for a corpus that fits in a prompt is cost and risk you bought for nothing.",
+    },
+  ],
+}
+
+A RAG system is a chain, and a chain reports the strength of its weakest link without telling you which link that was.
+
+You ask a question. Somewhere upstream a document got split into chunks, each chunk got turned into a vector, those vectors got indexed, your question retrieved a handful of them, and a language model read that handful and wrote an answer. When the answer is wrong, the wrongness could have entered at any of those stages, and the symptom looks the same from where you stand: a confident paragraph that happens to be false. The whole discipline of building RAG is learning to tell which stage failed, because the fix for each one is different and most of them are invisible in a demo.
+
+This piece walks the pipeline from chunk to answer and names every place it breaks. If you want the surrounding fundamentals, [how LLMs work](/blog/how-llms-work) covers the generator end, and [the system design interview framework](/blog/system-design-interview-framework) covers how to reason about a pipeline like this under constraints.
+
+## RAG was never search plus a chatbot
+
+Start with the thing the founding paper actually built, because the popular mental model lost it.
+
+Lewis et al. coined "retrieval-augmented generation" in 2020, and their RAG combined a parametric memory, the knowledge baked into a sequence-to-sequence generator's weights, with a non-parametric memory, a dense vector index of Wikipedia reached through a learned retriever. The load-bearing detail is that the retriever and the generator were trained together. The model learned which documents to pull and how to use them in a single optimization. They shipped two variants: RAG-Sequence, where one retrieved document conditions the whole output, and RAG-Token, where each generated token can attend to a different document.
+
+What everyone calls RAG today, embed the docs, store the vectors, pull the top-k, paste them into the prompt, is a training-free approximation of that. It works, it is cheap, and it is what you should build. But the approximation has a consequence that runs through everything below: it decouples what Lewis et al. fused. The retriever and the generator are now two systems bolted together rather than one system trained jointly, which means their failure modes are statistically independent. A retrieval miss and a generation miss have nothing to do with each other, and if you only instrument the final answer you will spend a week tuning the model when the bug was in the chunker. Decoupled components fail independently and must be measured independently. That sentence is the entire thesis.
+
+## The pipeline is a sequence of lossy stages
+
+Here is the path an answer takes, and the loss each stage can introduce:
+
+```
+  Ingest -> Chunk -> Embed -> Index -> Retrieve top-k -> Fuse/Rerank -> Generate
+                                          |                              |
+                                   retrieval failures           generation failures
+```
+
+The cruel property is multiplicative. Retrieval recall is a hard ceiling on everything downstream: if the chunk containing the answer never makes it into the retrieved set, no amount of generation skill recovers it, because the model is reasoning over evidence that does not include the answer. So the design problem has a clean shape. Maximize the probability that the right evidence survives every stage, then maximize the probability that the model actually uses it once it is there. Those are two different jobs with two different sets of failures, which is the next thing to make concrete.
+
+## Seven ways it breaks, and the line that splits them
+
+Barnett et al. studied three production RAG systems and produced the failure taxonomy worth memorizing. Seven failure points:
+
+- **FP1 Missing Content.** The answer is not in your corpus at all, and the model answers anyway. Hallucination by omission.
+- **FP2 Missed Top-Ranked.** The right chunk exists in the index but did not make the top-k.
+- **FP3 Not in Context.** It was retrieved but dropped during assembly, reranking, or window truncation before the model saw it.
+- **FP4 Not Extracted.** The answer is in the context the model was given, and the model failed to pull it out, drowned by noise or conflicting passages.
+- **FP5 Wrong Format.** You asked for a table or JSON and got a paragraph.
+- **FP6 Incorrect Specificity.** Too vague or too precise for what the user needed.
+- **FP7 Incomplete.** Partially right, omits information that was available.
+
+Now the organizing line, because it tells you where to look. FP1 through FP3 are retrieval failures: the evidence never reached the model. FP4 through FP7 are generation failures: the evidence was there and the model mishandled it. When you debug a wrong answer, your first question is which side of that line you are on, and the answer determines whether you touch the chunker and retriever or the prompt and reranker. Getting this wrong is the single most common waste of engineering time in RAG, because FP4 (correct context, wrong answer) is indistinguishable from FP2 (missing context) if you only read the final output. You have to look at what was retrieved.
+
+## Chunking is a dial, not a number
+
+The first lossy stage is the one people give the least thought, usually by copying a number off a tutorial. The honest answer is that chunk size is a recall-versus-precision dial tied to your embedding model's context length, your query type, and your document structure, and there is no global optimum, only a per-corpus one.
+
+The tension is real on both ends. Small chunks embed precisely, because a 200-token passage about one thing produces a vector that means one thing, but they fragment context and raise the odds the answer is split across a boundary. Large chunks keep ideas whole, but they dilute the embedding, because a vector averaging 1,500 tokens across four subtopics is a blurry pointer to all of them and a sharp pointer to none. Larger chunks also mean fewer fit in the window, which collides with the reranking math later.
+
+The defaults worth knowing: Pinecone's baseline is 512 tokens with 50 to 100 tokens of overlap, and the practitioner consensus lands around recursive splitting at 400 to 512 tokens with 10 to 20% overlap. Recursive splitting means cutting on structural boundaries in priority order, paragraph break, then line break, then space, so you sever at the most natural seam available instead of mid-sentence at a fixed character count. That structural respect beats fixed-size splitting on almost any real document.
+
+One caveat that should make you suspicious of gospel: overlap, the shared tokens between adjacent chunks meant to avoid cutting context at a boundary, is contested. A 2026 systematic analysis found no measurable retrieval benefit from overlap in its setup, only added indexing cost from storing the duplicated tokens. The senior move is to treat chunk size and overlap as hypotheses you test on your own corpus with your own eval set, pick a sane default to start (512 tokens, recursive, modest overlap), and let the measurement move you. Anyone who quotes you a universal chunk size has not measured on your data.
+
+## Dense and sparse fail on different queries, so run both
+
+The retrieval stage has a trap built into the word "semantic." Cosine similarity between embeddings is vector proximity in one learned space, and it is genuinely good at meaning and paraphrase. It is also blind to exact tokens. Ask a vector index for `ERR_CONN_4042` or `getUserById` or a part number, and it will happily return passages that are semantically adjacent and lexically wrong, because the embedding never learned that the literal string is what matters.
+
+That blindness is the entire reason BM25 still exists. BM25 is the classic lexical ranking function from the TF-IDF family, the sparse-retrieval workhorse, and it nails exact-match queries that vector search fumbles while missing the synonymy that vector search handles. Dense and sparse fail on disjoint query classes, which is the textbook argument for running both and fusing the results. This is hybrid search, and serious retrieval defaults to it.
+
+The non-obvious engineering problem is fusion. BM25 produces unbounded scores in a range like 0 to 15, while cosine similarities cluster between 0.7 and 0.95, and averaging two numbers on incompatible scales is meaningless. The standard fix is **Reciprocal Rank Fusion**, which sidesteps the scale problem by fusing on rank position alone:
+
+```
+RRF(d) = sum over each list of  1 / (k + rank_i(d))
+```
+
+Each document's fused score is the sum, across both ranked lists, of one over (k plus its rank in that list), with k conventionally 60. Notice what it ignores: the raw scores. A document ranked third by BM25 and fifth by the vector index gets credit for both positions, and the incompatible-scales problem never arises because no score is ever compared to another. The k constant is a smoothing dial, not a magic number, low k over-weights the very top ranks while high k flattens the contribution across positions, and it is worth a sweep on a golden set rather than left at 60 on faith. If you have read [the distributed cache](/blog/distributed-cache), the instinct is the same: the clever part is the data structure that makes the comparison cheap and correct, not the comparison itself.
+
+## Lost in the middle breaks the obvious fix
+
+When retrieval misses, the reflex is to retrieve more and stuff a bigger context, on the theory that more evidence cannot hurt. Liu et al. measured that theory and it is false in a way you need to see, because it kills the naive fix dead.
+
+Their finding is a U-shaped accuracy curve over the position of the gold document in the prompt. On multi-document QA with GPT-3.5-Turbo and 20 documents, accuracy with the answer at position zero was 75.8%, and accuracy with it buried in the middle (indices nine through fourteen) fell to between 53.8 and 57.3%, a gap of roughly 18 to 22 points driven by nothing but where the same evidence sat. At 30 documents the high end held near 73.4% while the middle sagged to 50.5 to 55.1%. The most damning number: the 20-document middle position, at 53.8%, scored below the closed-book baseline of 56.1%. A model handed 20 documents with the answer in the middle did worse than the same model handed no documents at all. The irrelevant context actively hurt it.
+
+Two design consequences fall straight out. First, rank order inside the prompt is a real and free intervention: given the U-curve, place your strongest evidence first or last, never buried in the middle. Second, more retrieved documents is not strictly better, because past a threshold every additional chunk is a distractor that degrades extraction, which is exactly FP4 (Not Extracted) showing up as a consequence of a retrieval decision. This is the cleanest demonstration that the retrieval and generation stages are coupled in effect even though they fail independently in mechanism: a retrieval choice (how many to pass) manufactures a generation failure (the model cannot extract). [Latency and the tail](/blog/latency-throughput-tail) makes the throughput case against giant contexts too, but lost-in-the-middle is the accuracy case, and it is the one that should change your default.
+
+## Reranking is the lever that fixes both ends
+
+Lost-in-the-middle leaves you with a tension. Retrieval recall wants you to cast a wide net, because the answer has to be in the set or you are finished. The generator wants a narrow, clean context, because distractors and middle-burial wreck extraction. Wide recall and narrow precision pull in opposite directions, and reranking is the lever that serves both at once.
+
+The mechanism rests on a distinction in how relevance gets scored. Your embedding model is a bi-encoder: it encodes the query and each document separately, into independent vectors, which is exactly why it is fast (you precompute every document vector once, offline) and exactly why it is imprecise (the query and document never interact until a final dot product). A cross-encoder reranker does the opposite. It feeds the query and a candidate document through the model together, in one forward pass, and outputs a direct relevance score, so the two texts attend to each other and the score is far more accurate. The catch that defines the architecture: a cross-encoder is far too slow to run over a whole corpus, because there is nothing to precompute, every query-document pair is a fresh forward pass.
+
+So you cascade. Retrieve wide and cheap with the bi-encoder and BM25, then rerank narrow and expensive with the cross-encoder:
+
+```
+  Stage 1  Retrieve:   BM25 top-128  +  Vector top-128   ->  up to 256 candidates  (recall up)
+  Stage 2  Fuse:       RRF                               ->  32 finalists
+  Stage 3  Rerank:     cross-encoder                     ->  8 sent to the LLM     (precision up)
+```
+
+This single move attacks recall and precision simultaneously: the wide first stage raises the ceiling on what can be found, and the cross-encoder trim hands the model a short, high-precision context, which directly defuses lost-in-the-middle without any prompt-engineering hacks. Practitioner writeups cite retrieval-quality lifts on the order of tens of percent from reranking; treat the exact figure as workload-dependent and illustrative rather than a law, but the structural reason it helps is solid. Reranking is usually the single biggest quality gain you can bolt onto a naive top-k pipeline that already works.
+
+## Contextual Retrieval: the cheap fix with hard numbers
+
+There is a failure that lives in the chunk itself, before any retrieval runs. Consider a chunk that reads, in full, "The company's revenue grew by 3% over the previous quarter." Severed from its document, it has lost its referents. Which company? Which quarter? The embedding of that sentence is a vector for a generic statement about revenue, so a query about ACME's Q2 2023 numbers may never retrieve it, and if it does, the model gets a context with no anchor.
+
+Anthropic's Contextual Retrieval fixes this at index time. Before embedding each chunk, you prepend a short, LLM-generated blurb (50 to 100 tokens) that situates the chunk in its source document, then embed and index that augmented version. The example chunk becomes something like: "This chunk is from an SEC filing on ACME Corp's performance in Q2 2023; the previous quarter's revenue was $314 million. The company's revenue grew by 3% over the previous quarter." Now the vector carries the referents the raw sentence dropped.
+
+The numbers are the reason to care, and they come straight from the primary source as a stacked ladder on top-20 retrieval failure rate:
+
+```
+  Baseline                          5.7%
+  + Contextual Embeddings           3.7%   (-35%)
+  + Contextual BM25                 2.9%   (-49%)
+  + Reranking                       1.9%   (-67%)
+```
+
+Each layer is additive, and the bottom line cuts the retrieval failure rate by two-thirds. The punchline is cost: with prompt caching, contextualizing an entire corpus runs about $1.02 per million document tokens, paid once at ingest. That is the rare fix that erases two-thirds of your retrieval errors for almost nothing. The same source hands you a decision rule worth stating plainly: if your whole knowledge base fits in roughly 200K tokens, skip RAG entirely and put it all in the context window, because the retrieval pipeline is complexity you only want above that threshold. Knowing when not to build the system is a senior skill, and the people who ship [IntelliFill](/case-study/intellifill)-style multi-agent LLM pipelines learn it early, because every stage you add is a stage that can break.
+
+## You cannot eyeball it: split the metric four ways
+
+The last and most skipped stage is evaluation, and the reason teams skip it is that the demo looked great. The demo always looks great. RAG quality is invisible to spot-checking because the failures are correlated with inputs you did not happen to try, and because a fluent wrong answer reads exactly like a fluent right one.
+
+RAGAS is the framework that makes this measurable, and its core design decision matches the thesis of this whole piece: it splits the score along the retrieval/generation line.
+
+- **Retrieval side.** Context Precision asks whether the retrieved context is relevant and whether the relevant items are ranked high. Context Recall asks whether you retrieved everything the answer needed.
+- **Generation side.** Faithfulness asks whether every claim in the answer is entailed by the retrieved context, which is your hallucination meter, the fraction of the answer that is actually grounded. Answer Relevancy asks whether the answer addresses the question that was asked.
+
+The property that makes this usable is that RAGAS is reference-free: it uses an LLM as judge, so you can score a system without a hand-labeled gold set for every question, which is what makes evaluation feasible at all on a real corpus. And the property that makes it essential is orthogonality. Faithfulness can be high while context recall is low, which means the model answered correctly from its own parametric memory and ignored your documents entirely, the exact silent failure RAG exists to prevent. Answer relevancy can be high while faithfulness is low, which is a fluent, on-topic hallucination. Collapse these four into one "RAG score" and you hide precisely the failures you most need to see. Measure all four or you are flying blind.
+
+One more piece the same study insists on, and it is uncomfortable: RAG validation is only fully feasible in operation, and robustness evolves rather than being designed in upfront. Offline eval on a golden set is necessary, it is your regression gate, but it is not sufficient, because production queries drift away from anything you anticipated. Treat RAG as an ops problem with a faithfulness regression gate and a domain-representative eval set you keep growing, the way the agent-observability work in [Aladeen](/case-study/aladeen) treats a running system as the thing under test. The eval set is the real moat. A pipeline anyone can clone in an afternoon; a maintained golden set that catches the regression before your users do is the thing that took six months of production to build.
+
+## The honest landing
+
+RAG is not one system. It is a retriever and a generator wearing a trench coat, and they fail for unrelated reasons. That is the fact every design decision traces back to. The chunk size sets your recall ceiling. Hybrid search and RRF widen what survives retrieval. Reranking trims it to a context the model can actually use and defuses lost-in-the-middle. Contextual Retrieval restores the referents the chunker tore off. And four orthogonal metrics tell you which half of the system to fix when the answer comes back wrong, instead of letting you tune the model for a week to patch a bug in the chunker.
+
+The discipline is the same one that runs through [idempotent webhooks](/blog/idempotent-webhooks) and [replication](/blog/replication-strategies) and every other piece of plumbing that has to survive contact with production: name the failure modes before they name you, instrument the stages independently because they fail independently, and refuse to trust the version that looked fine in the demo. Skip that and you ship a system that answers beautifully right up until the question you never tested, which is the only question your users were ever going to ask.
+
+## FAQ
+
+<FAQ />

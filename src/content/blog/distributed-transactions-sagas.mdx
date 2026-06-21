@@ -1,0 +1,227 @@
+export const meta = {
+  slug: 'distributed-transactions-sagas',
+  title: 'Distributed Transactions and the Saga Pattern: Trading Isolation for Availability',
+  description:
+    'One operation, three databases, no shared transaction. Why two-phase commit blocks under failure, how sagas swap rollback for compensation, and what it costs.',
+  headline: 'Distributed Transactions and the Saga Pattern: Trading Isolation for Availability',
+  deck: 'A saga keeps three letters of ACID and quietly drops the fourth, and the whole pattern is a negotiation over the one it gives up.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '16 min',
+  tags: ['sagas', 'distributed-systems', 'microservices', 'two-phase-commit', 'consistency', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between a saga and a database rollback?',
+      a: 'A rollback restores the exact prior bytes inside a single ACID transaction, before anything was committed. A compensating transaction is a new business transaction that semantically reverses an already-committed one, to what the original 1987 paper calls an acceptable approximation of the prior state. The airline already recorded and released the seat, so you cannot un-book it. You issue a cancellation, which may carry a fee. Compensation restores business invariants, not memory.',
+    },
+    {
+      q: 'Do sagas give you ACID across microservices?',
+      a: 'No. A saga preserves Atomicity, Consistency, and Durability but drops Isolation, leaving ACD. Intermediate states are observable by other transactions while the saga is mid-flight, which produces dirty reads, lost updates, and non-repeatable reads. You buy isolation back manually where it matters using countermeasures like semantic locks (a PENDING status flag), commutative updates, and reordering work around a pivot. Pretending a saga is fully ACID is what causes the dirty-read bugs the pattern is known for.',
+    },
+    {
+      q: 'When should you use two-phase commit instead of a saga?',
+      a: 'Use 2PC when you can afford to block and you own everything inside one transaction boundary: a single transaction manager, XA across two tables in one ownership domain, low transaction volume, and a hard correctness requirement. You get automatic reliability with zero compensation code. Use a saga when the operation crosses independently owned services that must stay available, where holding cross-service locks through a network round trip and a possible coordinator failure would wreck throughput.',
+    },
+    {
+      q: 'What is a pivot transaction in a saga?',
+      a: 'The pivot is the point of no return. Every step before it is compensable, meaning it has an inverse you can run to unwind. Once the pivot succeeds, the saga must complete forward, because the steps after it are irreversible or made retryable-until-success rather than compensated. Charging a card or dispatching a physical shipment is a typical pivot. Where you place it determines your entire compensation surface, so a poorly placed pivot leaves you with either un-undoable damage or infinitely retrying tails.',
+    },
+    {
+      q: 'What is the dual-write problem and how do sagas handle it?',
+      a: 'A saga step usually has to do two things atomically: commit a local database change and publish a message that triggers the next step. There is no way to make a database commit and a message publish atomic on their own, so a crash in between leaves the saga stalled forever or the message sent without the state change. The standard fix is the transactional outbox: write the outgoing event into an outbox table inside the same local transaction, then relay it asynchronously. Because delivery is at-least-once, every consumer must also dedupe.',
+    },
+  ],
+}
+
+Picture one ordinary action: a customer clicks Place Order. Behind that click, three things have to happen together. The order is recorded, the card is charged, the warehouse reserves stock. Now the part that ruins the simple version: orders live in Postgres, payments in a service backed by its own MySQL, inventory behind DynamoDB. Three databases, three engines, three separate write-ahead logs. You reach for the tool that has always made "happen together" safe, and it is not there.
+
+A database transaction is the cleanest guarantee in software. Wrap the writes in `BEGIN` and `COMMIT` and you get all-or-nothing: every change lands or none does, and nobody sees a half-finished state in between. That guarantee is enforced by one engine's lock manager and one write-ahead log, and it does not stretch. There is no shared lock manager spanning Postgres-for-Orders, MySQL-for-Payments, and DynamoDB-for-Inventory, because each is a separate process that has never heard of the others. The moment a business operation needs all three to move as a unit, the single-transaction abstraction has nothing to stand on.
+
+This is not a niche edge case. It is the direct consequence of a decision the industry made on purpose: microservices come with database-per-service, where every service owns its data and no other service touches that store directly. That autonomy is the point, and it is exactly what removes the transaction boundary you used to lean on. What you do instead is the question this piece answers, and the answer involves giving something up.
+
+## The obvious fix, and why it blocks
+
+If the problem is that there is no shared transaction, the obvious move is to manufacture one. That is two-phase commit, and its failure mode is what justifies everything that comes after it.
+
+2PC introduces a coordinator that drives the participants through two rounds. In the prepare phase, it asks every participant one question: can you commit? Each does the work, writes its undo and redo records to its log, locks the affected rows, and votes Yes or No without committing yet. It only promises that it can. In the commit phase the coordinator counts the votes: all Yes, it broadcasts commit and everyone finalizes and releases locks; any No, it broadcasts abort and everyone rolls back. When it works, it delivers genuine atomicity across separate databases, and that appeal is real.
+
+The flaw lives in the gap between the two rounds. Here is the sequence that ends 2PC for microservices:
+
+```
+Coordinator        Payment        Inventory        Shipping
+    |  prepare? -->   |              |               |
+    |  prepare? --------------->     |               |
+    |  prepare? ------------------------------>      |
+    |  <-- YES 🔒     |              |               |   all locked, all voted
+    |  <-- YES 🔒 ----+              |               |
+    |  <-- YES 🔒 ------------------+               |
+    |                                                |
+    X  <-- coordinator crashes here, before deciding
+    |                                                |
+   PREPARED 🔒     PREPARED 🔒     PREPARED 🔒     PREPARED 🔒
+   (every participant frozen, holding locks, waiting for a decision
+    that is never coming, and unable to decide for itself)
+```
+
+Read what each participant knows at the crash. It voted Yes. It is holding row locks. It has no idea whether its peers were told to commit or abort, so it cannot decide alone without risking a split outcome where it commits and another aborts. Wikipedia states it plainly: after a participant sends its agreement, "it will block until a commit or rollback is received." It is stuck in the prepared, or in-doubt, state, holding those locks, until the coordinator comes back.
+
+That is why 2PC is a blocking protocol and the coordinator a single point of failure. The damage is not that one transaction stalls; it is that the locked rows are unavailable to everyone else for as long as the in-doubt window lasts, bounded only by how fast you recover a crashed coordinator. Hold locks across a network round trip plus a possible failure window and throughput collapses exactly when the system is least healthy. Comparison studies report 2PC cutting throughput well into the double digits against local transactions, and sagas outpacing it by a wide margin on low-contention workloads. The direction is not controversial: locks and blocking do not scale across service boundaries.
+
+This is the same wall that makes [the payment system](/blog/payment-system) hard and that the [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) framing exists to discipline. You cannot have strong consistency, availability, and partition tolerance at once, and 2PC spends its entire budget on consistency. Across independently owned services that must stay up, that is the wrong trade.
+
+None of this means "2PC is bad, never use it." 2PC is the correct tool inside one ownership boundary where you can afford to block, and we will come back to exactly when. But as the default for a microservices order flow, the crash-in-the-gap diagram is its obituary.
+
+## The 1987 reframing
+
+The escape was published in 1987, before microservices had a name, in a SIGMOD paper by Hector Garcia-Molina and Kenneth Salem titled, simply, "Sagas." Their problem had nothing to do with distributed services. It was long-lived transactions, LLTs: transactions whose duration, in logical steps rather than wall-clock time, makes holding locks for their entirety unacceptable. One transaction touching twenty records over several seconds locks all of them the whole time while everything else queues behind it. Same disease, older century.
+
+Their move was to stop making the whole thing atomic and break it into a sequence of steps, each its own ordinary database transaction that commits independently. The chain becomes a saga. Each step commits as it goes and releases its locks immediately, so there is no long hold and no blocking. The price: the work is committed in pieces, so to undo it you cannot roll back. You have to actively reverse it.
+
+That reversal is the compensating transaction, and the paper's definition of it is the single most important sentence in the topic. A compensation restores "the world to a state which is an acceptable approximation to the state that it had before the start of the transaction." Read that twice. Not the exact prior state. An acceptable approximation. That phrase is the whole philosophical move, and everything that confuses people about sagas dissolves once you take it literally.
+
+The guarantee a saga actually provides is a clean two-line trace. On success, every step runs in order:
+
+```
+s₁ • s₂ • s₃ • … • sₙ • ✔
+```
+
+On failure partway through, the steps that already ran are undone by their compensations, in reverse order:
+
+```
+s₁ • s₂ • s₃ • ✗ • c₃ • c₂ • c₁ • ✔
+```
+
+In words: either all of T₁ through Tₙ run, or some prefix runs and is unwound by its compensations in reverse. What it conspicuously does not guarantee is that the intermediate states were never visible. Between s₂ committing and c₂ running, the effect of s₂ is real, committed, and observable. That visibility is not a leak. It is the deal you signed.
+
+## What a saga keeps, and the one thing it drops
+
+Hold a saga in your head as ACID with one letter removed. It keeps Atomicity in the semantic sense, because compensation still gives all-or-nothing as a business outcome; Consistency, because each local transaction moves its own database from one valid state to another; Durability, because each committed step is on disk. It drops Isolation, and it drops it on purpose.
+
+```
+   A  C  I  D
+   A  C  ✗  D      Isolation traded away.
+                   Bought back, where it matters, by hand.
+```
+
+Isolation is the property that concurrent transactions cannot see each other's uncommitted work, and a saga cannot offer it, because its steps commit one at a time with the gap between an early step and its compensation wide open. Atomikos, coming from the XA and 2PC pedigree, put it bluntly: a saga allows "dirty reads in between a service invocation and its compensation," "like dirty reads in the database at the SQL level." So the honest one-line definition: you trade Isolation for availability across service boundaries, then buy back exactly as much as your domain needs, manually, where it matters. That last clause is the part bootcamp explanations skip, and it is where the senior work lives.
+
+## Who drives the chain: orchestration or choreography
+
+A saga is a sequence of steps with compensations, and something has to decide what runs next. There are two answers, and this is the fork every saga design hits, which the [system design interview framework](/blog/system-design-interview-framework) treats as a default checkpoint for a reason.
+
+Orchestration puts one component in charge. An orchestrator, a persistent state machine, issues a command to each service, waits for the reply, and decides the next command from the result. The whole flow lives in one place you can read, test, and recover.
+
+```
+                 ┌─────────────────────────┐
+                 │   Order Orchestrator     │
+                 │  (persistent state mach.)│
+                 └──┬───────┬───────┬───────┘
+        reserveCredit│  reserveStock│   charge │   (commands out)
+                 ▼       ▼       ▼
+              Customer  Inventory  Payment
+                 │       │       │
+                 └───────┴───────┴──> replies back to the orchestrator
+```
+
+Choreography has no central brain. Each service reacts to events and emits its own, and nobody holds the whole picture.
+
+```
+  Order ──OrderCreated──▶ Inventory ──StockReserved──▶ Payment
+    ▲                                                    │
+    └──────────────── PaymentCompleted ──────────────────┘
+       (on PaymentFailed, Inventory releases stock,
+        Order cancels, and no single service knows the full flow)
+```
+
+The trade is not subtle once you have lived with both. Choreography has no single point of failure and lets teams deploy independently, which is genuinely attractive. But the flow becomes untrackable as it grows: no one place knows the whole sequence, cyclic dependencies sneak in where A's event triggers B whose event triggers A, and integration testing needs every service live at once. "No central coordinator" is sold as decoupling while it quietly does the opposite, because every service must now know which events to emit and consume, and adding a step means touching several of them. You get decoupled deployment and coupled understanding.
+
+Orchestration centralizes the flow into a recoverable state machine that is clear, testable, and observable, at the cost of a coordinator you build and operate. And here is the false equivalence to kill on sight: an orchestrator is not the 2PC coordinator wearing a hat. The 2PC coordinator strands participants holding locks while it is down; a saga orchestrator holds no cross-service locks at all, and if it crashes it resumes from durable state and carries on. Same word, opposite failure semantics. Confusing the two is how people talk themselves out of the better choice.
+
+How a senior decides: choreography for two or three participants with a simple flow and strong team-autonomy pressure; orchestration the moment the flow branches, the participant count climbs, or you need to answer "where is order 8412 stuck right now" without grepping six services. The [Kafka vs queues](/blog/kafka-vs-queues) decision rides along underneath: choreography leans on a durable event log, orchestration on commands and replies.
+
+## A worked order, with the pivot in the right place
+
+The order flow as an orchestrated saga:
+
+```
+T1 createOrder(PENDING)        → C1 rejectOrder(CANCELLED)
+T2 reserveCredit               → C2 releaseCredit
+T3 reserveStock                → C3 releaseStock
+T4 charge card  ═══ PIVOT ═══    (point of no return)
+T5 approveOrder(CONFIRMED)       (retryable, never compensated)
+```
+
+Three kinds of step live in that list, and naming them is the difference between a saga that survives and one that strands money. The steps before the pivot are compensable: T1, T2, T3, each with a real inverse, reserve-then-release. If the card is declined at T4, an application-level failure, you run backward recovery, C3 then C2 then C1, right to left, and the order ends cancelled with nothing leaked. The pivot itself, T4 the charge, is the point of no return: once money has moved you do not quietly un-charge it here. The steps after it are retryable: T5 and any fulfillment, never compensated, retried until they succeed because there is nothing sensible to undo once the customer has paid. They must therefore be idempotent, a correctness precondition rather than polish, for the reason spelled out in [idempotency and the exactly-once lie](/blog/idempotency-exactly-once): under at-least-once delivery, a retry that is not idempotent double-charges.
+
+Where you place the pivot is a design decision, not a label you stick on afterward. Push everything reversible in front of it and everything that must-eventually-succeed behind. A badly placed pivot leaves one of two diseases: irreversible damage it cannot undo, or a tail of steps retrying forever with no way forward.
+
+## The compensation that is not an inverse
+
+Here is the example that separates people who have read about sagas from people who have shipped one. Suppose T2 is `sendOrderConfirmationEmail`. The saga proceeds, then fails at the pivot. Run the compensations in reverse: C2 has to undo T2, so you un-send the email. But you cannot un-send an email. It is in the customer's inbox; the bytes left your control the instant the SMTP server accepted them.
+
+This is where the 1987 paper's "acceptable approximation" stops being philosophy and becomes a daily constraint. The correct C2 is not an inverse at all. It is a new forward action: a second email saying the order was cancelled. That restores the invariant the customer is not owed an order they did not get, without pretending you can reach into the past. A compensation restores business invariants, not bytes, and the right one is sometimes a brand-new action rather than a reversal.
+
+The same logic governs which actions can be compensated at all, because some cannot. A physical shipment that has left the warehouse, an irreversible payout, a confirmation sent to a third party you do not control: these are non-compensable, and that is the entire reason the pivot exists. You structure the saga so irreversible actions land after the point of no return and are made retryable, never sitting in the compensable region where the system might try to undo them and fail.
+
+## The part everyone skips: living without isolation
+
+We dropped Isolation at the ACID-to-ACD trade; now we pay for it. Three classic anomalies become possible the moment two sagas, or a saga and a plain query, run concurrently. A dirty read: something reads a value a saga wrote and has not yet compensated, acts on it, and then the saga unwinds, leaving that decision based on a state that no longer exists. A lost update: two sagas read the same value, both modify it, one silently clobbers the other. A non-repeatable read: a saga reads a value, a concurrent saga changes it, and a later read in the same saga sees something different. A staff engineer names all three and the countermeasure for each, the full set Microsoft enumerates, each buying back a slice of isolation:
+
+| Anomaly to prevent | Countermeasure | How it works |
+| --- | --- | --- |
+| Dirty read of in-flight state | Semantic lock | A status flag like `PENDING` says "in progress, do not act on this yet"; every reader must check it |
+| Lost update | Commutative update | Model writes as order-independent deltas (`+50`, `-30`) so concurrent sagas compose |
+| Dirty read | Pessimistic view | Reorder steps so risky updates land in retryable steps, after the danger window |
+| Lost / stale write | Reread value | Re-check the value is unchanged before writing; abort and restart if it moved |
+| Out-of-order operations | Version file | Keep an ordered log of operations so they can be reconciled regardless of arrival order |
+| High-risk operations | By value (risk-based) | Use a saga for low-risk operations and a real distributed transaction for high-risk ones, per operation |
+
+The cheapest and most common is the semantic lock. In the order saga, the order's `status = PENDING` is the lock: no other process may treat a PENDING order as a real, fulfillable one, and when the saga finishes the status flips to CONFIRMED or CANCELLED and the lock lifts. That single status field does the isolation work the database would have done for free inside one transaction. But notice the cost. The lock leaks into your domain model and is only as good as the discipline of every reader. Forget to check `status = PENDING` in one query, written by someone who did not know the saga existed, and that query is the dirty read. Your code is now the enforcement, everywhere, forever.
+
+The commutative-update row is the cleanest, because it removes the anomaly instead of guarding it: model a balance change as `addToBalance(+50)` and `addToBalance(-30)` rather than `setBalance(120)`, and concurrent sagas compose with no lock at all, the same principle that makes [CRDTs](/blog/crdts) work without coordination. And step count is not free: the more steps a saga has, the longer its intermediate state stays visible, so a seven-step saga has a strictly larger anomaly surface than a three-step one.
+
+## The plumbing that makes it real
+
+A saga assumes that when a step commits, the next step reliably gets triggered. That assumption hides two problems that will stall a saga in production.
+
+The first is the dual-write problem. A step has to do two things together: commit its local database change and publish a message that wakes the next step. Nothing makes a database commit and a broker publish atomic with each other. Commit then publish, and a crash between them leaves the database changed but the message never sent, so the saga stalls forever; publish then commit, and a crash leaves a message claiming work that never happened. The fix is the transactional outbox: in the same local transaction as the business write, insert a row into an `outbox` table describing the event, and a separate relay reads the outbox, publishes, and marks each row done. Because the event and the state change are written in one transaction they cannot diverge, and the relay can crash and retry freely.
+
+The second is duplicate delivery. Reliable messaging is at-least-once, so the same event will arrive twice and every consumer has to dedupe: a processed-message table keyed by message ID, checked transactionally alongside the business write, so a second delivery is a no-op. This at-least-once-plus-idempotency contract is the same machinery whether events flow through a queue or a log, part of why [replication](/blog/replication-strategies) and event delivery keep circling the same guarantees. One distinction worth holding: when you need nodes to agree on a single ordered history rather than just deliver messages, you are in [consensus and Raft](/blog/consensus-raft) territory, a stronger and more expensive guarantee than a saga ever asks for.
+
+Observability is not optional either. A saga is a distributed long-running workflow, and a half-completed one stays invisible until a customer complains unless you instrument it: a correlation ID through every step, the saga's state persisted, stuck-past-timeout detection, and alerts when a compensation itself fails. Because compensations can fail. Microsoft says it directly: "compensating transactions might not always succeed, which can leave the system in an inconsistent state." A serious saga has a dead-letter path and a human escalation for stranded compensations. The pattern is not automatic correctness; it is automatic until it is not, and then it pages someone. The [latency and the tail](/blog/latency-throughput-tail) reasoning carries straight across: it is the rare stuck saga, not the median, that defines your operational pain, the same way keeping [NomadCrew](/case-study/nomadcrew)'s trip state consistent across phones that drop offline mid-edit is this problem wearing different clothes.
+
+## When 2PC still wins, and the middle ground
+
+None of this makes the answer "sagas always, 2PC never." 2PC is the right tool inside a single ownership boundary where you can afford to block: XA across two tables one team owns, or a small set of tightly controlled services with low volume and a hard correctness requirement, where the occasional blocked transaction is acceptable and writing compensation logic for every step is not worth it. There it buys automatic reliability with zero compensation code. The framing: 2PC where you can afford to block and you own everything; sagas where you must stay available across boundaries you do not control.
+
+The spectrum is not binary, and the middle ground is TCC, Try-Confirm-Cancel: each step becomes a Try that reserves a resource, a Confirm that commits the reservation, and a Cancel that releases it. The reservation keeps intermediate state invisible until Confirm, buying back the isolation a plain saga gives up, without 2PC's blocking. It costs more modeling per resource and not every operation reserves cleanly, but for the steps where dirty reads are genuinely unacceptable, it is the third point between 2PC and the plain saga.
+
+## How to choose
+
+The decisions stack in an order, and the ones that matter most sit at the top.
+
+| Concern | Default move | Why |
+| --- | --- | --- |
+| Cross-service write, must stay available | Saga | Avoids holding cross-service locks through a failure window |
+| Single ownership boundary, can block | 2PC / XA | Automatic reliability, zero compensation code |
+| Some steps need true isolation | TCC | Reservation hides intermediate state without 2PC blocking |
+| Complex flow, branching | Orchestration | One recoverable state machine you can read and test |
+| 2-3 simple steps, team autonomy | Choreography | No SPOF, independent deploys |
+| Undoing committed work | Compensation, not rollback | Restore the invariant, not the bytes |
+| Irreversible step | After the pivot, make it retryable | You cannot compensate a shipment or a payout |
+| Commit plus message must be atomic | Transactional outbox | The only way to close the dual-write gap |
+| Stuck or failed sagas | Correlation ID, state, alerting | Compensations fail; a half-done saga is otherwise invisible |
+
+None of these is exotic. What separates a saga that survives production from one that looks right in a design review is whether the unglamorous rows are present: the pivot placed deliberately, the semantic lock every reader actually checks, the outbox, the idempotent retry. They are the parts no happy-path demo exercises and every partial failure does.
+
+## The honest landing
+
+You do not get a single transaction across three databases. That guarantee belonged to one engine and one log, and the moment you split your data across services you handed it back. Everything here is the bill for that decision.
+
+A saga is the most honest way to pay it. It keeps Atomicity, Consistency, and Durability as business guarantees and tells you the truth about the one it cannot keep. Compensations reverse meaning instead of memory, a pivot marks the line between what you can undo and what you must finish, and an outbox plus idempotent consumers keep the chain from stalling. The discipline behind it is the same one behind [Audex](/case-study/audex)'s determinism: a system is trustworthy only when its corrective paths are designed as carefully as its happy path, because those are the paths that run once something has already gone wrong.
+
+Do that, and an order that fails at the payment step unwinds cleanly and the customer never knows. Pretend a saga is just ACID with extra steps, skip the pivot, trust the database to isolate work it can no longer see, and you ship the dirty-read bug that only shows up under the concurrency no test reproduces, the one you debug at 2 a.m. with three services open and no single place that knows what the flow was supposed to do.
+
+## FAQ
+
+<FAQ />

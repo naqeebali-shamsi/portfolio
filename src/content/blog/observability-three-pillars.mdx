@@ -1,0 +1,173 @@
+export const meta = {
+  slug: 'observability-three-pillars',
+  title: 'Metrics, Logs and Traces: Designing the Three Pillars Without Going Bankrupt',
+  description:
+    'Metrics, logs and traces each bill on a different axis: cardinality, volume, keep-rate. Match the cost lever to the axis, or observability outgrows the system.',
+  headline: 'Metrics, Logs and Traces: Designing the Three Pillars Without Going Bankrupt',
+  deck: 'Each signal bills on a different cost axis, and the senior skill is choosing which one you are buying before observability outgrows the system it watches.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '17 min',
+  tags: ['observability', 'metrics', 'tracing', 'logging', 'slo', 'opentelemetry', 'system-design'],
+  faq: [
+    {
+      q: 'What are the three pillars of observability?',
+      a: 'Metrics, logs, and traces. Metrics are aggregatable numbers sampled over time, such as request rate or p99 latency. Logs are discrete timestamped events, ideally structured as typed fields. Traces follow one request across services as a tree of timed spans. The useful framing is not what each shows you but how each one costs you: metrics scale on cardinality, logs on event volume, traces on volume times keep-rate. A growing camp argues the three are really one wide event stored three different ways, which is itself the main source of the bill.',
+    },
+    {
+      q: 'Why do metrics get expensive at high cardinality?',
+      a: 'A metric becomes one stored time series per unique combination of its label values, so cost is the cartesian product of those labels. A counter split by 3 regions and 4 environments is 12 series. Add a user_id label for a million users and it becomes 12 million series, because memory scales roughly linearly per active series. Any unbounded label such as user_id, request_id, session_id, email, or a raw URL path is a time bomb. The fixes are dropping the high-cardinality label at ingest, pre-aggregating with a recording rule, or lowering scrape resolution.',
+    },
+    {
+      q: 'What is the difference between head sampling and tail sampling in tracing?',
+      a: 'Head sampling decides whether to keep a trace at the very start, usually by hashing the trace id, before any spans have run. It is cheap and stateless but cannot guarantee that traces containing an error are kept, so you randomly throw away the failures you most need. Tail sampling decides after the whole trace completes, by inspecting all its spans, so you can keep every error and every slow request. The price is that it is a stateful distributed system: it must buffer spans in memory and route every span of a given trace to the same collector instance.',
+    },
+    {
+      q: 'How do SLOs control observability cost?',
+      a: 'An SLO pins a metric into your must-keep set: high resolution, long retention, never sampled. Because SLIs are aggregations over percentiles, they require histograms rather than raw latencies, and you alert on burn rate with multi-window multi-burn-rate rules rather than on every threshold crossing. The Google SRE guidance to have as few SLOs as possible is therefore a budget control in disguise. Every SLO you add expands the set of telemetry you are forbidden from downsampling or expiring, so a small, defended SLO set keeps the expensive tier small.',
+    },
+    {
+      q: 'Where should you control telemetry cost?',
+      a: 'At the collection pipeline, before data reaches a paid backend. The OpenTelemetry Collector is a vendor-agnostic place to receive, process, and export telemetry, which makes it the one programmable choke point where you can drop low-value signals, strip high-cardinality labels, pre-aggregate, batch, scrub PII, and apply tail sampling. Putting cost policy in the Collector as config rather than hard-coding vendor SDKs across your services means the policy is reviewable and the backend is swappable, so you can renegotiate the bill instead of being locked into it.',
+    },
+  ],
+}
+
+Every team meets the same wall at roughly the same scale. The product works, traffic climbs, and one day the observability bill arrives larger than the compute bill for the system it watches. Nobody decided that. It accumulated, one well-intentioned label and one debug log at a time, until the instrument cost more than the engine.
+
+The usual reaction is to sample harder and hope. That treats observability as a single thing with a single dial. It is not. Metrics, logs, and traces are three different signals, and the part most explanations skip is that they do not cost the same way. Each one bills on a different axis. Spend without knowing which axis you are buying and you go broke in three directions at once.
+
+This piece is about the axes, and where you put the valve on each one.
+
+## The two questions that define a signal
+
+Before pillars, there were two questions. Peter Bourgon framed them in 2017, and the framing has outlasted every vendor taxonomy since, because it is about the shape of the data rather than the marketing around it.
+
+First question: is the data aggregatable? Metrics are. A request counter is an atom that composes cleanly into a rate, a gauge, a histogram. You can add a million of them and the result is small. Logs are the opposite. The defining trait of a log is that it is a discrete event, and discrete events do not compress into each other. A million log lines is a million log lines.
+
+Second question: is the data request-scoped? A trace is. Its whole identity is that it follows one request across service boundaries and stitches the hops together under a single id. A metric usually is not request-scoped; it is a property of a system over a window.
+
+Those two questions draw a plane, and the three pillars are just regions on it. Metrics live in the aggregatable, not-request-scoped corner. Logs are discrete and usually not request-scoped. Traces are discrete and request-scoped. The interesting territory is the overlaps. The modern wide event deliberately sits in the middle of all three, which is exactly why it both solves cost and creates it. Hold that thought; it is where the piece lands.
+
+Bourgon also said the thing this article is built on, almost in passing. Metrics require the fewest resources because they compress well. Logging tends to be overwhelming, frequently growing to surpass the volume of the production traffic it reports on. That sentence is a cost model. The signals differ in how their cost scales. Name the axis for each, cap it, and you keep observability proportional to the thing it observes.
+
+## Metrics: cheap until cardinality, then a cliff
+
+Start with the signal everyone calls cheap, because the word hides a trap.
+
+A metric is cheap to store because it compresses. But the unit you are billed on is not the metric, it is the time series, and you get one time series for every unique combination of label values. Cardinality is that count, and it is a cartesian product. A latency metric split by 3 regions and 4 environments is 12 series. Fine. Now someone adds a `user_id` label to slice latency per customer, and you have a million users. You did not add a label. You added twelve million time series, because the product is 3 times 4 times 1,000,000. Memory scales roughly linearly per active series, so doubling the unique values of one label doubles the memory. An unbounded label is a detonation on a delay.
+
+The labels that do this are predictable, and you should treat every one as radioactive in a metrics system: `user_id`, `session_id`, `request_id`, `email`, client IP, a raw URL path with ids baked into it, `container_id`. Each has no ceiling on its value set. This is structural, not a tuning problem: a time-series database builds an inverted index over labels, and that index is what chokes when the label space is unbounded.
+
+So the metrics cost axis is cardinality, and there are exactly three levers that move it. Decide per metric which one you are pulling. First, drop the high-cardinality label at ingest: if `user_id` does not belong on a metric, strip it with a relabeling rule before it is stored, and the series collapses back to the bounded product. Second, pre-aggregate with a recording rule: compute the rollup you actually query, keep that, discard the raw per-series detail. You wanted p99 latency by region, not per user, so store exactly that. Third, lower resolution. Collecting per-second measurements yields data that is very expensive to collect, store, and analyze, and most of it you never look at. Grafana puts a number on it: moving a scrape interval from 15 seconds to 60 seconds can cut cost by around 75 percent, because you store a quarter of the points. A default Prometheus node exporter emits roughly 500 series; a MySQL exporter around 1,000. Multiply that across a fleet and resolution stops being a detail.
+
+The mistake to retire is the belief that metrics being cheap means you can add all the labels you want. They are cheap only while cardinality is bounded. The senior move is to decide, per label, whether it earns its place against the cartesian product it joins.
+
+## Logs: highest fidelity, highest volume, three valves
+
+Logs are the opposite trade. Where a metric throws away detail to stay small, a log keeps everything and pays for it. The cost axis is raw event volume, and volume is the one that grows to exceed the traffic it describes.
+
+Structured logging is the first thing people reach for, and it is necessary, but it does not control cost on its own. Emitting JSON or logfmt instead of free text lets you filter by field, route by severity, and sample by rule. It is the prerequisite for control. It is not the control. The driver is still how many events you write, and structure does not reduce that number.
+
+Three valves do, and they stack.
+
+Sample by severity. Keep 100 percent of errors and anything critical, sample routine operations down to somewhere between 1 and 10 percent. Most log lines are a healthy request saying it was healthy, and you do not need every one to know the system is fine. You need every error to know how it broke.
+
+Tier the retention. For most logs, usefulness has a half-life measured in hours. Put the last day on fast NVMe, the last few weeks on cheaper disk, everything older in object storage. The economics are stark: cold object storage runs around \$0.023 per GB per month against \$0.10 and up for hot SSD, so aged data on the cold tier costs roughly a quarter as much. Most of your log bytes are old, so most of your log bill is avoidable by moving bytes you rarely read onto storage that matches how rarely you read them.
+
+The third valve quietly changes the architecture: the canonical log line. Instead of a dozen scattered `logger.info` calls per request, emit one wide structured event at the end carrying the request's vital signs as fields. Stripe described this years ago as the authoritative line for a particular request. A real one is a single row with `http_method`, `http_path`, `http_status`, `duration`, `database_queries`, `auth_type`, and a few dozen more fields, replacing many narrow lines with one fat one. Queries over it are faster to write and faster to run, because the join is already done at write time.
+
+The canonical log line matters beyond cost, and this is the hinge of the whole piece. It is a log, it carries a trace id, and you can derive metrics from its fields. It is the bridge object that sits in the overlap of all three regions on Bourgon's plane. Hold onto it; the contrarian ending is built on this exact shape.
+
+## Traces: the sampling fork is the cost decision
+
+A trace is a tree of spans that share one trace id, each span a timed unit of work with a name, a parent, timestamps, attributes, a status, and a kind such as client or server. What makes the tree possible across process boundaries is context propagation, which OpenTelemetry calls the core concept that enables distributed tracing. The context rides the wire in the W3C `traceparent` header: version, trace id, parent span id, trace flags. The trace id stays constant across every hop; the parent span id changes at each one, which is how the tree knows its branches.
+
+That is the mechanism. The cost decision is sampling, and it forks hard.
+
+Head sampling decides whether to keep a trace at the very start, before any spans have run, usually by hashing the trace id so every service makes the same call. It is cheap and stateless. It has one killer limitation, stated plainly in the OpenTelemetry docs: you cannot ensure that all traces with an error are sampled with head sampling alone. Think about what that means. You keep a flat 1 percent, chosen blind, which keeps 1 percent of your errors too. The failures you would trade a hundred healthy traces to see, you throw away ninety-nine times out of a hundred, at random, by design.
+
+Tail sampling fixes the visibility and moves the cost. The decision is made after the trace completes, by inspecting all its spans, so you keep every trace whose status is error and every trace slower than a threshold while dropping the boring successful majority. Honeycomb's Refinery captures the rule in a sentence: if a trace is an error or a slow request, keep every single one; if it is one of hundreds of millions of fast successes, keep maybe 1 in 1,000. That is the policy you actually want.
+
+It is not free, and the bill is paid in state, not storage. Tail sampling must be a stateful system that buffers a large amount of span data, potentially across dozens or hundreds of compute nodes. And it imposes a constraint shallow treatments never mention: all spans for a given trace must be received by the same collector instance, because you cannot decide on a trace whose spans landed on three different boxes. That forces consistent-hash load balancing on trace id across your collector fleet. If you have read [consistent hashing](/blog/consistent-hashing), the shape is familiar: route by a key so related work lands together, the same idea that keeps a [distributed cache](/blog/distributed-cache) coherent. Tail sampling is that pattern applied to spans, and trace-affinity is the hidden tax on it.
+
+So the traces cost axis is volume times keep-rate times span fan-out, and the lever is which sampling strategy you run. At scale a keep-rate of 1 percent or lower is normal. The OpenTelemetry line is blunt: sampling is one of the most effective ways to reduce the cost of observability without losing visibility. The catch is that head sampling loses the visibility that matters and tail sampling charges you in operational complexity to keep it. Senior teams run tail sampling on the paths they need to debug and pay the state, because a stateless 1 percent that discards your errors is not cheaper, it is just blind.
+
+## Sampling is only safe if you record the rate
+
+One belief sits underneath all of this and quietly corrupts dashboards: that sampling means you lose accurate counts. It does, but only if you forget to write down what you did.
+
+When you keep 1 trace in 1,000, that surviving trace stands for 1,000. Record the sample rate as a field on the event, and at query time you weight by it: each kept event counts as 1,000, latency sums get scaled, the totals reconstruct. Honeycomb's dynamic sampling guidance is explicit that each event stood for sampleRate events, and that is the difference between a sampled dashboard that tells the truth and one that lies by a factor of a thousand.
+
+Sampling without per-event weighting silently understates everything, so treat the sample rate as data, not metadata. It is the same discipline that makes at-least-once delivery survivable in [idempotent webhooks](/blog/idempotent-webhooks): the raw stream is lossy or duplicated, and you reconstruct the truth from a small piece of recorded state rather than trusting the stream. A trace you kept with its sample rate attached is a fact you can do arithmetic on. A trace you kept without it is an anecdote.
+
+## SLOs decide what you are allowed to keep
+
+The cost axes tell you how each signal scales. They do not tell you what to keep. That decision belongs to your SLOs, and once you see SLOs as a retention policy, the cost discipline falls out for free.
+
+An SLI is a carefully defined quantitative measure of some aspect of service. An SLO is a target for that measure. An SLA wraps the target in consequences. The discriminator from the Google SRE book is the cleanest test: ask what happens if the objective is missed, and if there is no explicit consequence, you are looking at an SLO rather than an SLA. Two design constraints fall straight out of this, and both are cost constraints in disguise.
+
+The first: SLIs ride on percentiles, never averages. Averaging request latencies obscures the detail that decides your architecture, because most requests can be fast while a long tail is much, much slower, and the mean lands in the empty valley between the two. That is the entire argument of [latency and the tail](/blog/latency-throughput-tail), and the consequence for observability is concrete: you store histograms, the bucketed distribution, not raw latencies and not means. An SLO written against a p99 forces a histogram metric into existence and forbids you from throwing it away.
+
+The second: have as few SLOs as possible. The SRE guidance is to pick just enough to cover the service and defend each one by winning a priority argument with it; if you cannot, it is not worth having. That reads like process advice. It is a budget control. Every SLO pins a metric, its cardinality, and its retention into your must-keep set, the tier you are not allowed to sample or downsample or expire. A short SLO list keeps that expensive tier short. A sprawling one quietly forbids you from cutting cost anywhere it touches.
+
+Alerting completes the picture. You alert on symptoms, not causes, using multi-window multi-burn-rate rules. Burn rate is how fast you drain the error budget relative to the SLO: a burn rate of 1 against a 99.9 percent monthly objective means a steady 0.1 percent error rate that exhausts the budget exactly on schedule. A fast burn, say 14.4 times normal over an hour, pages someone now; a slow burn opens a ticket. This is why the SLO-backing metrics must be cheap, high-resolution, and long-retained while almost everything else can be sampled or rolled up. The handful of signals that page you are the handful you protect from the cost-cutting you apply everywhere else. Same muscle as [the system design interview framework](/blog/system-design-interview-framework): name the few numbers that decide success, then let everything else be negotiable.
+
+## An illustrative budget, so the numbers feel real
+
+None of the sources gives an end-to-end bill, so here is a worked model. Treat it as illustrative, built from the per-unit numbers above, not a measured benchmark. The point is the shape of the drop, not the exact dollars.
+
+Take a service at 10,000 requests per second, which is 864 million requests a day. Assume an average request emits a few kilobytes of logs across its scattered lines and produces a trace of around 10 spans at roughly a kilobyte each.
+
+| Approach | What you store | Rough daily volume | Relative monthly cost |
+| --- | --- | --- | --- |
+| Naive: full logs, 100% traces, hot storage | Every log line and every span, all on hot SSD | Tens of TB/day | Baseline (the bill that scares you) |
+| Structured + canonical log line | One wide event per request instead of a dozen lines | A few TB/day of logs | ~5-10x cheaper on logs alone |
+| Add 1% tail sampling on traces | Keep 100% of errors and slow traces, 1 in 100 of the rest | Spans drop by ~99% on the happy path | Another large cut on traces |
+| Add hot/warm/cold retention tiering | Last day hot, weeks warm, rest in object store at ~\$0.023/GB | Same data, mostly on cheap storage | ~75% off the aged majority |
+
+Stack the three and the bill drops by one to two orders of magnitude while error-debuggability stays at 100 percent, because every error log and every error trace is kept in full. That last clause is the whole game. You did not get cheaper by seeing less of what matters. You got cheaper by refusing to pay full price to store, at the highest resolution and forever, the overwhelming majority of events that say nothing happened. The same capacity-thinking that sizes a system up front, the kind behind [the URL shortener](/blog/url-shortener), is what tells you which tier each byte belongs in.
+
+## The Collector is where policy lives
+
+All of these levers, dropping labels, pre-aggregating, sampling traces, batching, scrubbing PII, share a question: where do you apply them? Scatter the logic across every service's SDK and your cost policy is hard-coded in a hundred places and welded to one vendor. The right answer is a single choke point.
+
+The OpenTelemetry Collector is a vendor-agnostic way to receive, process, and export telemetry, which makes it the one place to cut spend before it reaches a paid backend. Telemetry flows from your SDKs into the Collector, and there, in config, you filter low-value signals, drop high-cardinality labels, pre-aggregate, batch, scrub PII, and run the tail sampler before fanning out to whatever backends you choose. Two properties make this the senior default. Cost policy becomes config you review in a pull request rather than code redeployed across every service. And because the Collector speaks a vendor-neutral protocol, the backend is swappable, which means the bill is negotiable. A backend you cannot leave is a backend that can price you however it likes. Same instinct as keeping a [replication](/blog/replication-strategies) decision reversible: put the policy somewhere you can change your mind.
+
+This is where the pattern shows up in real agent systems. In the [Aladeen](/case-study/aladeen) case study, the hard part of observing an agent CLI was that a single run fans out across model calls, tool invocations, and retries, exactly the request-scoped tree a trace is built for, and the cost question was which runs to keep in full versus sample. That decision lived in the collection layer. Multi-agent pipelines like [IntelliFill](/case-study/intellifill) raise the same problem one level up: every document flows through a chain of LLM stages, and you want the full trace of the runs that failed or stalled without paying to store the full trace of every run that sailed through.
+
+## The heresy: maybe the pillars are the bankruptcy
+
+Here is the staff-level objection that makes the whole framing uncomfortable, and it is worth taking seriously rather than waving off.
+
+Charity Majors argues there are no pillars, that they are a marketing term dressed up as an architecture. Her cost argument is the sharpest in the field and lands directly on this article's thesis: you are storing the same information in your metrics database, your logs, and your traces, just formatted differently, and that is insanely expensive. Look back at the canonical log line. A wide event already carries the fields you would aggregate into metrics, the request id and timing you would put in a trace, and the message you would write to a log. The three pillars, in that light, are one request stored three times. The duplication is not a best practice. It is a cost multiplier you adopted by default.
+
+Her alternative is to store the data once as one arbitrarily-wide structured event and derive metrics, logs, and traces as views over it, doing the signal processing at collection or query time. Pillar is a marketing word; signal is a technical one. Store the signal once, compute the views.
+
+The honest part, the part a staff engineer says out loud, is that this does not make the cost vanish. It moves it. A single wide event with high-cardinality fields is exactly the workload a metrics database falls over on, so you have traded three moderate storage problems for one large high-cardinality problem, which you now solve in a columnar query engine rather than a time-series index. Cardinality flips from liability to asset there: the `user_id` and `build_id` fields that bankrupt a time-series database are precisely what let you ask what is different about the slow requests, the question you actually have at 2 a.m. The bankruptcy did not disappear. It relocated, from storing-three-times to querying-wide. Whether that trade is worth it depends on your scale and your query engine, and the only wrong move is to not know you are making it.
+
+You do not have to pick a side today. You do have to know that the comfortable three-pillar default has a duplication tax baked in, and the wide-event camp is offering to swap it for a different bill. Both are real. Neither is free.
+
+## How to choose
+
+The decisions line up by signal, each matched to the axis it bills on.
+
+| Signal | Cost axis | Default lever | When it bites |
+| --- | --- | --- | --- |
+| Metrics | Cardinality (and resolution) | Drop unbounded labels at ingest; recording rules; lower scrape interval | One unbounded label turns 12 series into 12 million |
+| Logs | Event volume (times retention tier) | Canonical wide event; sample routine at 1-10%, errors at 100%; hot/warm/cold tiering | Log volume grows past the traffic it reports on |
+| Traces | Volume times keep-rate times fan-out | Tail-sample: keep all errors and slow traces, 1 in 1,000 of the rest | Head sampling at 1% discards 99% of your errors |
+| SLO metrics | Pinned to must-keep, never sampled | Histograms not averages; as few SLOs as possible; burn-rate alerts | Every extra SLO forbids cost-cutting on the metric it pins |
+| All of the above | Where the policy lives | Apply at the Collector, in config, not in app SDKs | Hard-coded vendor SDKs make the bill non-negotiable |
+
+None of these levers is exotic. What separates an observability stack that scales from one that bankrupts you is whether you matched the lever to the axis, or reached for the same blunt dial, sample everything more, and applied it to three signals that cost three different ways.
+
+## The honest landing
+
+You cannot make observability cheap by wanting it to be. You make it proportional by deciding, per signal, which cost axis you are buying and capping it before it runs away. Metrics buy you aggregation and bill you on cardinality, so guard the labels. Logs buy you fidelity and bill you on volume, so sample the routine, keep the errors, and tier the rest onto storage that matches how rarely you read it. Traces buy you the request's path and bill you on keep-rate, so tail-sample for the failures that matter and pay the state it costs. Let your SLOs decide the small set you protect from all of this, and put the whole policy at the Collector so the bill stays negotiable.
+
+Do that, and the instrument stays smaller than the engine. Skip it, and one morning the dashboard you built to watch the system becomes the line item that threatens it, and you will be sampling blind in a panic, throwing away the errors you needed because you never decided which axis you were on.
+
+## FAQ
+
+<FAQ />

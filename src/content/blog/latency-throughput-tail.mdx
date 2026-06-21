@@ -1,0 +1,165 @@
+export const meta = {
+  slug: 'latency-throughput-tail',
+  title: 'Latency vs Throughput, and the Tyranny of the Tail',
+  description:
+    'Latency is a distribution and the average hides the requests that decide your architecture. Why p99 drives design: fan-out, coordinated omission, Little\'s Law.',
+  headline: 'Latency vs Throughput, and the Tyranny of the Tail',
+  deck: 'The average latency is a number no real request experiences, and at fan-out the tail you ignored becomes the median your users feel.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '16 min',
+  tags: ['latency', 'throughput', 'tail-latency', 'distributed-systems', 'performance', 'system-design'],
+  faq: [
+    {
+      q: 'What is the difference between latency and throughput?',
+      a: 'Latency is the time one operation takes, measured as a distribution with units of seconds. Throughput is how many operations complete per unit time, measured as a rate. They are linked through concurrency but optimized with different levers and they fail in different ways. Batching is the clearest case: it raises throughput while raising latency, because work waits to be grouped before it runs. Treating them as one performance dial is the mistake that hides which one your workload is actually bound by.',
+    },
+    {
+      q: 'Why is average latency a bad metric?',
+      a: 'Latency distributions are right-skewed and often multi-modal, with separate humps for the fast path, garbage-collection pauses, cache misses, and retransmits. The arithmetic mean lands in the valley between those humps, a value no actual request experiences, and standard deviation assumes a normal shape that latency never has. Report percentiles instead: p50, p99, p99.9, and the max. Percentiles are order statistics, so they make no assumption about the distribution\'s shape.',
+    },
+    {
+      q: 'What is tail latency amplification?',
+      a: 'When one request fans out to many components and must wait for all of them, it inherits the maximum of N latency draws rather than a typical one. A rare per-server slow event becomes a common per-request slow event. If each of 100 servers has a 1 percent chance of being slow, the probability that at least one is slow on a given request is 1 minus 0.99 to the 100th power, about 63 percent. The leaf\'s p99 becomes the parent\'s p50.',
+    },
+    {
+      q: 'What is coordinated omission?',
+      a: 'Coordinated omission is a measurement artifact in closed-loop load generators. When the system under test stalls, the generator stops issuing new requests, so the exact moment that should produce your worst samples produces no samples at all. The omitted requests are precisely the slow ones, so reported p99 can understate the truth by orders of magnitude. ScyllaDB measured a naive p99 of 249 microseconds against a corrected p99 of 665 milliseconds on the same system, a 2,600x gap. Fix it with open-model load generation and full-range recording.',
+    },
+    {
+      q: 'How does Little\'s Law connect latency and throughput?',
+      a: 'Little\'s Law states L equals lambda times W: the average number of requests in flight equals the arrival rate times the average time each spends in the system. It is distribution-independent, holding for any stable system. The architectural consequence is a feedback loop. If latency W rises while arrivals lambda hold steady, in-flight concurrency L rises too, consuming more threads, connections, and memory, which degrades latency further. This is how a brief latency blip turns into an outage, and why concurrency limits and load shedding are load-bearing, not optional.',
+    },
+  ],
+}
+
+There is a number on your latency dashboard that almost no request actually experiences. It sits in the middle, it looks reassuring, and it is the average. Latency does not live in the middle. It lives in the tail, and the tail is where your timeouts fire, your retries pile up, and your architecture gets decided whether you meant to decide it or not.
+
+This piece is about two quantities people collapse into one word, "performance," and about why the one you can average is the one that lies to you. Latency and throughput are different physical things, and the tail of the latency distribution shapes a serious system far more than its average does. By the end I want the sentence "the p99 of a leaf becomes the p50 of the parent" to feel obvious rather than clever, because once it does, a lot of architecture stops being a matter of taste.
+
+## Two quantities, not one dial
+
+Start with the definitions, because the whole topic falls apart when they blur.
+
+Latency is the time a single operation takes. It is a duration, and the only honest way to describe it is as a distribution, because no two operations take the same time. Throughput is how many operations finish per unit time. It is a rate. One has units of seconds, the other things-per-second, and no single multiplier converts between them.
+
+They are linked, but they move independently, and the cleanest proof is batching. Group a hundred database writes into one transaction and flush them together, and you raise throughput, because fixed per-flush costs amortize across a hundred rows. You also raise latency for the first write, because it waits for ninety-nine siblings before anything commits. Same change, opposite effects: an optimization that improves one degrades the other, which is the tell that they are different axes. A single-threaded service can have beautifully low latency and embarrassing throughput; a deeply pipelined one can have enormous throughput and latency you would never put in front of a user.
+
+So the first senior move is to ask which one the workload is bound by before reaching for a lever. A checkout flow is latency-bound: the user is staring at a spinner and total throughput is modest. A nightly analytics rollup is throughput-bound: nobody watches a single row, only rows-per-hour. Tuning the throughput-bound system for tail latency, or the reverse, spends effort on the axis the workload does not care about. When I sized the data pipeline for [Audex](/case-study/audex), this was the first fork: the ingest path was throughput-bound and the query path latency-bound, and pretending they wanted the same tuning would have hurt both.
+
+## The average is in the empty valley
+
+The claim, stated plainly: the mean is the wrong summary for latency, and not because it is imprecise. It is structurally wrong.
+
+Latency distributions are right-skewed. There is a floor (work takes some minimum time) and no ceiling (a request can always be slower), so the long tail stretches right and drags the average with it. Worse, real latency is usually multi-modal. Gil Tene's central point in "How NOT to Measure Latency" is that a production system does not have one latency distribution, it has several stacked together: a fast-path hump where most requests live, a second hump where a garbage-collection pause hit, another for cache misses, another for a TCP retransmit, another for a page fault. Each mechanism contributes its own mode.
+
+Put those humps on a chart and ask where the arithmetic mean lands. It lands in a valley between them, at a value almost no request actually has. Brendan Gregg's "What the Mean Really Means" makes the same point with real data: the average of a bimodal latency describes neither mode. Standard deviation is no better, because it assumes a normal distribution that latency never has, so "mean plus or minus a standard deviation" is a meaningless phrase for a skewed, multi-modal shape.
+
+The fix is percentiles, and they work because they assume nothing about shape. The p99 is the value below which 99 percent of observations fall, found by sorting and counting. That is an order statistic, and order statistics survive any distribution. Report p50 for the typical request, p99 and p99.9 for the tail, and the max for the worst thing that actually happened in your window.
+
+A trap waits here, and it is the one I see most in otherwise senior teams. Percentiles do not average and they do not add. You cannot average the p99 of ten servers into a fleet p99, or the p99 of ten one-minute buckets into a ten-minute p99, because a percentile is a property of a specific population and averaging summaries throws the population away. A metrics stack that stores "p99 per minute" and averages those points to draw an hour is drawing fiction. To aggregate latency correctly you merge the raw distributions, which is what HdrHistogram, t-digest, and DDSketch are for: mergeable sketches, where you combine the underlying data and then read the percentile off the result.
+
+## The tail is the math of fan-out
+
+Calling the tail "the slow requests" undersells it, because at scale the tail stops being an edge case and becomes the common case. The mechanism is amplification, and it is the most important idea in this topic.
+
+Picture a request that fans out to N components in parallel and cannot return until all respond. Its latency is the maximum of N draws from the component distribution. The maximum of N samples has a far heavier tail than any single sample, because all it takes is one of the N to be slow. This is Dean and Barroso's "The Tail at Scale," and the arithmetic is unforgiving.
+
+Suppose each server has a 1-in-100 chance of responding slower than one second, a perfectly ordinary 1 percent tail. Hit one server, and 1 percent of your requests are slow. Fan out to 100 servers and wait for all of them, and the probability that at least one is slow is 1 minus 0.99 to the 100th power, which is about 63 percent. A 1 percent per-server event has become a 63 percent per-request event purely through fan-out. The general form is 1 minus (1 minus p) to the m, where p is the per-server tail probability and m is the fan-out width.
+
+It gets starker as you scale. The curve from the paper, read across fan-out width:
+
+| Per-server outlier rate | At 100 servers | At 2,000 servers |
+| --- | --- | --- |
+| 1 in 100 (1%) | 0.63 | essentially 1.0 |
+| 1 in 1,000 (0.1%) | ~0.10 | ~0.87 |
+| 1 in 10,000 (0.01%) | ~0.01 | 0.18 |
+
+Read the bottom-right cell. Even a 1-in-10,000 per-server event, the kind you call rare and move on from, makes 18 percent of requests slow once the request touches 2,000 servers. You cannot out-tune this at the per-server level. Driving a 1 percent tail down to 0.1 percent is real work, and it still leaves a coin-flip's worth of slow requests at fan-out width 2,000. The paper's conclusion, the one worth internalizing, is that you design the system to tolerate the tail rather than trying to eliminate it at the source.
+
+Now the sentence I promised. Dean and Barroso's Table 1 measures a real fan-out tree, and it lands like a hammer:
+
+| | 50th percentile | 95th percentile | 99th percentile |
+| --- | --- | --- | --- |
+| One random leaf finishes | 1 ms | 5 ms | 10 ms |
+| 95% of all leaf requests finish | 12 ms | 32 ms | 70 ms |
+| 100% of all leaf requests finish | 40 ms | 87 ms | 140 ms |
+
+A single leaf has a median of 1 ms. But the parent cannot return until the last leaf returns, and the median time for all leaves to finish is 40 ms, forty times the single-leaf median. The leaf's tail has become the parent's typical case. That is the literal meaning of "the p99 of a leaf becomes the p50 of the parent," and it is why optimizing the median of a component you fan out to is often pointless: its tail is what the system above it experiences as normal.
+
+This also reframes a metric people quote without thinking. "Our p99 is fine" tells you nothing about a user session that issues a hundred sub-requests, because that session is very likely to hit the slow one at least once. Per-request p99 and per-user-session experience are different things, and the gap between them is exactly the 63 percent problem: the unit of the metric has to match the unit the user cares about, and the user cares about the page. The [system design interview framework](/blog/system-design-interview-framework) leans on this constantly. The moment a candidate draws a fan-out, the right follow-up is "what is the tail of the slowest leg, and how wide does this fan out," because that product is the latency the user sees.
+
+## You are probably measuring the tail wrong
+
+Here is the part that stings, because it means your existing numbers might be comforting fiction. The most common load-testing setup systematically under-reports the tail, in the direction of your hopes.
+
+The artifact is coordinated omission, and Gil Tene named it. A naive load generator runs a closed loop: send a request, wait for the response, record the time, send the next. Read that loop under the condition that the server stalls for one second. During that stall the generator is blocked waiting for the one in-flight response, so the thousands of requests that should have been issued during that second are never sent. The stall produces one slow sample instead of the thousands it should have, and the omitted requests are precisely the ones that would have recorded the worst latencies. The measurement coordinates with the system's stalls to delete the tail.
+
+The numbers are not subtle. ScyllaDB ran the same system under three measurement regimes:
+
+| Measurement regime | Reported p99 (read) |
+| --- | --- |
+| Naive, all-out, coordinated omission present | 249 µs |
+| Throughput-capped, omission still uncorrected | 819 µs |
+| Coordinated-omission corrected | 665 ms |
+
+The true p99 was about 2,600 times higher than the naive number. This is a one-directional error that always flatters the system, because the requests it deletes are always the slow ones, so it never averages out. The root cause has a clean framing: response time equals wait time plus service time, and a closed-loop tool measures only service time. It never counts the time a request spent waiting to even be issued, which is the entire backlog that builds during a stall.
+
+The fix is open-model load generation, where arrivals are scheduled independently of the system's state, so a stall causes a backlog you record instead of a gap you silently skip. Tene's wrk2 does this: it holds throughput constant and records each request's latency from its intended send time. Nitsan Wakart showed the same bug corrupting the database benchmarks everyone cites, fixed by recording values against an expected interval. The discipline this leaves you with is a short list of questions for any latency number before you trust it. Service time or response time. Over what window. Open-model or closed. A number that cannot answer those is decoration.
+
+## Little's Law: where latency and throughput turn out to be the same problem
+
+The two quantities are coupled through concurrency, and the law that ties them is the most useful equation in capacity work: L equals lambda times W. The average number of requests in the system equals the arrival rate times the average time each spends in it. It is distribution-independent, holding for any stable system regardless of how arrivals or service times are distributed, so you need to model nothing to use it.
+
+Put real numbers in. A service handling 10,000 requests per second with a mean residence time of 50 ms has, by the law, 500 requests in flight at any instant: 500 threads or connections you must have provisioned, derived from a rate and a duration without a load test. This is the arithmetic I reach for in [capacity estimation](/blog/capacity-estimation), where in-flight concurrency is something the law hands you rather than something you guess.
+
+Now the feedback loop, which is where tail latency stops being a dashboard concern and becomes an outage. Suppose a tail event pushes mean residence time from 50 ms to 200 ms while arrivals hold at 10,000 per second. By the law, in-flight concurrency jumps from 500 to 2,000: 4x the threads, connections, and memory, demanded suddenly and not because traffic grew. Every one of those resources has a ceiling, and hitting it adds queueing, which adds latency, which raises residence time further, which raises concurrency further. Tail latency and queue buildup are the same phenomenon from two sides, and a brief blip becomes a spiral because the law guarantees concurrency follows latency.
+
+Rearrange the equation and it becomes a design tool. Maximum stable throughput is L-max over W: if your pool caps concurrency at L-max and W rises under stress, the achievable arrival rate falls. The system sheds throughput exactly when it is most loaded, unless you planned for it. This is the quantitative basis for concurrency limits, backpressure, and admission control, and Netflix's adaptive concurrency limits are this law turned into a control loop. Bounding L keeps W from running away, which is why "just let the queue grow" is the wrong instinct: an unbounded queue is an unbounded W, which is an unbounded outage.
+
+## Throughput has a tail too, and it bends backward
+
+The latency tail has a throughput-side twin, and most engineers carry the wrong model for it: "add servers, get proportional throughput." Neil Gunther's Universal Scalability Law says that is the exception, not the default.
+
+The USL models throughput as you add capacity N, with two terms that bite. Contention, the cost of serializing on shared resources (locks, a shared queue, a single coordinator), gives you Amdahl's Law: throughput plateaus at a ceiling, and adding machines past it barely moves the total because the serial fraction dominates. Coherency is worse. The cost of keeping nodes consistent with each other grows like N squared, because every node may need to coordinate with every other, so throughput reaches a maximum and then declines: adding capacity past the knee reduces completed work. This is retrograde scaling, and it is why a system fine at 40 nodes can fall over at 60.
+
+This twin joins the latency story through utilization. The classic queueing result for a single server is that mean wait time scales like rho over (1 minus rho), where rho is utilization. As utilization approaches 100 percent, that fraction approaches infinity: latency does not degrade gracefully near saturation, it explodes, and the explosion is hyperbolic. That is the reason you never run a latency-sensitive service near full utilization, and why the right operating point sits left of the USL knee with real headroom. Run it hot to save money and the tail collects the bill with interest.
+
+The design consequence is admission control as a first-class requirement, not a nicety you bolt on after an incident. When load approaches the knee, shed work, return a fast rejection, and protect the throughput you can still deliver. A bounded intake that fails fast beats an unbounded one that fails slowly and takes everything down, the same instinct behind the backpressure in [event-driven RBAC](/blog/event-driven-rbac) and the queue-fronted handlers in [idempotent webhooks](/blog/idempotent-webhooks). The tradeoff is real: shedding rejects requests that could in principle have been served, and too conservative a threshold wastes capacity. A senior sets it by the cost asymmetry, whether a rejected request is recoverable with a retry and whether an accepted-then-collapsed one takes the service down, and sheds early when collapse is catastrophic and rejection is cheap. That same calculus is one half of [the CAP and PACELC spectrum](/blog/cap-pacelc-consistency-spectrum): under partition or overload, you choose what to give up before the system chooses for you.
+
+## Tolerating the tail: the mitigations and what they cost
+
+If you cannot eliminate the tail, you tolerate it, and Dean and Barroso's framing is the right one. Tail tolerance is to latency what fault tolerance is to hardware: you assume some component will be slow on every request and build latency redundancy, the same way you assume disks fail and build storage redundancy. The techniques that matter come with a price, and the price is the part shallow treatments skip.
+
+Hedged requests give you the most tail relief per dollar. Send the request to one replica, and if it has not answered within a short delay, send a second copy to another replica and take whichever returns first. The paper's headline result: reading 1,000 keys from a BigTable-like store, a hedged request issued after a 10 ms delay cut p99.9 latency from 1,800 ms to 74 ms, roughly 24x, for 2 percent additional load. The delay is why it is cheap. You only hedge the small fraction of requests that are actually slow, so you rarely pay for the second copy. The cost is that copy's load and the cancellation logic, and the failure mode is hedging without a delay: send two copies always and you double load, which under congestion pushes you toward the USL knee and makes the tail worse.
+
+Tied requests attack a subtler source of delay: queueing. Send both copies nearly immediately but have them reference each other, so the moment one begins executing it sends a cancel to its twin and the redundant copy dies in the queue before doing work. Hedges attack stall and execution delay; ties attack the queueing delay that is often the dominant source of variance. The cost is the cross-server cancellation protocol, real engineering, and the failure mode is a cancellation that races and loses, leaving duplicate work you must make idempotent anyway. Past those two the toolkit gets situational: micro-partitioning to kill head-of-line blocking, latency-induced probation to route around a slow server, a canary request to test a risky query on one node before fanning out to thousands. Which you reach for depends on which source of tail dominates, and you only know that if you measured the distribution correctly.
+
+One nuance separates people who read the paper from people who have lived it: the amplification math assumes independent tails, and real tails are often correlated. A garbage-collection pause or a synchronized background job hits many servers at once, which blunts hedging because the second replica is slow for the same reason as the first. Dean and Barroso's counterintuitive fix is to synchronize disruptive background work into short shared windows, so the path is clear the rest of the time: the penalty is per-action, so concentrate the pain rather than smear it.
+
+## How to decide
+
+The decisions stack in an order, and the order matters: each layer assumes the one above it is handled.
+
+| Concern | Default move | Why |
+| --- | --- | --- |
+| Which axis the workload is bound by | Identify latency-bound vs throughput-bound first | The two axes want opposite tuning; pick the one the user feels |
+| How you summarize latency | Percentiles and the max, never the mean | The mean sits in an empty valley; percentiles assume no shape |
+| Aggregating across hosts or time | Merge raw distributions (HdrHistogram, t-digest, DDSketch) | Percentiles do not average and do not add |
+| Trusting a load-test number | Demand open-model generation, ask service vs response time | Closed-loop testing deletes the tail via coordinated omission |
+| Fan-out width | Bound it, and budget the tail of the slowest leg | The leaf's p99 becomes the parent's p50 |
+| Concurrency under stress | Cap it; use Little's Law to size pools | Rising W with fixed lambda spikes L and spirals into an outage |
+| Operating point vs saturation | Stay left of the USL knee with headroom | Latency scales like rho/(1-rho) and explodes near full utilization |
+| The tail you cannot remove | Hedged or tied requests, with a delay | 24x p99.9 improvement for 2% load when you only duplicate the slow ones |
+
+None of this is exotic, and that is the point. The difference between a system that holds under a traffic spike and one that gets paged is whether the unglamorous rows are present: a bounded fan-out, a concurrency limit derived from Little's Law, a load test that can actually see the tail, an operating point with headroom below the knee. When I rebuilt the request path for [NomadCrew](/case-study/nomadcrew), the win came from capping fan-out width and acknowledging that the slowest leg sets the pace, no clever algorithm required. The same instinct shaped the throughput budget on [Mecanum](/case-study/mecanum), the ingest limits on [IntelliFill](/case-study/intellifill), and the real-time pipeline on [Aladeen](/case-study/aladeen): decide where the tail lives before it decides for you.
+
+## The honest landing
+
+You do not get to make latency a single number. It is a distribution, skewed and multi-modal, and the average you keep glancing at is a value almost no request experiences. Throughput is a different quantity on a different axis, coupled to latency only through concurrency, and it has its own tail that bends backward past the knee. One conservation law joins them, L equals lambda times W, and it turns a latency blip into a concurrency spike and a concurrency spike into an outage.
+
+So measure the distribution with a tool that can see the tail instead of one that hides it, budget the tail of every fan-out, cap concurrency from Little's Law, and sit left of the USL knee with the headroom the tail will eat. Do that, and the rare slow component at the bottom of your stack stays rare in the experience at the top. Skip it, and the 1 percent event you dismissed arrives at fan-out width 2,000 as the thing your users call normal, and you find out on a page at 2 a.m.
+
+## FAQ
+
+<FAQ />

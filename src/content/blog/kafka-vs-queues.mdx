@@ -1,0 +1,139 @@
+export const meta = {
+  slug: 'kafka-vs-queues',
+  title: 'Log-Based Brokers vs Message Queues: Kafka, SQS and RabbitMQ Under the Hood',
+  description:
+    'Kafka is a log, SQS and RabbitMQ are queues, and the difference is one decision: delete-on-ack versus retain-and-offset. Everything else follows from that.',
+  headline: 'Log-Based Brokers vs Message Queues: Kafka, SQS and RabbitMQ Under the Hood',
+  deck: 'The split is not streaming versus messaging. It is whether the broker deletes a message when you acknowledge it, or keeps it and tracks where you are.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '15 min',
+  tags: ['kafka', 'sqs', 'rabbitmq', 'distributed-systems', 'message-queue', 'system-design'],
+  faq: [
+    {
+      q: 'Is Kafka a message queue?',
+      a: 'No. Kafka is a replicated, append-only commit log. The broker does not delete a message when a consumer reads it; it keeps the record and each consumer group tracks its own position as a single integer offset. SQS and RabbitMQ classic queues are real queues: a message is removed once it is acknowledged. Kafka only gained true queue semantics in version 4.2 with share groups (KIP-932), and RabbitMQ only gained log semantics with Streams, so the line between the two has blurred, but the defaults still reflect each system origin.',
+    },
+    {
+      q: 'Does Kafka guarantee message ordering?',
+      a: 'Only within a single partition. Kafka guarantees a total order for messages inside one partition and no order at all across partitions. Your choice of partition key is therefore your ordering contract: all events that must stay ordered relative to each other have to hash to the same partition. SQS FIFO has the same shape one level up, where order holds inside a message group ID and messages in different groups interleave freely. Global ordering means a single partition or a single message group, which serializes throughput.',
+    },
+    {
+      q: 'When should I use Kafka instead of SQS or RabbitMQ?',
+      a: 'Reach for a log when you need replay, several independent consumers reading the same stream, or event sourcing where the history itself is the source of truth. Reach for a queue when you need per-message acknowledgement, work distribution across competing workers, complex routing, and you do not need to re-read old messages. The deciding question is whether the broker keeps history after a consumer is done with a message. If you need that history, you want a log; if you only need each message handled once and then gone, a queue is simpler and cheaper to operate.',
+    },
+    {
+      q: 'What does exactly-once mean in Kafka?',
+      a: 'Kafka exactly-once semantics combine an idempotent producer, which uses sequence numbers to drop duplicate writes, with transactions that make a read-process-write cycle atomic across Kafka partitions and offset commits. The guarantee is scoped to Kafka topics. The moment you write to an external database or call an external API, you are outside the transaction and back to needing your own idempotent writes or a transactional-outbox pattern. The honest default everywhere, including Kafka, is at-least-once.',
+    },
+    {
+      q: 'What is head-of-line blocking in a log-based broker?',
+      a: 'A partition is consumed strictly in offset order by one consumer per group. If the message at offset n is slow or poisonous and keeps failing, every message behind it in that partition is stuck for that consumer group until n is dealt with. This is head-of-line blocking, and it is the log model main weakness. SQS FIFO has the same problem per message group. Kafka share groups (KIP-932) exist largely to break it by acknowledging individual messages out of order, at the cost of the strict ordering a partition normally gives you.',
+    },
+  ],
+}
+
+Two systems sit behind almost every event-driven backend, and most engineers describe the choice between them wrong. They say Kafka is for streaming and RabbitMQ or SQS is for queues, as if these were three competing products picked by use case. That framing survives exactly until the first design review where someone asks why you cannot replay last Tuesday's events, or why adding a tenth consumer did nothing, or why one stuck message froze an entire shard. At that point the use-case story falls apart, because the real difference was never about streaming. It was about one decision the broker makes the instant you acknowledge a message.
+
+Does it delete the message, or keep it and remember where you are?
+
+That is the whole fork. A queue deletes on acknowledgement; the message is consumed, gone, unrecoverable. A log keeps every record and hands each reader a bookmark. Replay, fan-out, ordering guarantees, how much state a consumer carries, how far you can scale readers: all of it is downstream of that single choice. This piece takes the three systems people actually run, Kafka, Amazon SQS, and RabbitMQ, and shows how each one is a different answer to the delete-or-retain question, plus what changed in 2026 when both flagship systems grew the other's shape.
+
+If you want the broader interview scaffolding these tradeoffs slot into, [the system design interview framework](/blog/system-design-interview-framework) is the parent piece; this is the deep dive on the messaging layer.
+
+## The log is the deeper primitive
+
+Start with the abstraction, not the products, because the abstraction is what you are actually choosing between.
+
+Jay Kreps defined the log precisely in his 2013 essay, the one piece of writing that explains more of modern data infrastructure than any other. A log is "an append-only, totally-ordered sequence of records ordered by time." He chose that word deliberately over "messaging system" or "pub sub," because, in his words, it "is a lot more specific about semantics." A log does two things and only two things: it orders changes, and it distributes data. Everything a log-based broker can do is some consequence of those two properties.
+
+The consequence that matters most is almost shocking in how much it collapses. If a log records what happened, in order, then a consumer's entire state is one number: the position of the last record it processed. Kreps puts it as being able to "describe each replica by a single number, the timestamp for the maximum log entry it has processed." Hold that against a queue, which has to track acknowledgement state for every single in-flight message. The log reader carries O(1) state. The queue carries O(messages currently being worked). That asymmetry is not a detail. It is the reason logs scale fan-out cheaply and queues scale per-message control cheaply, and you will see it drive every tradeoff below.
+
+There is a second consequence that explains why people build whole architectures on logs. State-machine replication: "if two identical, deterministic processes begin in the same state and get the same inputs in the same order, they will produce the same output and end in the same state." Feed the same log to a database, a search index, and a cache, and each one is "a projection of this history." The log is the record of truth; the table is a view derived from it. A queue cannot do this, because once a message is acknowledged and deleted, the history that would let you rebuild those views is gone. This is the spine of event sourcing, and it is why "can I rebuild my read models from scratch" is a question only a log can answer yes to. If you have read [replication](/blog/replication-strategies), this is the same idea pointed at application state instead of database bytes.
+
+So the log is the more general primitive: a queue is roughly a log you are only allowed to read once. Keep that lens. Now watch each product pick a side.
+
+## Kafka: the log made concrete
+
+Kafka is the commit log turned into a product, and once you see it that way its odd corners stop being odd.
+
+A Kafka topic is split into partitions, and each partition is "an ordered, immutable sequence of messages that is continually appended to," with every message assigned "a sequential id number called the offset that uniquely identifies each message within the partition." The producer decides which partition a message lands in, normally by hashing a key, and that decision is load-bearing in a way I will come back to. The broker writes the message to disk and does not remove it when a consumer reads it. Removal happens later, on a retention policy, not on consumption.
+
+Here is the part that breaks the queue mental model: the consumer owns its position. The broker is not pushing messages and crossing them off. The consumer pulls, and it tracks the offset of the next message it wants. That offset is checkpointed to an internal topic called `__consumer_offsets`, but the broker treats it as a bookmark, not a delete marker. Which is exactly why replay is free. As the docs put it, the consumer "can specify an offset to reconsume data if needed." You did not turn replay on. Replay is just what it means to not delete on read. Reset the offset backward and you read history again. A queue physically cannot offer this, because the data is no longer there to re-read.
+
+One mechanism gives Kafka both classic patterns at once. A partition "is consumed by exactly one consumer within each subscribing consumer group at any given time." Read that rule twice, because two behaviors fall out of it. Consumers in the *same group* divide the partitions between them, so the group as a whole load-balances the work: that is a queue. Consumers in *different groups* each independently read every partition, so each group sees the full stream: that is pub-sub fan-out. Analytics, a search indexer, an audit log, and a fraud detector can be four consumer groups reading the identical bytes off the same partitions, each at its own pace, none interfering with the others. A delete-on-ack queue cannot do that fan-out without physically duplicating the queue N times, which is precisely the inefficiency that pushed RabbitMQ to build Streams.
+
+Now the constraint hiding inside that elegant rule. One consumer per partition per group means **partition count is the ceiling on consumer parallelism**. A topic with eight partitions can have at most eight working consumers in a group; a ninth sits idle. "Just add consumers" does nothing past that line. Worse, partition count is a design-time decision that is painful to change later: repartitioning rehashes keys, which scrambles the per-key ordering of any in-flight data, so it is close to a one-way door. You choose partition count for peak future load and live with it. This is why [capacity estimation](/blog/capacity-estimation) on a Kafka design has to happen up front rather than being deferred; the number you pick is hard to walk back.
+
+### Why Kafka is fast, mechanically
+
+Kafka's throughput is not magic, and the design docs are refreshingly blunt about the physics. Linear writes to a JBOD array clock "about 600MB/sec but random writes is only about 100kB/sec, a difference of over 6000X." An append-only log is nothing but linear writes, so it sits on the right side of that 6000x cliff by construction. Kafka leans on the OS page cache instead of caching in the JVM heap, which dodges garbage-collection pressure and double-buffering. Reads use zero-copy via `sendfile`, avoiding "four copies and two system calls" per read, which is why serving many consumer groups off the same data stays cheap. The whole engine is built so "all operations are O(1) and reads do not block writes."
+
+There is an operational tax buried in that. The page-cache reliance assumes consumers read *recent* data that is still hot in memory. A lagging consumer that falls far behind forces the broker to seek to cold disk, and throughput falls off a cliff right when you least want it. Consumer lag is therefore a real SLO on a Kafka system, not a vanity dashboard. It tells you whether your readers are still in the fast path. The mechanics that make Kafka fast also make it pickier about consumer health than a queue ever is, and this connects directly to [latency and the tail](/blog/latency-throughput-tail): a healthy consumer reads from RAM, a lagging one pays disk-seek latency on every fetch.
+
+### Delivery semantics, scoped honestly
+
+Kafka offers the three guarantees every messaging system has to choose among: at-most-once (may lose, never redelivers), at-least-once (never loses, may redeliver, and the default), and exactly-once. Exactly-once arrived in 0.11 via an idempotent producer that uses sequence numbers to discard duplicate writes, plus transactions that make a read-process-write cycle atomic across partitions and offset commits.
+
+The trap is reading "exactly-once" as a global promise. It is not. The guarantee is a closed world: atomic across *Kafka* partitions and *Kafka* offset commits. The instant your consumer writes to an external database or calls an external API, it has left the transaction, and you are back to needing idempotent writes or the transactional-outbox pattern. This is the same wall described in [idempotent webhooks](/blog/idempotent-webhooks): no trick makes a broker transaction and a foreign API call atomic together. If you want the full treatment of why exactly-once delivery is a myth and exactly-once processing is the achievable thing, [idempotency and the exactly-once myth](/blog/idempotency-exactly-once) is the companion piece. The short version: design idempotent consumers regardless of which broker you run, because at-least-once is the honest floor everywhere.
+
+## SQS: the queue archetype
+
+Amazon SQS is the queue in its purest managed form, and it is honest about exactly the things people wish were not true.
+
+Standard SQS gives you a "nearly unlimited number of API calls per second," and it tells you the catch in the same breath: it ensures "at-least-once message delivery, but due to the highly distributed architecture, more than one copy of a message might be delivered, and messages may occasionally arrive out of order." The duplicate mechanism is specified precisely rather than hand-waved. Messages live on multiple servers, and "one of the servers that stores a copy of a message might be unavailable when you receive or delete a message," so you might get that copy again later. AWS does not apologize for this; it tells you the fix in one line: "Design your applications to be idempotent." Treat duplicates as guaranteed, not rare, and you will build the right thing.
+
+The clever part of SQS is how it makes a queue safe without exposing a transaction to you: the visibility timeout, which is a lease. When a consumer calls `ReceiveMessage`, the message goes invisible for a window (default 30 seconds, max 12 hours) so no other consumer can grab it. The consumer must call `DeleteMessage` before the window expires. Delete in time and the message is gone for good; miss the window and the message reappears and is redelivered. That is at-least-once delivery expressed as a lease plus an explicit delete, and it has a concrete tuning rule: set the timeout above your p99 processing time, or a slow-but-fine consumer will have its message redelivered out from under it and you will manufacture duplicates. If a message fails enough times, a dead-letter queue catches it after `maxReceiveCount` attempts, which is how you quarantine a poison message instead of redelivering it forever.
+
+SQS FIFO is ordering and deduplication bolted onto the queue, and the bolts have a price tag. It gives exactly-once processing and strict ordering, but only *per message group ID*: "messages with different message group IDs may arrive or be processed out of order relative to one another." Throughput is where you pay. The default is 300 transactions per second per API action, up to 3,000 per second per partition with batching, and high-throughput mode spreads load across partitions keyed by message group ID. Hit the ceiling and you get a `ThrottlingException` even when messages are sitting right there waiting. There is a deduplication window of five minutes: resend a message with the same `MessageDeduplicationId` inside that window and it is silently dropped, which is how producer retries stay safe.
+
+Notice the structural rhyme with Kafka. Kafka orders within a partition; SQS FIFO orders within a message group. Kafka parallelism is capped by partition count; SQS FIFO parallelism is capped by the number of message groups. Both make you choose your ordering boundary up front, and both punish "I want one global order" with serialized throughput, because one global order means one partition or one group. The vocabulary differs; the physics is identical, and recognizing that is the difference between memorizing two products and understanding one axis.
+
+## RabbitMQ: the routing-rich queue
+
+RabbitMQ is also fundamentally a queue, but it answers a question the other two largely ignore: how do messages get routed to the right place? That is where its identity lives.
+
+Producers in RabbitMQ never address a queue directly. They publish to an *exchange*, and the exchange routes the message to queues "based on routing keys and bindings." Four exchange types (direct, topic, fanout, headers) give RabbitMQ routing expressiveness that neither Kafka nor SQS has natively. You can fan a message out to every bound queue, route by an exact key, or match a wildcard topic pattern, all declared in the broker rather than coded in producers. If your problem is "this event needs to reach these three subsystems by these rules," RabbitMQ answers it at the infrastructure layer instead of making you build a router.
+
+Delivery to competing consumers on a queue is round-robin, and safety comes from manual acknowledgements. On `basic.ack`, RabbitMQ records the message as delivered and discards it. If the channel or connection dies before the ack, "any delivery that was not acked is automatically requeued," and the redelivered copy carries a `redelivered` flag set true so the consumer knows it is a retry. Prefetch, set as channel QoS, bounds how many unacknowledged messages a consumer can hold at once (100 to 300 is the usual range); hit the prefetch limit and RabbitMQ "will stop delivering more messages on the channel until at least one of the outstanding ones is acknowledged." That is backpressure built into the protocol.
+
+The trap here is durability defaults. People assume classic RabbitMQ queues are safe out of the box; they are not. End-to-end no-loss requires a durable queue *and* persistent messages *and* publisher confirms *and* manual acks, all four together, per the reliability guide. The modern answer is **quorum queues**: "a durable, replicated queue based on the Raft consensus algorithm," with a leader and followers, the recommended default whenever you need a replicated, highly available queue. A message confirmed to the publisher "should not be lost as long as at least a majority of nodes hosting the quorum queue are not permanently unavailable." Poison-message protection is built in via a default delivery-limit of 20, after which the message is dropped or dead-lettered. The cost is that prefetch is capped at 2,000 to keep the Raft log from ballooning, and quorum queues drop several classic-queue features (non-durable, exclusive, transient, server-named). This is the same consensus tradeoff that shows up in [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum): you buy durability and ordered failover with a majority quorum, and you pay for it in latency and throughput.
+
+## The convergence: log versus queue is an axis, not a binary
+
+Here is the part shallow comparisons miss entirely, and it is the most important thing to know in 2026: both flagship systems grew the other's shape, so the binary collapsed into a spectrum.
+
+**Kafka grew a queue.** KIP-932, "Queues for Kafka," went generally available in Kafka 4.2. The motivation is stated plainly: Kafka's consumer groups "provide strong ordering and reliable streaming but struggle with bursty workloads due to the strict 1:1 partition-to-consumer mapping and head-of-line blocking." Share groups fix that. They let "consumers scale elastically beyond partition count" with per-message acquisition locks (default 30 seconds) and individual ack, release, reject, and renew operations, plus a default of five delivery attempts before a message is treated as unprocessable. You can now have more consumers than partitions, acknowledging messages one at a time, exactly like a queue. The explicit tradeoff in the design: "share groups sacrifice ordering for elastic scaling and per-message control." You give up the partition's total order to escape the partition's parallelism ceiling. Kafka let you choose which of its constraints to keep.
+
+**RabbitMQ grew a log.** RabbitMQ Streams are "an immutable append-only disk log" with "non-destructive consumer semantics," which the docs contrast directly against the rest of the product: "all other RabbitMQ queue types have destructive consume behaviour, where messages are deleted from the queue when a consumer is finished with them." Streams let consumers replay via `x-stream-offset` (first, last, next, a specific offset, or a timestamp), with retention by `max-length-bytes` or `max-age`, and Single Active Consumer to restore ordered processing across failover. That is a Kafka-shaped log living inside RabbitMQ, built precisely to give multiple independent readers the same stream without N copies of a queue.
+
+So the clean takeaway is this. **Log versus queue is an axis, not a binary.** As of 2026 each flagship can operate at either end. Lay them on a line from pure log to pure queue and they straddle it: Kafka consumer groups and RabbitMQ Streams sit at the log end, Kafka share groups and SQS FIFO and RabbitMQ quorum sit at the queue end, and each product now reaches across the middle.
+
+Which raises the obvious question: if both can do both, does the choice still matter? It does, because each system stays *opinionated* toward its origin, and the convergence carries a cost asymmetry. Share groups give Kafka queue semantics, but you inherit Kafka's full operational weight to get them: brokers, partitions, KRaft metadata, consumer-lag monitoring. RabbitMQ Streams give you a log, but without Kafka's ecosystem of Connect, stream processing, and tiered storage. The defaults, the tooling, and the failure modes all still pull toward where each system started. Picking the tool aligned with your dominant pattern, log-first or queue-first, is usually still the right call. The convergence means you *can* cross over for a secondary need without bolting on a second system; it does not mean the two ends became interchangeable.
+
+## How a senior actually decides
+
+Strip away the product names and the decision reduces to a short sequence of questions, each one cutting off a branch.
+
+| Question | If yes | Why it decides |
+| --- | --- | --- |
+| Do you need replay, or several independent readers of the same stream? | Log (Kafka, RabbitMQ Streams) | Only a retain-and-offset broker keeps history after a consumer is done; a queue deleted it on ack |
+| Is the event history itself your source of truth (event sourcing)? | Log, likely with compaction | Compaction keeps the latest value per key as durable materialized state; a queue has no retention concept |
+| Do you need per-message ack and work distribution across competing workers, with no replay? | Queue (SQS, RabbitMQ, or Kafka share groups) | O(in-flight) per-message control is what queues are cheap at; paying for a log buys nothing here |
+| Do you need rich routing (fan-out by rules, topic patterns)? | RabbitMQ exchanges | Routing is declared in the broker; Kafka and SQS make you build it |
+| Do you need strict ordering? | Single partition or single message group, and accept the throughput hit | One global order serializes throughput everywhere; there is no free lunch |
+| Are you fully managed with no ops appetite? | SQS | Nearly unlimited standard throughput, zero brokers to run; you trade away replay and routing |
+
+A few things separate the staff-grade answer from the competent one. The first is naming the irreversible levers early: partition count in Kafka and message-group cardinality in SQS FIFO are design-time decisions that are painful to undo, so they belong in the first design conversation, not a later tuning pass. The second is treating at-least-once as the universal floor and building idempotent consumers no matter which broker wins, because every one of these systems will hand you a duplicate eventually. The third is reasoning about head-of-line blocking explicitly: a single slow message at offset n stalls its whole partition for that consumer group, and you either size partition and group cardinality around that risk or you adopt share groups and trade away the ordering. The fourth is knowing the convergence well enough to add a capability without adding a system: when a queue-first service suddenly needs replay for one stream, RabbitMQ Streams may beat standing up a whole Kafka cluster, and that judgment is worth real money.
+
+The systems I have built lean on both ends of this axis depending on the job. [NomadCrew](/case-study/nomadcrew) routes real-time presence and trip updates through a WebSocket hub where per-connection fan-out and ordering-within-a-conversation matter more than long-term replay, which is queue-and-pub-sub territory; the design questions there rhyme with [Design Twitter](/blog/design-twitter-feed) and its fan-out problem. [IntelliFill](/case-study/intellifill) coordinates a multi-agent LLM pipeline where stages hand work to the next stage and at-least-once with idempotent steps is exactly the right contract, a queue-shaped problem end to end. [Aladeen](/case-study/aladeen) leans the other way, treating an append-only event record as the source of truth for agent-CLI observability, which is the log abstraction doing what only it can: replay the history to reconstruct what happened. Same axis, three different points on it, chosen by which property the workload actually needed rather than by which product had the most momentum.
+
+## The honest landing
+
+The mistake is comparing three products. The move is comparing two abstractions and then mapping the products onto the axis between them. A log retains every record and hands each reader an offset, so it can replay, fan out to many independent consumers off the same bytes, and serve as a source of truth, at the cost of carrying ordering and parallelism as a partition-shaped decision you make up front. A queue deletes on acknowledgement, so it gives cheap per-message control and work distribution, at the cost of having no history to re-read and no native fan-out. Kafka is the log, SQS and RabbitMQ are queues, and in 2026 each one reaches across the middle: Kafka with share groups, RabbitMQ with Streams.
+
+Pick the end your dominant workload lives at, build idempotent consumers because at-least-once is the floor regardless, decide the irreversible partition and group cardinality before anything ships, and treat consumer lag and head-of-line blocking as first-class concerns rather than surprises. Do that and the broker becomes the boring, reliable layer it should be. Skip it and you find out which abstraction you actually needed at 2 a.m., when the stream you cannot replay is the one you most wish you had kept.
+
+## FAQ
+
+<FAQ />

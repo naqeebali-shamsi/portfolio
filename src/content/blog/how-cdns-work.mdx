@@ -1,0 +1,151 @@
+export const meta = {
+  slug: 'how-cdns-work',
+  title: 'How a CDN Works: Edge Caching, Anycast, and the Last Mile',
+  description:
+    "A CDN exists to beat the speed of light by shortening distance. How edge caching, anycast routing, and DNS steering actually work, and where each one quietly fails.",
+  headline: 'How a CDN Works: Edge Caching, Anycast, and the Last Mile',
+  deck: 'You cannot out-engineer the speed of light, so the only durable fix is to move the bytes closer.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '15 min',
+  tags: ['cdn', 'caching', 'anycast', 'dns', 'networking', 'system-design'],
+  faq: [
+    {
+      q: 'Does a CDN route me to the geographically closest server?',
+      a: "Usually, but not because it knows geography. Anycast announces one IP from many locations and lets BGP pick the route, and BGP optimizes for AS-path length and ISP peering policy, not for distance or latency. A measurement of a real anycast CDN found roughly 20 percent of clients land on a sub-optimal front-end, and just under 10 percent see a path that is 100 ms or more slower than the best available choice. A Denver user can be served from Phoenix because that is where their ISP hands traffic off.",
+    },
+    {
+      q: 'What is a cache hit ratio and why does it matter more than having a CDN?',
+      a: "Cache hit ratio is hits divided by hits plus misses: the fraction of requests the edge answers without touching your origin. It is the lever, not the presence of a CDN. At a 95 percent hit ratio only 5 percent of requests reach origin; going from 90 to 99 percent does not shave 9 percent of origin load, it cuts origin requests tenfold. A CDN with a misconfigured Vary header or a Set-Cookie on static assets can drive the hit ratio toward zero, at which point it just adds a hop.",
+    },
+    {
+      q: 'Can a CDN serve dynamic or personalized content, or only static files?',
+      a: "It can serve dynamic content two ways. Edge compute runs your code at the PoP in lightweight V8 isolates that start about 100 times faster than a Node process, so personalization happens microseconds from the user with no cold start. The other route is to cache everything, including event-driven content, and purge the instant it changes. Fastly propagates purges by gossip over UDP and runs on the order of 60,000 purges per second, which is what makes a news homepage or a price page cacheable.",
+    },
+    {
+      q: 'Why did Netflix build its own CDN instead of renting one?',
+      a: "Because their workload is predictable, and a generic CDN only caches on a miss. Netflix can forecast what members will watch, so Open Connect pre-loads content to its appliances during off-peak fill windows instead of reacting to demand, which Netflix says cuts upstream network demand by several orders of magnitude. It also places appliances inside ISP networks for free, Netflix supplies the hardware and the ISP supplies power and space, and steers clients to specific appliances with explicit per-server URLs rather than anycast.",
+    },
+    {
+      q: 'Is anycast safe for long-lived connections like WebSockets or HTTP/3?',
+      a: "Less safe than for short HTTP requests. A short request tolerates a mid-flight reroute because it just lands on a different PoP and opens a new connection. For a long-lived connection, a catchment shift, meaning the set of client prefixes reaching a given PoP changes as inter-domain routing moves, can drop the session entirely. The usual mitigations are connection-ID-aware steering and pinning the client to a unicast IP after the initial anycast handshake.",
+    },
+  ],
+}
+
+Open a stopwatch and put a server in Virginia. A user in London asks it for a web page. Before a single byte of that page comes back, the request has to cross the Atlantic and the answer has to cross back, and the ocean does not care how much you paid for the server. Light in fiber moves at roughly two-thirds of its vacuum speed, slowed by a factor of about 1.5 by the glass it travels through. New York to London has a theoretical floor near 37 ms round trip in a vacuum; a real transatlantic cable lands closer to 60 ms once you count switching and amplification. Add TLS and TCP handshakes, which can mean three or four round trips before the first byte of content, and your London user is waiting a quarter-second to start receiving a page that the server generated in two milliseconds.
+
+You cannot fix this with a faster server. You cannot fix it with more bandwidth, because the constraint is not how wide the pipe is, it is how long the wire is. As Ilya Grigorik put it years ago, latency, not bandwidth, is the constraining factor for typical web pages, and for most pages every 20 ms of latency improvement is close to a linear improvement in load time. The speed of light is not negotiable. The distance is. That is the entire reason CDNs exist: not to make the server faster, but to keep a copy of the answer in London so the ocean never enters the picture.
+
+Everything else in this piece follows from that one move, and from the awkward fact that "put a copy closer" turns out to hide three genuinely hard problems underneath a simple sentence.
+
+## The metric that decides whether the CDN matters
+
+Put a cache in London and you have changed nothing until that cache actually answers requests. The number that tells you whether it does is the cache hit ratio: hits divided by hits plus misses. Cloudflare's own worked example is 39 hits and 2 misses, which is 39 over 41, or 95.1 percent. Read that as economics rather than arithmetic. At a 95 percent hit ratio, only 5 percent of requests ever reach your origin. The CDN has cut origin load twentyfold.
+
+Here is the part that reframes how you should think about it. The hit ratio is the lever, not the presence of a CDN. A CDN that caches everything but lands at a 50 percent hit ratio has merely halved your origin load. One at 99 percent has cut it a hundredfold. And the curve is brutally nonlinear at the top: going from 90 to 99 percent does not save you 9 percent of origin traffic, it takes origin from 10 percent of requests to 1 percent, a tenfold reduction. Every percentage point you claw back near the ceiling is worth ten times the one below it.
+
+Which means the interesting failure mode is not "no CDN," it is "CDN with a hit ratio near zero." The usual culprits are mundane and self-inflicted: cache-busting query strings that make every URL unique, a `Vary` header that forks the cache key on something high-cardinality, a `Set-Cookie` riding on your static assets so the edge refuses to store them, or TTLs so short that nothing survives to be reused. Each of these turns the edge into an expensive extra hop that asks origin the same question over and over. This is the same offload-versus-correctness tension that runs through [the distributed cache](/blog/distributed-cache); a CDN is a globally distributed read-through cache, and it inherits every one of that pattern's sharp edges.
+
+There is a second axis worth naming before you optimize the wrong one. Request hit ratio and byte hit ratio are different numbers. You can answer 99 percent of requests from the edge and still pass most of your bytes through origin, if the 1 percent you miss happen to be enormous video segments. A senior decides which one to chase by looking at what the workload actually costs: for an API serving small JSON, optimize request hit ratio; for video, watch the bytes.
+
+## What the edge is allowed to keep
+
+The edge does not get to decide what it caches. The origin tells it, through headers, in a precedence that trips up more teams than any routing subtlety ever will. Three audiences read cache headers, and conflating them is the most common caching bug in production.
+
+`Cache-Control` speaks to the browser, and to the edge only when nothing more specific overrides it. `s-maxage` is the shared-cache TTL, the middle ground for any cache between the browser and origin. `CDN-Cache-Control` speaks to the CDN alone, which is the one people forget exists. That last one is what lets you hold an object at the edge for an hour while telling the browser not to cache it at all, exactly what you want for HTML that should be fast but never stale in someone's back button.
+
+And TTL means something narrower than people assume. TTL is freshness: how long the edge may serve an object without checking back with origin. It is not the same as retention, which is how long the object physically stays on disk. Cloudflare splits these deliberately, and the gap between them is where one of the best tricks lives. `stale-while-revalidate` says serve the expired copy immediately and refresh it in the background, so the user never waits on a revalidation. `stale-if-error` says if origin is down, keep serving the stale copy rather than failing. Both turn the cache from a freshness mechanism into a resilience one, a theme worth picking up in [resilience patterns](/blog/resilience-patterns), where serving slightly stale beats serving an error nearly every time.
+
+```text
+Freshness vs retention (a 5-minute TTL, 1-hour retention)
+  t=0:00  fetched from origin, fresh
+  t=0:00 .. 0:05  served directly, no origin contact
+  t=0:05  TTL expires -> object is STALE, still on disk
+  t=0:05 .. 1:00  with stale-while-revalidate: serve stale, refresh in bg
+  t=1:00  retention ends -> evicted from disk
+```
+
+## Finding the nearest edge, and why "nearest" is a lie
+
+Now the genuinely hard problem. You have a cache in London, one in Frankfurt, one in Virginia. A request arrives. How does it reach the right one? There are two mechanisms, they work at different layers, and the mature answer is to run both.
+
+The first is anycast, which works at the network layer. You announce one IP address via BGP from every PoP at once, and the client's ISP picks a route. The packets land at whichever PoP that route leads to. No DNS games, no per-client logic, and a useful side benefit: a volumetric DDoS attack gets spread across every PoP instead of concentrated on one, because the attack traffic follows the same announcements and fans out. This is why anycast is the default for absorbing attacks.
+
+Here is the line every junior engineer gets wrong. Anycast does not route you to the closest server. It routes you to wherever BGP's path selection sends you, and BGP optimizes for AS-path length and the ISP's local routing policy, not for geographic distance and emphatically not for latency. RFC 4786, the standards document for running anycast, is explicit that the mechanism is latency-unaware and load-unaware. It has no idea which PoP is fastest for you. It only knows which route is shortest by its own policy metrics.
+
+How much does that hurt? We have real numbers, because researchers measured a production anycast CDN (Bing) and published it at IMC 2015. The good news first: about 82 percent of clients land within 2000 km of their assigned front-end, and about 90 percent within 1375 km. Most of the time, anycast is fine. But the tail is real and it is expensive. Anycast is 25 ms or more slower for 20 percent of requests, and just under 10 percent of measurements are 100 ms or more slower than the best unicast choice available to that client. The paper names the causes plainly: BGP's lack of topology insight makes occasional far-away choices, and an ISP's own routing policy hands traffic off at a distant peering point. A client in Denver routed to Phoenix; a client in Moscow handed off in Stockholm. Not because anyone is broken, but because that is where the route goes.
+
+The second mechanism is DNS-based steering, at the application layer. Here the authoritative DNS server returns a different IP to each client based on where the query appears to come from. Akamai pioneered this, and it buys you fine-grained, near-real-time control that anycast structurally cannot: you can weight by current PoP load, drain a hot site gradually, and pick by measured latency rather than by BGP's guess.
+
+It has its own fatal blind spot, and it is worth understanding precisely because it is so easy to state wrong. The authoritative server does not see the user. It sees the user's recursive resolver, the LDNS. When that resolver is on the same network as the user, fine. When it is a public resolver like `8.8.8.8` or OpenDNS, serving a large and geographically scattered set of clients, there is no single good answer to "where is this query from," because the resolver and the user can be on different continents. The IMC paper found about 8 percent of demand comes from clients more than 500 km from their resolver. Steer by the resolver and you can send a user in Texas to a PoP chosen for a datacenter in Virginia.
+
+The fix is EDNS Client Subnet, RFC 7871, usually written ECS. The recursive resolver attaches a truncated prefix of the client's own subnet, say a /24, to the query it sends upstream, so the CDN's authoritative server can map the actual user's region instead of the resolver's. This is the machinery behind Akamai's end-user mapping: map the user, not the resolver.
+
+So which do you pick? You do not. The IMC researchers showed that a simple history-based DNS scheme recovers 15 to 20 percent of the clients anycast underserves. That is the synthesis a staff engineer lands on: anycast as the default, because it is simple and DDoS-resilient, plus DNS and ECS layered on top to rescue the latency tail anycast leaves behind. They are not competitors. They are two layers of the same routing stack, each covering the other's weakness.
+
+```text
+Routing mechanism tradeoffs
+  Anycast (network layer)
+    + dead simple, no per-client logic
+    + DDoS spreads across PoPs automatically
+    - BGP picks by AS-path + policy, NOT latency
+    - cannot drain a hot PoP gracefully (withdrawing risks cascade)
+  DNS steering (application layer)
+    + fine-grained, load-aware, near-real-time control
+    + can pick by measured latency
+    - sees the resolver, not the user (fixed by ECS / RFC 7871)
+    - ECS truncation trades privacy + cache fragmentation for accuracy
+```
+
+## Dynamic content, which is where "CDNs only do static files" goes to die
+
+The old boundary said a CDN serves static files and dynamic content goes to origin. That boundary is gone, dissolved from two directions at once.
+
+The first direction is edge compute. Cloudflare Workers run your code at the PoP, not in a container or a VM, but in a V8 isolate, the same sandboxing primitive a browser uses to keep one tab's JavaScript away from another's. The docs are specific: a single runtime instance runs hundreds or thousands of isolates and switches between them quickly, an isolate starts roughly 100 times faster than a Node process, it uses an order of magnitude less memory, and each tenant's memory is fully isolated to mitigate side-channel attacks like Spectre. The practical consequence is the one that matters: effectively no cold start. The per-process warm-up that plagues serverless functions is paid once for the whole runtime, not once per request. So A/B variants, geo and cookie-based content, auth gating, and edge-side HTML assembly can all happen microseconds from the user, with only the genuinely dynamic fragment fetched from origin.
+
+That win comes with a bill, and naming it is what separates an architect from an enthusiast. Personalizing at the edge means putting state at the edge, in KV stores or durable objects, and the moment you do, you own edge-to-origin consistency, regional data residency, and read-your-writes semantics across a hundred locations. The latency win is real; so is the distributed-state problem you just signed up for, which is its own discipline.
+
+The second direction is invalidation, and it is the half people underestimate, because it looks like a config setting and is actually a distributed-systems problem. Fastly's model is to cache everything, including event-driven content that "feels" dynamic, and then purge it the instant it changes. The interesting question is how a purge reaches every PoP on Earth fast enough to matter. Fastly's answer, from their own engineering writeup: a purge is broadcast over UDP with no acknowledgment, propagated by a gossip protocol (Bimodal Multicast) where each node forwards to at least two others. Inter-POP packet loss runs under 0.1 percent, skipping the ACK cut propagation latency by up to half, and the system now handles on the order of 60,000 purges per second, up from 2 to 3 thousand a few years back. Fastly's own marketing figure is stale content updated within about 150 ms globally; treat the exact number as a vendor claim, but the mechanism behind it is real and clever.
+
+Group invalidation is the operational piece that makes this usable. Surrogate keys (cache tags) let you label objects and purge by label: tag every page that shows a given product, and one purge-by-key clears all of them when the price changes. Soft purge marks objects stale so they revalidate on the next request, hard purge evicts immediately. Fast, precise purge is the thing that makes a news homepage or a live inventory page cacheable at all, because the moment you can invalidate in 150 ms, "dynamic" stops meaning "uncacheable."
+
+## A worked tour of the request
+
+Stitch the pieces into one request and the architecture stops being a list. A user in Lyon loads a page. Their query resolves through ECS to a French PoP rather than their resolver's region. Anycast lands the TCP and TLS handshake at the nearest edge by BGP path. The edge checks its cache key, normalized so tracking parameters do not fragment it, finds the HTML stale but within its `stale-while-revalidate` window, and serves the stale copy in under 5 ms while kicking off a background refresh. A Worker stitches in a personalized header fragment from edge KV. The one truly dynamic call, the user's cart total, goes to origin. The page is interactive before the cross-Atlantic round trip that the naive design would have spent on the very first byte.
+
+This is the same muscle as a [system design interview](/blog/system-design-interview-framework): name the constraint, pick a mechanism, then say out loud where it breaks. CDNs are a favorite there precisely because every layer has a failure mode an interviewer can probe.
+
+## The failure modes a staff engineer names unprompted
+
+A tutorial stops at the happy path. The reason this topic separates senior from junior is that the failures are specific and the mitigations are known.
+
+The thundering herd. When a hot object's TTL expires, thousands of edge nodes can miss simultaneously and dogpile origin in the same instant, which is exactly when origin can least afford it. The defenses stack: `stale-while-revalidate` so the herd serves stale instead of stampeding; request coalescing so concurrent misses for the same key collapse into one origin fetch; and tiered cache, where a designated upper-tier PoP fronts origin so the fan-out collapses from N PoPs talking to origin down to one shield doing it. This is the same coalescing instinct you would reach for in front of any expensive backend, and it is worth pairing with how [latency and the tail](/blog/latency-throughput-tail) behave under load, because a stampede is a tail-latency event before it is an outage.
+
+Anycast cannot load-shed gracefully. There is no gentle way to drain a hot anycast PoP, because the only lever is withdrawing the BGP announcement, and withdrawing it dumps that PoP's entire catchment onto its neighbors at once, risking a cascade. Operators reach for blunt instruments here: selective announcement, AS-path prepending, BGP communities. This clumsiness is a large part of why DNS steering keeps earning its place even after anycast handles the common case; DNS can shift load a few percent at a time, and BGP cannot.
+
+Catchment instability for long-lived flows. A catchment, the set of client prefixes that actually reach a given PoP, is not a stable map. It drifts as inter-domain routing changes, which is why an entire research tool (Verfploeter) exists just to measure it. For short HTTP requests this is harmless; a reroute mid-stream just means the next request opens a fresh connection elsewhere. For long-lived connections, HTTP/3 over QUIC, WebSockets, a large video segment download, a catchment shift can break the session outright. The mitigations are connection-ID-aware steering and pinning the client to a unicast IP once the initial anycast handshake is done. If you run a persistent connection over anycast and have not thought about this, you have a 2 a.m. incident waiting. It is the same lesson [NomadCrew](/case-study/nomadcrew) ran into from the other side: its WebSocket hub drops events from a full 256-deep buffer rather than block, because a persistent connection forces you to decide, explicitly, what happens when the happy path stops holding.
+
+The cache key is a design surface, not a default. What you fold into the key, query parameters, headers, cookies, `Vary`, is the entire difference between a 99 percent and a 9 percent hit ratio. Normalize it before it ever reaches cache: strip tracking parameters, sort query strings, drop cookies on assets that do not need them. A key you designed beats a key you inherited.
+
+## Why Netflix built its own
+
+Which brings us to the most instructive special case, because it inverts almost everything above. Netflix runs Open Connect, its own CDN, and the reason is not vanity. It is that a generic CDN is demand-driven: it caches an object only after a miss, reactively. Netflix's workload is the opposite of reactive. They can forecast, with high accuracy, what members will watch and roughly when. When demand is that predictable, caching on a miss is leaving the entire advantage on the table.
+
+So Open Connect does directed, proactive caching. During configurable off-peak fill windows, when the network is quiet, Netflix pre-loads content onto its appliances before anyone requests it, and the appliances even fill from each other to spare backbone capacity. Netflix says this cuts upstream network demand by several orders of magnitude versus a standard demand-driven CDN. That is the whole game, and it generalizes into a principle worth keeping: the more predictable your access pattern, the more you should prefetch rather than cache on a miss. Reactive caching is what you do when you cannot see the future. Netflix can, so it does not.
+
+The hardware deployment is its own economics lesson. Open Connect Appliances ship two ways: planted inside internet exchange points where they peer with ISPs over settlement-free interconnect, or embedded directly inside an ISP's network, given to qualifying ISPs free of charge. Netflix provides the box; the ISP provides power, space, and connectivity, and decides which of its customers route to it. Both sides win, the ISP stops hauling Netflix traffic across expensive transit links, and Netflix gets a cache one hop from the viewer. The widely cited outcome is that around 95 percent of Netflix traffic is served over direct connections to the member's ISP, though that figure is Netflix's own.
+
+The steering is the sharpest break from everything earlier: Open Connect does not use anycast at all. It steers with explicit URLs. When you press play, the request goes to Netflix's playback apps in AWS, which check entitlement and licensing and pick the files needed. A steering service (CODA), using a live inventory of what each appliance holds from a cache control service (CCS), selects the optimal appliances and generates per-appliance URLs handed back to the client. The client then pulls bytes from exactly those appliances, and an appliance serves a client only if that client's IP range was advertised to it over a BGP session. The appliances themselves store no user data; they do two things, report health and inventory to the AWS control plane, and serve bytes over HTTP. It is a clean split: a smart control plane in the cloud making explicit per-request placement decisions, and dumb fast caches at the edge doing what they are told.
+
+This is the same architecture behind the video systems worth studying on their own: the [Design Netflix](/blog/design-netflix) breakdown lives and dies on this prefetch-and-position model, and [Design YouTube](/blog/design-youtube) shows the contrast, where user-generated, long-tail, unpredictable demand pushes you back toward reactive edge caching because you genuinely cannot forecast which of a billion videos goes viral tonight. The CDN you build is downstream of how predictable your traffic is. Netflix and YouTube sit at opposite ends of that axis, and their CDNs look different for exactly that reason.
+
+## The honest landing
+
+A CDN is one idea wearing several costumes. The idea is that you cannot beat the speed of light, so you move the answer closer and stop paying for the distance. Everything technical is in service of that: edge caches to hold the answer, a hit ratio that decides whether holding it mattered, headers that govern what the edge may keep and for how long, anycast and DNS steering racing each other to put the request on the right cache, edge compute and instant purge to drag dynamic content into the cacheable world, and Netflix proving that if your future is predictable enough you should stop caching reactively and start pre-positioning.
+
+The trap is believing the simple sentence. "Put a copy closer" hides a routing layer that does not know where you are, a metric that silently decides your entire ROI, an invalidation problem that is really distributed consensus over UDP, and a long-lived-connection hazard that does not show up until it pages you. A senior engineer treats the CDN not as a checkbox in front of origin but as a distributed system with its own failure modes, and reasons about which one is about to bite. Get the hit ratio high, normalize the cache key, layer DNS steering over anycast for the tail, and decide on purpose what happens to your persistent connections when the route moves. Do that, and the London user gets their page in 5 ms instead of 250. Skip it, and you have bought a very expensive extra hop that asks Virginia the same question, all night long.
+
+## FAQ
+
+<FAQ />

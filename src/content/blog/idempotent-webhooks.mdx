@@ -1,0 +1,165 @@
+export const meta = {
+  slug: 'idempotent-webhooks',
+  title: 'Idempotent Webhooks: Making At-Least-Once Delivery Behave Like Exactly-Once',
+  description:
+    'Webhooks arrive at least once, so duplicates are guaranteed. How to process them exactly once: a stable idempotency key, an atomic database constraint, and reconciliation against the source of truth.',
+  headline: 'Idempotent Webhooks: Making At-Least-Once Delivery Behave Like Exactly-Once',
+  deck: 'Exactly-once delivery is a myth the network will never grant you. Exactly-once processing is a unique constraint and a little discipline.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '14 min',
+  tags: ['webhooks', 'idempotency', 'distributed-systems', 'stripe', 'postgresql', 'system-design'],
+  faq: [
+    {
+      q: 'Why do webhooks get delivered more than once?',
+      a: 'Webhooks use at-least-once delivery. The sender retries until it sees a success response, and it cannot tell the difference between an event you never received and one you handled whose acknowledgment was lost on the way back. Both look identical from the sender side, so the safe move is to resend. Exactly-once delivery is impossible at the transport layer, so duplicates are guaranteed rather than rare.',
+    },
+    {
+      q: 'What is an idempotency key for a webhook?',
+      a: 'A stable identifier supplied by the sender that is identical across every retry of the same event, such as Stripe event id evt_xxx. The receiver records the key once the event is processed and checks it before processing the next one. The uniqueness check must be enforced atomically at the database (a unique constraint), not with a separate read-then-write, or concurrent duplicates slip through.',
+    },
+    {
+      q: 'How do you handle webhooks that arrive out of order?',
+      a: 'Do not trust arrival order or the snapshot inside the event payload. Compare a version or timestamp from the sender and ignore events older than the state you already applied, or treat the event as a hint and re-fetch the object current state from the source of truth before acting. Combined with idempotent processing, this lets out-of-order, duplicated streams still converge on the correct state.',
+    },
+  ],
+}
+
+A webhook is a promise the sender cannot keep. It offers to tell you the moment something happens: a payment clears, a subscription renews, a report finishes rendering. What it cannot offer is to tell you exactly once.
+
+That gap is where double charges live.
+
+Picture the handler everyone writes first. Stripe POSTs a `payment_intent.succeeded` event, you look up the order, mark it paid, charge the saved card for the balance, send a receipt, and return 200. It works in every test you run, because in every test the event arrives once. Then one night the same event arrives twice, the handler runs twice, and a customer is charged twice for one order. Nothing in the logic was wrong. The assumption underneath it was: that the event would arrive once.
+
+It will not. This piece is about why, and about the small amount of discipline that makes a handler safe against the duplicates the network guarantees.
+
+## The only promise the network makes
+
+There are three delivery guarantees a messaging system can offer, and only one of them is real at the transport layer.
+
+At-most-once: the sender fires and forgets. Fast, and it drops messages whenever anything fails. Useless for a payment.
+
+Exactly-once: every message handled one time, no loss, no duplication. It is what everyone wants and what no transport can give you, for a reason worth internalizing.
+
+At-least-once: the sender keeps trying until it hears success, and accepts that "keeps trying" sometimes means a message lands more than once. This is what Stripe does. It is what SQS, SNS, and essentially every durable queue does. It is the only guarantee that survives contact with real networks.
+
+Here is why exactly-once is impossible where the bytes move. The sender delivers your event and waits for an acknowledgment. Your `200 OK` travels back across the same unreliable network that might drop it. If the sender never sees the ack, it cannot distinguish two situations: you never received the event, or you received it, did the work, and the ack got lost on the way home. From the sender side those cases are identical, and they demand opposite responses. The only safe move under that uncertainty is to resend. So it resends. The duplicate is not a defect in Stripe. It is Stripe being correct.
+
+```
+   Stripe                          Your endpoint
+     |  --- payment.succeeded -->    |  receives, marks paid, returns 200
+     |  X--- 200 OK (lost) ------    |
+     |  (no ack seen, so retry)      |
+     |  --- payment.succeeded -->    |  receives the SAME event again
+```
+
+Once you accept that duplicates are guaranteed rather than rare, the design question flips. The sender cannot make delivery exactly-once, so correctness has to move to the one place that can enforce it: the receiver.
+
+## Why exactly-once is the wrong thing to want
+
+The useful distinction is between delivery and processing.
+
+Exactly-once delivery is a myth. Exactly-once processing is achievable, and it is a different claim. It says: no matter how many times the event is delivered, the effect on my system happens once. You do not stop the duplicates from arriving. You make the second, third, and fourth arrivals do nothing.
+
+That property has a name. An operation is idempotent when applying it more than once has the same effect as applying it once. Setting a light switch to the "on" position is idempotent. Flipping it is not. The whole job of a webhook handler is to take an at-least-once stream of events and apply each one idempotently, so that "delivered twice" and "delivered once" reach the same end state.
+
+Everything below is a way to buy that property, ordered roughly from strongest to most situational.
+
+## The idempotency key, and where it has to come from
+
+The mechanism is simple to state. Before doing the work for an event, ask: have I already processed this one? If yes, do nothing and return success. If no, do the work and record that you did.
+
+The whole design rests on what "this one" means, and the answer has to come from the sender. You need a stable identifier that is identical across every retry of the same logical event. Stripe gives you exactly this. Every event carries an id like `evt_1P9x...`, and a retry of that event carries the same id. That id is your idempotency key: record it when you process the event, check it before you process the next.
+
+Resist the urge to invent your own key by hashing the payload. Two genuinely distinct events can serialize to similar shapes, and one logical event can vary in fields you do not control, so a payload hash gives you both false matches and false misses. The sender already solved this. Use its id.
+
+There is a deeper version of the idea worth holding onto: the best idempotency key is one you never have to check, because the operation is naturally idempotent. "Set order 1234 status to paid" applied twice leaves the order paid. "Increment the balance" applied twice is a bug. When you can express the side effect as a state you set rather than a delta you apply, duplicate suppression becomes a safety net instead of the only thing between you and a double charge. Reach for that shape first, and keep explicit keys for the operations that cannot be made naturally idempotent.
+
+## The race nobody tests for
+
+Here is the version that passes review and still double-charges.
+
+```
+seen = SELECT 1 FROM processed_events WHERE event_id = $1
+if seen: return 200
+do_the_work()
+INSERT INTO processed_events (event_id) VALUES ($1)
+```
+
+Read it slowly and it looks correct. Run it under the conditions webhooks actually create and it is not. Two copies of the same event can be in flight at once, because a retry can overlap a slow first attempt, and most handlers run on more than one instance. Both copies run the SELECT. Both see no row. Both proceed. Both do the work. The check and the act are separate steps with a gap between them, and the duplicate slips through the gap. This is a time-of-check-to-time-of-use race, and it is invisible in any test that sends one event at a time.
+
+You cannot close the gap with more application code, because the gap is between your process and the database, and another process is living inside it. You close it by making the check and the claim a single atomic operation, performed by the one component that can serialize concurrent writers: the database. Put a unique constraint on the event id, and let the insert itself be the claim.
+
+```
+INSERT INTO processed_events (event_id) VALUES ($1)
+  ON CONFLICT (event_id) DO NOTHING;
+
+-- 1 row inserted -> you won the claim, do the work
+-- 0 rows inserted -> someone already claimed it, skip
+```
+
+Now concurrency has exactly one referee. Whichever copy inserts the row first wins and proceeds. Every other copy hits the unique index, inserts nothing, and skips. The unique constraint is doing real work here that application logic cannot do from the outside: it is your concurrency-control primitive, not a data-integrity afterthought.
+
+## Idempotency stops at your transaction boundary
+
+Claiming the event and doing the work are two effects, and if they are not atomic together, you have only moved the bug.
+
+Suppose you record the event as processed, then crash before the work runs. The retry arrives, sees the event is already processed, and skips. The work never happens. You have turned a duplicate into a silent loss, which is worse, because nothing alerts on it.
+
+Suppose instead you do the work, then crash before recording the event. The retry arrives, finds nothing recorded, and does the work again. You are back to the double charge.
+
+The fix is to make the claim and the work commit together. When the side effect is a database write, this is clean: insert the idempotency row and perform the work in the same transaction, so they either both land or both roll back. A retry after a rollback finds no row and safely redoes everything. A retry after a commit finds the row and skips. One transaction, one outcome.
+
+The catch, and the part that separates a handler that works inside one service from one that works across many, is that idempotency only composes as far as your transaction reaches. The moment the side effect leaves your database, sending an email, calling a payment processor, publishing to another service, you cannot wrap it in your transaction. A crash between "commit my row" and "call the other system" reintroduces the exact gap you just closed, one network hop downstream.
+
+No trick makes a database transaction and a foreign API call atomic. What you do instead is push idempotency across the boundary, and two patterns carry the weight.
+
+The transactional outbox. In the same transaction that does your local work, write a row to an `outbox` table describing the external action you intend to take. A separate relay reads the outbox, performs the external call, and marks each row done. The external call can now fail and retry freely, because the intent is recorded durably exactly once, and the relay can be made idempotent on its own row id.
+
+Idempotency on the downstream call. Pass your own idempotency key to the system you are calling, so it dedupes you the same way you dedupe Stripe. Stripe's own API accepts an `Idempotency-Key` header for precisely this reason: it knows you will retry, and it wants your retry to be safe. Idempotency is not something you implement once at the edge. It is a property every hop has to carry.
+
+## Acknowledge fast, do the work later
+
+A timing trap hides in the obvious handler. If you do all the work synchronously and then return 200, two things go wrong under load. The sender has a timeout, and slow real work, charging a card, rendering a PDF, calling three downstream services, can blow past it. When it does, the sender concludes failure and retries, so your slowness manufactures the very duplicates you are fighting, and it does so exactly when you are already overloaded.
+
+The resolution is to split "received durably" from "fully processed." Make the handler do the smallest durable thing that guarantees the event is not lost, then return 200 immediately. In practice: verify the event, claim its id, and write it (or an outbox row) to the database in one transaction, then acknowledge. The heavy work runs asynchronously off a queue you control, where you own the retry policy and the timeout instead of borrowing the sender's.
+
+This is why a queue like SQS sits behind serious webhook endpoints. The handler's contract becomes narrow and fast: accept the event durably and exactly-once, then hand it to infrastructure built to process reliably. The thing the sender is impatient about, the ack, is now cheap. The thing that is genuinely slow is now somewhere the sender cannot see and cannot time out.
+
+## Order is not guaranteed either
+
+At-least-once delivery brings a quieter problem along with duplication: events do not always arrive in the order they happened. A retry of an earlier event can land after a later one. A `customer.subscription.updated` can overtake the `created` that logically preceded it.
+
+So do not trust arrival order, and do not trust the snapshot inside the event payload to be current, because by the time you process it the world may have moved on. Two habits handle this. Compare a version or timestamp the source provides, and ignore any event older than the state you have already applied. Or, for anything that matters, treat the event as a hint to go look, and re-fetch the object's current state from the source of truth before acting. Stripe says this directly: for ordering-sensitive logic, retrieve the object from the API rather than trusting the event body.
+
+This composes with idempotency rather than competing with it. Idempotency makes replays safe; reconciliation against the source of truth makes out-of-order delivery safe. Together they let you accept the messy stream the network actually delivers and still converge on the right state.
+
+## Verify it is real before you trust it
+
+A webhook endpoint is a public URL that accepts POSTs and then moves money. Treat it like one. Anyone who finds the URL can forge an event, and a handler that acts on unverified input is an open door to fabricated payments and bogus state changes.
+
+Every serious sender signs its webhooks. Stripe includes a `Stripe-Signature` header, an HMAC of the raw request body computed with a secret only you and Stripe hold. You recompute the signature over the exact bytes you received and reject anything that does not match. Two details matter in practice. Verify against the raw body, before any JSON parsing or middleware reserializes it, because a single reordered key changes the hash. And honor the timestamp inside the signature with a tolerance window, so an attacker cannot capture one valid request and replay it forever; an event older than a few minutes is rejected regardless of a valid hash.
+
+Signature verification is correctness as much as security. An idempotency scheme that faithfully dedupes forged events is just a reliable way to be attacked.
+
+## How to choose
+
+The decisions stack in a sensible order, strongest property first.
+
+| Concern | Default move | Why |
+| --- | --- | --- |
+| The side effect | Make it naturally idempotent (set state, not deltas) | Removes the problem instead of guarding it |
+| Dedup under concurrency | Unique constraint + INSERT ON CONFLICT | The database is the only correct referee for concurrent writers |
+| Claim plus work | One transaction | Prevents both the lost-event and double-work crashes |
+| External side effects | Outbox, or idempotency keys downstream | Idempotency must cross every hop, not just the edge |
+| Latency vs the sender timeout | Ack fast, process async on your own queue | Stops slowness from manufacturing duplicates |
+| Out-of-order events | Reconcile against the source of truth | Arrival order is not event order |
+| Authenticity | Verify the signature over the raw body, with a replay window | A public endpoint that moves money is a target |
+
+None of these is exotic. What separates a handler that survives production from one that looks fine in review is whether the unglamorous rows are present: the unique index, the single transaction, the fast ack. They are the parts no demo exercises and every retry storm does.
+
+## The honest landing
+
+You do not get to make webhooks arrive once. The network will deliver them at least once for as long as networks are unreliable, which is forever. The only thing you control is where the fact of "I already handled this" lives, and whether checking it is atomic.
+
+Put that fact in the database, behind a unique constraint. Claim the event and do the work in one transaction. Acknowledge fast, and process where the sender cannot time you out. Reconcile against the source of truth when order matters, and verify the signature before you trust a byte. Do that, and the duplicate that arrives at 2 a.m. hits a wall instead of a customer's card. Skip it, and the simplest-looking handler you ever wrote becomes the one you get paged for.

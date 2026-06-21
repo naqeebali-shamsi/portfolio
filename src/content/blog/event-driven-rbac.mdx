@@ -1,0 +1,185 @@
+export const meta = {
+  slug: 'event-driven-rbac',
+  title: 'Event-Driven RBAC: Authorization When Every Request Asks Permission',
+  description:
+    'How authorization actually works at scale: why RBAC turns into an event-driven caching problem, why revocation is the hard half, and how to bound staleness instead of pretending it away.',
+  headline: 'Event-Driven RBAC: Authorization When Every Request Asks Permission',
+  deck: 'Permissions become a caching problem long before they become a scaling problem. The real skill is knowing which half of that problem is allowed to be slow.',
+  datePublished: '2026-06-08',
+  dateModified: '2026-06-08',
+  readingTime: '15 min',
+  tags: ['authorization', 'rbac', 'system-design', 'distributed-systems', 'postgresql'],
+  faq: [
+    {
+      q: 'What is event-driven RBAC?',
+      a: 'Event-driven RBAC keeps permissions normalized in a database as the source of truth, serves authorization checks from a fast denormalized cache, and propagates changes by emitting an event whenever a permission is granted or revoked. It is CQRS applied to authorization: a rare, careful write path and a constant, fast read path, with a TTL and periodic reconciliation as backstops in case an event is lost.',
+    },
+    {
+      q: 'Why is revoking access harder than granting it?',
+      a: 'Granting is additive and forgiving. If a new permission takes a minute to appear, the user is only mildly inconvenienced. Revoking is urgent and security-critical, because a stale revoke means someone keeps access after you cut them off. Grants tolerate eventual consistency; revokes need a bounded, short staleness window.',
+    },
+    {
+      q: 'Should you store permissions in a JWT?',
+      a: 'Only for low-stakes checks. Embedding permissions in a signed token makes reads free, but you cannot un-issue a token, so revocation is effectively impossible until it expires. Keep access tokens short-lived and keep high-stakes actions, like approving a payout, behind a live authorization check.',
+    },
+  ],
+}
+
+Authentication runs once per session. Authorization runs on every request inside it. That asymmetry is where most of the pain in real authorization systems comes from, and it is the part people consistently underrate.
+
+When you log a user in, you pay the cost of checking a password and minting a session exactly once. For the next eight hours, authentication is a solved problem. Authorization gets no such break. Every time that user pulls a report, opens a record, or hits export, something in your system has to answer one question before it does anything useful: is this person allowed to do this, to this specific thing, right now? On a financial-reporting API serving around 1,300 requests per second, that is roughly 1,300 authorization decisions per second, each one standing between a user and data somebody genuinely cares about keeping private.
+
+So authorization sits on the hot path of everything. And it fails in two directions that pull against each other. Make the check too slow and you have taxed every endpoint you own, because nothing happens until it returns. Make the check too stale and you have let someone read data after they lost the right to see it, which in a finance context is not a bug you fix quietly. It is an incident with a timeline.
+
+This piece is about the design space between those two failures, and why the shape that falls out of it is event-driven.
+
+## Start with the version that is correct
+
+Before reaching for anything clever, build the version everyone writes first, because it is correct and you should understand exactly why it stops being enough.
+
+You model permissions in the database. A `users` table, a `roles` table, a `permissions` table, and the join rows that connect them: `role_assignments` ties a user to a role, `role_permissions` ties a role to what it can do. To check access, you walk the graph. Who is this user, which roles do they hold, do any of those roles grant the action they are attempting on the resource in front of them.
+
+```
+Request --> API --> "can user U do action A on resource R?"
+                       |
+                       v
+        Postgres join: users + role_assignments + roles + role_permissions
+                       |
+                       v
+                  allow / deny      (runs on every request, ~1,300x/sec)
+```
+
+This is good engineering, and it is worth defending. It is normalized, so a permission lives in exactly one place. It is auditable, because every grant is a row with a timestamp. It is consistent, because you read the source of truth on every request. At low and moderate traffic it is not merely acceptable, it is correct in a way fancier designs have to work to recover.
+
+It breaks for three specific reasons, and naming them precisely matters more than waving at the word "scale."
+
+First, the permission check is now a multi-table join sitting on the p99 of every endpoint. Cheap in isolation, expensive as a toll you pay 1,300 times a second.
+
+Second, your authorization availability is now welded to your primary database's availability. The moment Postgres slows down, every request slows down, because every request waits on a permission read before doing its real work. You have handed one dependency the power to fail all access decisions at once.
+
+Third, you are spending money and connection-pool budget re-deriving an answer that almost never changes. A user's permission set gets read thousands of times an hour and written to maybe once a week. You are recomputing a near-constant on every request.
+
+That third point is the tell.
+
+## Cache it, and meet the wall
+
+The obvious move is to stop recomputing the constant. Resolve the user's permission set once, cache it in Redis or in process, and check against the cached copy. Latency collapses. The database stops carrying authorization traffic. Done.
+
+And immediately you have traded a correctness guarantee for a freshness problem, which is the most important sentence in authorization design. The database always told the truth. The cache tells you what was true the last time you looked. The instant an admin changes a role, the cache is lying, and it keeps lying until something tells it to stop.
+
+The lazy fix is a TTL: cache the permission set for sixty seconds and accept that changes take up to a minute to land. This is where most people stop thinking, and where the actual judgment starts, because a sixty-second staleness window is completely fine for half of all permission changes and dangerous for the other half.
+
+## The lens: grants and revokes are not the same event
+
+Permission changes come in two kinds, and they do not deserve the same treatment.
+
+A grant is additive. You gave someone access they are entitled to. If it takes sixty seconds to take effect, the worst case is a user refreshing a page, mildly irritated that the new report has not shown up yet. Grants can be lazy. Eventual consistency is genuinely fine.
+
+A revoke is the opposite. You took access away, and usually for a reason: someone left the company, a contractor's engagement ended, a token leaked, an account was compromised. The worst case for a stale revoke is that the person you just cut off keeps reading financial data for another sixty seconds. That is the exact window an incident review will ask you about.
+
+So here is the model that should drive the whole design: authorization is read-heavy, write-rare, and asymmetric on freshness. Reads dominate by orders of magnitude. Writes are rare enough to be expensive without anyone noticing. And on the rare write, a grant can be slow but a revoke must be fast. A senior design does not treat "permission changed" as one event with one consistency requirement. It gives grants and revokes different service levels, because being wrong costs wildly different amounts in each direction.
+
+Hold that lens. Everything below is downstream of it.
+
+## Event-driven RBAC is the shape that falls out
+
+Once you accept that the read path should be fast and the write path is rare, the architecture mostly designs itself. It is CQRS, applied to permissions.
+
+The write model stays in Postgres: normalized, the source of truth, every change a timestamped row you can audit. This is where a grant or revoke is recorded, and it stays deliberately boring, because the place that holds the truth should be boring.
+
+The read model is denormalized: a flat, precomputed permission set per user, cached next to the services that need it, shaped for one job, answering "can this user do this" in microseconds without touching the database.
+
+The bridge between them is an event. When permissions change in Postgres, the write side publishes a fact: user 4012's access changed. The read side consumes that fact and updates or invalidates its cached copy.
+
+```
+READ PATH  (constant, ~1,300x/sec)
+   Request --> Service --> cached permission set (Redis / in-process) --> allow / deny
+                                  ^
+                                  |  no database on the hot path
+
+CHANGE PROPAGATION  (rare: a grant or a revoke)
+   Admin action --> Postgres (source of truth, audited) --> publish event
+                                                               |
+                                                               v
+                              Service updates / invalidates its cached set
+   Backstops:  short TTL on every entry   +   periodic reconcile against Postgres
+```
+
+What you bought is concrete. The read path no longer touches the database, so those 1,300 checks a second cost it nothing. Authorization no longer falls over when Postgres is under load. The write path stays simple and auditable, because the thing that changes rarely is allowed to be slow and careful.
+
+In a system that already runs event-driven, this barely adds a moving part. A permission change writes to Postgres and drops a message on a queue, the same way a finished report writes a row and drops a message on SQS for a Lambda to render. Authorization stops being a special case and becomes one more consumer of changes the system is already broadcasting.
+
+So far this looks like a free win. It is not, and the gap between an engineer who has run this in production and one who has only drawn it on a whiteboard is whether they can tell you what happens when the event does not arrive.
+
+## Events are messages, and messages have bad days
+
+An event is a message, and messages fail in four ways. Each maps to a specific authorization outcome, and the grant-versus-revoke asymmetry tells you how much each should scare you.
+
+A **delayed** event widens the staleness window. The cache is wrong for longer than you planned. For a grant, shrug. For a revoke, that is your incident window stretching.
+
+A **reordered** pair is sneakier. If a grant and a later revoke arrive out of order, last-write-wins by arrival time leaves the user granted. You revoked them, the system agreed, and they still have access because two messages swapped places in flight. The fix is to order by a version number from the source of truth, not by when the consumer happened to receive them. The write model already has the timestamp. Carry it in the event and let the read model reject anything older than what it already applied.
+
+A **duplicate** event is usually harmless, as long as the update is idempotent. If the event says "replace user 4012's permission set with this," applying it twice changes nothing. Good reason to send state, not deltas: "here is the new set" survives redelivery, "add permission X" does not.
+
+A **lost** event is the one that should keep you honest. The revoke fires, the message is dropped somewhere between publisher and consumer, and the read model never hears about it. Now you have a permanently stale permission: a user revoked in the source of truth, still allowed in the cache, with nothing scheduled to ever correct it. No error fired. Postgres says they were revoked. The running system says they are fine.
+
+That is the trap in pure event-driven invalidation, and it is why the mature version of this design never trusts events as the source of truth. Events are an optimization for propagation speed. They are not the mechanism of correctness. You need a backstop, and you want two layers of it.
+
+## Bounding the staleness instead of hoping
+
+The first backstop is a short TTL underneath the events. Events do the fast invalidation, but every cached entry also expires on its own after a few minutes. If an event is lost, the damage has a ceiling: the stale entry self-heals at the next expiry, when the read model re-derives it from Postgres. Events give you fast propagation in the common case; the TTL caps your worst case when events fail. Speed and a bounded blast radius, at the same time.
+
+The second backstop is periodic reconciliation. On a schedule, the read model resynchronizes against the source of truth and repairs any drift, whatever events it did or did not see. This is the same discipline finance uses everywhere else: trust the running ledger for speed, reconcile against the authoritative record for correctness. Eventual consistency is acceptable when "eventually" has a number attached to it. "Eventually, but I cannot tell you when" is not a design. It is a hope with a diagram.
+
+## The token shortcut, and the revocation tax
+
+There is a tempting way to make reads cost nothing at all: put the permissions inside the token. Stamp the user's roles into a signed JWT at login, and every service checks access by reading a claim. No lookup, no cache, no event, no database. It is the most elegant-looking option on the page.
+
+It also has the worst revocation story of anything here, for a reason that is structural and unfixable. You cannot un-issue a token. Once it is signed and in the user's hands, it is valid until it expires, and there is no cache to invalidate, because the permission is not in your infrastructure anymore. It is in their browser. Staleness equals the full token lifetime, and revocation stops being something you can do on demand.
+
+Laying the options side by side makes the tradeoff legible:
+
+| Approach | Read latency | Freshness on revoke | If the layer is down | Revocation |
+| --- | --- | --- | --- | --- |
+| DB check per request | High | Instant | Authz outage = DB outage | Immediate |
+| Cache + TTL | Low | Up to the TTL | Fall back to the DB | Wait out the TTL |
+| Event-driven cache + TTL backstop | Low | Seconds, capped by TTL | Degrades to DB on a miss | Fast, with a safety net |
+| Permissions in the JWT | Lowest (no lookup) | Token lifetime | Nothing to be down | Effectively none until expiry |
+
+The senior read of that table is not "take the bottom row because it is fastest." It is: match the row to what the resource costs you when you are wrong. Stamping "can view the dashboard layout" into a short-lived token is fine. Stamping "can approve a payout" into a one-hour token means you have a one-hour window where a compromised account moves money with no way to stop it. The usual resolution is to keep access tokens short-lived and keep the high-stakes actions behind a live check, so the convenient path handles cheap decisions and the expensive decisions stay revocable.
+
+## Fail open or fail closed is a per-resource decision
+
+Every layer of caching and eventing you add to make authorization fast also turns authorization into a dependency that can be unavailable. Which forces a question you want to answer on purpose, not discover at 3 a.m.: when the authorization read model is down or uncertain, do you allow or deny?
+
+For financial data, you fail closed. If you cannot prove the user is allowed, the answer is no. But fail-closed carries a cost that is easy to ignore until it bites: authorization is now a hard dependency in front of everything, so an authorization outage becomes a total outage. You have decided, correctly, that locking everyone out beats letting the wrong person in, and you should know you decided it.
+
+A keycard system is the right way to picture it. When the badge reader loses its link to the server, the vault door fails locked and the lobby door fails open, because the cost of being wrong differs enormously at the two doors. Your API is the same building. The endpoint serving a public figure can fail open and stay up. The endpoint exporting a client's financial statements fails closed every time, even if that means it goes dark during the outage. "Fail open or fail closed" is not a global switch. It is a property of each resource, and choosing it per resource is part of the design.
+
+## Defense in depth: the database has the last word
+
+A fast cached read model is an optimization, and optimizations drift. The same reason an event can be lost is the reason the cache can be momentarily wrong. So for anything that truly must not leak, you do not lean on the fast layer alone. You enforce in depth.
+
+The cheap RBAC check at the application layer handles the common case and gives users a clean experience: controls they cannot use do not render, requests they cannot make get a clean 403. But the last line of defense lives where the data lives. Row-level security in Postgres enforces, inside the database, that a query can only ever return rows the current tenant owns, regardless of what the application layer believed. If a bug in the cached read model ever says yes when it should have said no, RLS still says no, because it is evaluated against the actual data at query time and cannot be skipped by an application mistake.
+
+That is the line between authorization as a feature and authorization as a guarantee. The fast layer exists for the 1,300 requests a second. The database layer exists for the night the fast layer is wrong.
+
+## Auditability quietly constrains all of it
+
+Finance carries a requirement that shapes everything above: you have to be able to say who accessed what, whether it was allowed, and why. Not in aggregate. Per decision, after the fact, possibly to an auditor who is not in a generous mood.
+
+That requirement is why you cannot reduce authorization to a cached boolean and walk away. "Allowed: true" is not an answer to "why." The decision has to be explainable: which role granted it, under which assignment, at which version of the policy. It is also why the write model stays normalized and versioned instead of collapsing into whatever shape the cache found convenient. The read model gets to be a denormalized blob optimized for speed precisely because the write model stays the careful, auditable record of how every permission came to exist. The two models answer two different questions. The read model answers "can you, right now, fast." The write model answers "how did that become true, and prove it."
+
+## Know when RBAC is the wrong model
+
+One last piece of judgment, because it separates someone who knows the pattern from someone who knows its edge.
+
+RBAC models permissions through roles, which works beautifully when access is about what kind of user you are: an admin, an editor, a viewer. It buckles the moment access becomes about your relationship to one specific thing. As soon as the requirement is "Alice can edit this document but not that one," roles stop scaling, because expressing it means minting a role per resource, and role count explodes into something no one can reason about or audit.
+
+That smell, roles multiplying to encode per-object access, is the signal to look at relationship-based authorization: the model behind Google's Zanzibar and tools like OpenFGA, where access is a graph of relationships ("Alice is an editor of doc 17") rather than a pile of roles. You do not start there, because the machinery is not free and most systems never need it. A matrix of subject, resource, and action, scoped per tenant, carries you a long way before relationships are the thing you are actually modeling. But catching the role-explosion smell early is what keeps you from bolting a hundred bespoke roles onto a model that quietly stopped fitting a year ago.
+
+## The honest landing
+
+No design on this page is fast, fresh, simple, and outage-proof at the same time. The per-request database check is always fresh and chains your uptime to one dependency. The cache is fast and lies between updates. Events shrink the lie but can drop it on the floor. Tokens make reads free and revocation nearly impossible. Every option relaxes one property to buy another.
+
+So the job was never to find the best authorization architecture. It is to match the consistency guarantee to what each resource costs you when you are wrong, and to stay honest about which property you gave up to get there. Grant lazily, because a slow yes is harmless. Revoke aggressively, because a slow no is an incident. Cache the read, audit the write, fail closed on the things that matter, and never let a single dropped message be the only thing standing between a revoked user and the money.

@@ -1,0 +1,174 @@
+export const meta = {
+  slug: 'matching-engine',
+  title: 'Design a Stock Exchange: The Matching Engine, the Order Book, and Determinism',
+  description:
+    'How an exchange matches orders: a single-threaded in-memory engine, an order book built from three data structures, and determinism defended at every layer.',
+  headline: 'Design a Stock Exchange: The Matching Engine, the Order Book, and Determinism',
+  deck: 'The fastest matching engine in the world runs on one thread, and that is the optimization rather than the compromise.',
+  datePublished: '2026-06-09',
+  dateModified: '2026-06-09',
+  readingTime: '16 min',
+  tags: ['system-design', 'matching-engine', 'low-latency', 'determinism', 'event-sourcing', 'order-book'],
+  faq: [
+    {
+      q: 'Why is a matching engine single-threaded?',
+      a: 'Because contention is more expensive than the work. Incrementing one counter 500 million times takes 300ms on one thread and 224 seconds once two threads fight over a lock for it, a penalty of roughly 750x. The order book is the most contended datum in the whole system, so the moment you let two threads mutate it you spend more time coordinating than matching. LMAX runs all trades, all customers, all markets on a single thread at 6 million orders per second. The thread is what makes the system fast, so you design around it rather than tolerate it.',
+    },
+    {
+      q: 'What data structure is an order book?',
+      a: 'Three structures working together. A balanced tree (or skip list) indexes price levels and caches the best bid and offer for O(1) access. Each price level holds an intrusive doubly-linked list of orders in time priority, so appending and splicing out a cancel are both O(1). A hash map keyed by order id gives O(1) cancel and lookup. Steady state, every hot operation (add at an existing level, cancel, execute, read top of book) is O(1). One firm spent 2 million dollars on hardware with zero latency gain because their inserts into a sorted array were O(N); the hardware was waiting on the algorithm.',
+    },
+    {
+      q: 'What does determinism mean for an exchange?',
+      a: 'Same ordered input produces the same trades, every time, on every replica, after every crash. That is what makes the system fair, auditable, and recoverable from a log. You do not get it for free by writing single-threaded code. Determinism is a budget you defend at every layer: no wall-clock reads in matching logic, no random number generators, no hash-map iteration order leaking into output, no floating-point money, and exactly one writer. Any one of those leaks and your replay diverges.',
+    },
+    {
+      q: 'At what price does a trade execute, the buyer or the seller price?',
+      a: 'At the resting (maker) price, never the incoming (aggressor) price. If a buy order priced at 10.01 hits a resting sell at 10.00, the trade prints at 10.00. The aggressor crossed the spread and is willing to pay up to 10.01, but the resting order set the terms by being there first, so the aggressor gets price improvement. Getting this backwards is a classic amateur tell and it silently mis-prices every fill.',
+    },
+    {
+      q: 'Why use an event log instead of a database for the order book?',
+      a: 'Because the log is the truth and the order book is just a projection of it. Matching is a pure function of the ordered input log, so you never need to persist the book itself; you persist the inputs and replay them. Recovery is load the latest snapshot, apply the log entries after it, and the book is restored exactly. A full cold start at LMAX (process up, snapshot loaded, a day of journals replayed) takes under a minute, and failover to a hot replica is microseconds. In-memory and durable stop fighting each other once you accept that the log, not the book, is what you protect.',
+    },
+  ],
+}
+
+An exchange is a machine for resolving a single question, billions of times a day, without ever being wrong: who trades with whom, at what price, in what order. Everything else (the FIX gateways, the market-data feeds, the clearing pipeline) is plumbing around that one decision. The decision itself happens in the matching engine, and the matching engine is where most intuitions about how to build fast systems are exactly backwards.
+
+Here is the number that should reframe your priors before we go anywhere. LMAX, a real exchange running real money, processes all trades, from all customers, in all markets, on a single thread, at six million orders per second. Not a cluster. Not a thread pool. One thread, in memory, no database in the hot path. And the path from a naive implementation to that number was not faster hardware. On the same machine, naive sequential code did about ten thousand transactions per second; well-factored code with small methods did about a hundred thousand; cache-friendly custom data structures got to six million. A 600x improvement, entirely from software.
+
+That is the whole essay in one ladder. If your mental model of "make it faster" is "add machines," an exchange will break it. The constraints here run the other direction: the thing you are tempted to parallelize is the thing that must stay serial, and the discipline that feels like a straitjacket buys you speed and correctness at the same time. This is a [low-level design](/blog/hld-vs-lld) problem wearing a high-level design costume, and the [system design interview framework](/blog/system-design-interview-framework) gets you to the boundary but not across it.
+
+## Why the fastest path is one thread
+
+Start with the instinct everyone has: the order book gets hammered by concurrent orders, so shard it, lock it, use a fancy concurrent data structure, let many threads work in parallel. It is the obvious move and it is wrong, for a reason you can measure rather than argue about.
+
+Take the cheapest operation in computing, incrementing a 64-bit counter, and do it 500 million times. One thread, no locks: 300 milliseconds. One thread with a lock it never contends: 10 seconds, because the lock machinery itself costs. Now let two threads fight over that lock: 224 seconds. The work did not change. The coordination went from free to catastrophic. Two threads doing 300ms of real work spend nearly four minutes managing the fight over who gets to do it, a penalty around 750x.
+
+That table is the entire argument for single-threaded matching, because the order book is the most contended datum in the system. Every order touches it. If two threads mutate it, they are the two threads in that 224-second row, and you will spend more silicon coordinating than matching. Martin Thompson named the rule behind this the Single Writer Principle: any given piece of data should be owned by exactly one execution context for all mutations. Readers can share freely through cache coherency. Only one thread is ever allowed to write. The corollary is that for highly contended data, a system very easily spends more time managing contention than doing real work, and the order book is the most contended data you will ever have.
+
+So the senior move is not "parallelize the matching." It is "make the single writer so fast that you never need to." How fast? The next number tells you.
+
+## Mechanical sympathy, or why the data structure is the latency
+
+The 600x ladder came from designing software that respects how the hardware actually moves bytes. A CPU does not fetch one value at a time; it pulls a 64-byte cache line and prefetches the next, betting you will read sequentially. An array honors that bet. A textbook linked list scattered across the heap defeats it, and traversing scattered nodes is roughly two orders of magnitude less efficient than walking a contiguous array, because every hop is a cache miss the prefetcher could not hide.
+
+This is why the throughput of a matching engine is, to a first approximation, the choice of its data structures. And the canonical order book is three structures, each chosen for the operation it has to make O(1).
+
+```
+        PRICE-LEVEL INDEX                  PER-LEVEL FIFO QUEUE
+        (balanced tree / skip list)        (intrusive doubly-linked list)
+
+   asks  10.02  --------------------->  [ ord ]<->[ ord ]<->[ ord ]   (time priority)
+         10.01  --------------------->  [ ord ]<->[ ord ]
+   ----  BBO cached here for O(1) ----
+         10.00  --------------------->  [ ord A ]<->[ ord B ]
+   bids   9.99  --------------------->  [ ord ]<->[ ord ]<->[ ord ]
+
+        ORDER INDEX  (hash map: order_id -> node)   ... overlaid for O(1) cancel
+```
+
+The price-level index is a balanced binary search tree or a skip list. Its job is to find or create a price level, which is O(log M) where M is the number of distinct price levels (a small number, dozens to hundreds, not millions of orders). The best bid and best offer are cached, so reading the top of book is O(1) and skips the tree walk. The per-level queue is an intrusive doubly-linked list of resting orders in arrival order, which is exactly time priority; appending a new order at an existing level is O(1), and because the list node lives inside the order object, splicing it out on a cancel is O(1) too. The order index is a hash map from order id to the node, so when a cancel arrives for order id 8675309 you find it and unlink it in O(1) without scanning anything.
+
+Net result, steady state: add at an existing level is O(1), cancel is O(1), execute is O(1), read the top of book is O(1). The only O(log M) operation is creating a brand-new price level, which is rare and cheap.
+
+Now the cautionary tale that makes this concrete. A firm spent two million dollars on faster hardware and got no measurable latency improvement, because their order book was a sorted array and inserting a non-best order meant shifting elements, an O(N) operation. No clock speed fixes an algorithm. The hardware was sitting idle waiting on a memcpy. They bought a Ferrari and left the parking brake on. The lesson the [latency, throughput, and the tail](/blog/latency-throughput-tail) discussion keeps making in the abstract becomes brutally literal here: you cannot buy your way past a bad complexity class.
+
+## A match, step by step
+
+The matching rule itself is short, and a worked example pins down four things juniors routinely get wrong. The resting book has these asks:
+
+```
+  ASK  100 @ 10.00   (order A, arrived t=1)
+  ASK   50 @ 10.00   (order B, arrived t=2)
+  ASK  200 @ 10.01   (order C)
+```
+
+An order arrives: buy 120 @ 10.01.
+
+The engine matches against the best opposite price first, which is 10.00, and walks that level's FIFO queue in time order. Order A is first. It fills completely: a trade prints for 100 shares at 10.00. The incoming order has 20 left. Still at 10.00, order B is next by time priority; 20 of its 50 fill, a trade prints for 20 at 10.00, B keeps 30 and rests. The incoming order is now fully filled and never touches 10.01 at all. Two prints, both at 10.00, in FIFO order.
+
+Read that price again. The buyer was willing to pay 10.01, but both fills printed at 10.00, the resting price. Trades execute at the maker price, never the aggressor price. The resting order set the terms by being there first, so the incoming order gets price improvement. Get this backwards and you mis-price every fill in the system while passing every single-order test, because with one order on each side the maker and taker prices look the same.
+
+The example also quietly defines the rest. A market order takes no special handling; it is a limit order priced at zero (to sell) or infinity (to buy), so it crosses every level and sweeps until filled. A partial fill leaves a residual that rests as a new limit order (order B above). And "best price, then time" is the price-time priority every retail trader has heard of, also called FIFO.
+
+It is not the only rule real exchanges run, though. CME matches roughly 70% of ES and NQ volume with FIFO, but it also runs pro-rata, where an aggressor is split across resting orders in proportion to their size. Send 100 lots against resting orders of 600, 300, and 100 at the same price, and pro-rata allocates 60, 30, and 10. Pro-rata rewards posting size and gives a large resting order deep in the queue a fair shot it would never get under strict FIFO. It also has a subtle invariant: because each share is rounded down to the nearest integer (and can round to zero), pro-rata can never be the final allocation step; rounding always leaves a remainder, so a FIFO leveling pass cleans it up. There is a whole zoo here (lead-market-maker allocations, top-order priority, hybrids), and a venue chooses per product. The point for a designer is that the allocation rule is a policy knob, and each variant adds branches and hidden state that the next section will tell you to treat as a liability.
+
+## Determinism is a budget, not a side effect
+
+Here is the conceptual core, and the part that separates someone who has built one of these from someone who has read about it. The order book is not the source of truth. The log is.
+
+The exchange receives a stream of inputs (new orders, cancels, modifies). A sequencer stamps them into one total order. The matching engine consumes that ordered stream and produces trades. And matching is a pure function of the input log. Feed the same ordered inputs to the same engine and you get the same trades, byte for byte, forever. Which means you never have to persist the order book at all. The book is a projection, a real-time view computed from the log. The log holds the truth; the book just caches where the log has gotten to.
+
+```
+  inputs ->  [ SEQUENCER ]  ->  ordered log  ->  [ MATCHING ENGINE ]  ->  trades
+               single             (durable,           (pure function
+               writer,            append-only,         of the log)
+               total order        immutable)
+                  |                    |
+                  |                    +----> snapshot every N events
+                  +--> the ONLY total-order point in the system
+```
+
+This is event sourcing, the same backbone under the [payment system](/blog/payment-system) and under any double-entry ledger, where the journal is sacred and balances are derived. It is what makes recovery trivial: load the latest snapshot, replay the log entries after it, and the book is restored exactly. You snapshot periodically only to bound how much log you have to replay, not because the book itself is precious. A full cold start at LMAX (process up, recent snapshot loaded, a day of journals replayed) runs under a minute. Failover to a hot replica that has been consuming the same log all along is microseconds.
+
+But here is the senior tell: you do not get determinism for free by writing single-threaded code. Single-threaded removes the worst source of non-determinism (thread interleaving), and then you discover non-determinism hiding everywhere else, and you have to defend against each one deliberately. Determinism is a budget you spend down at every layer:
+
+- **Clocks lie, so the matching logic never reads one.** A call to `now()` returns a different value on replay than it did live, and your trades diverge. Time enters only as data carried in the input events, never as a side effect read mid-match. (You still need accurate wall-clock timestamps, but for regulatory audit reporting under rules like MiFID II, not for ordering. Two clocks, strictly separated: the logical sequence orders trades, the wall clock reports them, and the wall clock must never leak into matching.)
+- **No random number generators** anywhere on the path. Anything that needs a tiebreak resolves it from the deterministic sequence, never from entropy.
+- **No hash-map iteration order in output.** Iterating a hash map and acting on the order it yields is a non-determinism bomb, because that order can vary across runs and JVM versions. If you must iterate, sort first or use an ordered structure.
+- **No floating-point money.** The price 9.95 has no exact binary representation; store it and read it back and you may get 9.9499999. Those errors accumulate and they destroy both correctness and determinism. Money is scaled integers, prices are integer ticks. This is the same discipline as a ledger that stores cents as `bigint` and never as `float`.
+- **Exactly one writer**, which you already have, because that is the only way the sequence of mutations is itself deterministic.
+
+Leak any one of these and your replica computes different trades from the same log, your audit replay disagrees with production, and the property that justified the whole architecture is gone.
+
+There is a finer distinction worth naming because it has a name in practice. Logical determinism means a replay yields the same trades; that is enough for audit and recovery. Byte determinism means the engine's memory and output are bit-for-bit identical run to run, which is stricter and is what you need to cross-check two independent engine instances against each other or to prove formal replay equivalence. [Audex](/case-study/audex), a financial-statement engine I built, is locked by exactly this contract: the same inputs must produce a byte-identical output whose hash matches a stored golden value, so any drift gets caught the instant the hash moves. A matching engine and a byte-deterministic statement engine are the same animal, a deterministic state machine whose input is an ordered log, where every design choice exists to keep the machine bit-honest under crash, audit, and load.
+
+## The sequencer is the point you cannot shard
+
+If matching is a pure function of an ordered log, then everything depends on the ordering, and the ordering depends on one component: the sequencer. It assigns monotonic sequence numbers and thereby imposes the single total order the whole system replays from. And here is the architectural truth that constrains an exchange more than any other: that ordering path cannot be parallelized.
+
+Why not just timestamp orders as they arrive and sort by time? Because distributed clocks lie. Two gateways' clocks disagree by more than the gap between two orders, and "fairness by arrival time" becomes "fairness by whose server clock drifted." The sequencer exists precisely so that fairness comes from one authority's monotonic counter rather than from wall-clock arrival. There is no parallelism in the ordering path because parallelism is the absence of a total order, which is the one thing the sequencer's entire job is to provide.
+
+This gives you the fundamental scaling boundary of an exchange. You scale across instruments, sharding by symbol so AAPL and TSLA run on independent engines, each with its own sequencer and its own single writer. You never scale within a single book's sequencing path. One symbol's throughput ceiling is one sequencer's throughput, which you raise by making the sequencer faster (a better network card, kernel bypass, tighter code), never by adding a second sequencer to the same book. The moment there are two, there is no total order, and there is no exchange.
+
+So the architecture falls out of the constraint. Stateless gateways do validation only (is this a well-formed order, is this account permitted) and defer every ordering decision downstream. The sequencer is the single total-order point. The matching engine is the single writer behind it. Where you draw the gateway-to-sequencer line decides both your fairness model and the blast radius of a buggy gateway, because anything a gateway decides is a decision made outside the deterministic core.
+
+## Getting orders in and out without locks
+
+If the engine runs on one thread and locks cost 224 seconds, how do other threads (the network receivers, the replicators, the market-data publishers) hand work to it and take results from it? Not through a lock, and not through a standard concurrent queue either.
+
+The mechanism is a ring buffer, the heart of the LMAX Disruptor: a pre-allocated, fixed-size circular array, sized to a power of two so an index wraps with a cheap bitmask instead of a modulo. Because it is allocated once and reused forever, the runtime treats it as immortal; nothing on the hot path allocates, so nothing on the hot path triggers garbage collection. Producers and consumers coordinate through sequence numbers and memory barriers in place of locks. With a single producer, no locks and no compare-and-swap are needed at all; a `volatile` write is the memory barrier, and that is the entire synchronization cost.
+
+The numbers are why this matters. Compare the Disruptor against a standard `ArrayBlockingQueue` through a three-stage pipeline: mean latency drops from about 32,757 nanoseconds to about 52 nanoseconds, three orders of magnitude. But the mean is the boring part. Watch the tail:
+
+| Latency | ArrayBlockingQueue | Disruptor |
+| --- | ---: | ---: |
+| Mean | 32,757 ns | 52 ns |
+| 99% under | 2,097,152 ns | 128 ns |
+| 99.99% under | 4,194,304 ns | 8,192 ns |
+| Max | 5,069,086 ns | 175,567 ns |
+
+The queue's 99.99th percentile is four milliseconds; the Disruptor's is eight microseconds, 500x tighter. For an exchange this is the whole game, because the SLA is the tail rather than the mean. The mean only tells you the typical order was fast; the tail tells you whether the one order that mattered during a volatility spike got matched or got stuck. Means lie, and on an exchange they lie about exactly the moments you care about.
+
+The reason the tail collapses is a subtle property worth internalizing. A standard queue follows a J-curve: latency stays flat as load rises, then suddenly explodes as the queue saturates and threads pile up on the lock. The ring buffer does the opposite. A consumer that fell behind sees the producer's cursor has jumped ahead and processes the whole gap in one pass, without re-entering any concurrency machinery for each item. The catch-up is free. So latency stays close to constant as load rises, right up until the memory subsystem itself saturates, which is a much higher ceiling than lock contention's. You flatten the J-curve in place of riding it off the cliff.
+
+Garbage collection deserves one more line because on this path it is a weapon pointed at you. A stop-the-world collector can pause for seconds per gigabyte, and a multi-second pause in a matching engine is an outage. LMAX's answer is to pre-allocate everything (the immortal ring buffer) and bounce the process nightly to wipe memory clean. In C++ or Rust you trade the collector for manual lifetimes and arena allocation, but the goal is identical: zero allocation on the hot path, because the hot path cannot afford to pause.
+
+## What this shares with the rest of the stack
+
+Step back and the matching engine stops looking exotic. It is a replicated deterministic state machine fed an ordered input log, which is the same shape as a lot of serious infrastructure once you strip the domain away.
+
+The replication is the tell. You run more than one engine (LMAX runs two in the primary datacenter plus a third at a disaster-recovery site, all three consuming the same input events), and a leader broadcasts the ordered input so every follower replays it into an identical book. Why broadcast a deterministic sequence in place of just multicasting raw orders? Because IP multicast can deliver messages in different orders to different nodes, and different order means different books. The leader's sequence is the agreement on order; followers replay no gaps, no duplicates, no reordering, and arrive bit-identical. That is state-machine replication, and choosing the leader when one dies is a [leader election](/blog/leader-election) problem that pulls in everything [consensus and Raft](/blog/consensus-raft) and [distributed locks](/blog/distributed-locks) have to say about agreeing on a single authority. Aeron Cluster productizes precisely this pattern for capital markets.
+
+The connections keep going, and they are worth following because they tell you which of your existing instincts transfer and which do not. The log-as-truth, book-as-projection split is the same lens as [Kafka versus queues](/blog/kafka-vs-queues): an immutable ordered log you replay, in place of a queue you drain and forget. The replicas tracking a leader's log are a [replication strategy](/blog/replication-strategies) with a hard determinism requirement on the apply step. The choice to keep one strongly-consistent total order rather than partition for availability is a deliberate landing on the [CAP and PACELC](/blog/cap-pacelc-consistency-spectrum) spectrum: an exchange picks consistency and pays latency to defend it, because a book that forks is no longer a book. Even the integer-money and snapshot-the-state discipline rhymes with how [MVCC and isolation levels](/blog/mvcc-isolation-levels) keep a consistent view without locking readers against the single writer.
+
+None of these is a coincidence. They are the same small set of ideas (one writer, ordered log, deterministic replay, snapshot to bound recovery) reused under different pressure. The matching engine just applies them at the most unforgiving end of the spectrum, where a microsecond of jitter or a single non-deterministic `now()` is the difference between a market and a lawsuit.
+
+## The honest landing
+
+The thing to carry out of this is that the matching engine inverts the reflex that scaling means spreading out. The hot path goes the other way: one writer, one thread, one total order, everything in memory, nothing allocated, no clock read, no float, no lock. A senior engineer does not adopt that reluctantly as a pile of compromises. It is the design, and every constraint in it buys you two things at once. Single-threaded buys you speed (no contention tax) and determinism (a defined sequence of mutations). The event log buys you durability (replay) and auditability (the same property). The integer money buys you correctness and bit-identical replay. Determinism is the through-line, and you never receive it for free by avoiding threads. It is a budget you defend at every layer, because the instant it leaks, the replica disagrees, the audit fails, and the machine you trusted to be bit-honest quietly stops being so. Build the discipline in from the first line, and a six-million-orders-per-second engine fits on one thread. Bolt it on later, and you will be the firm with the two-million-dollar Ferrari and the parking brake on.
+
+## FAQ
+
+<FAQ />
