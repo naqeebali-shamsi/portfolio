@@ -7,9 +7,7 @@ import dalLogo from "../images/dalLogo.png";
 import charusatLogo from "../images/charusatLogo.png";
 import opasLogo from "../images/opas_mobile.png";
 import cdsLogo from "../images/cds.png";
-import mockpiImg from "../images/mockpi.png";
 import quizcraftImg from "../images/quizcraft.png";
-import rebounderImg from "../images/rebounder.png";
 import awsBadge from "../images/aws-badge.png";
 
 // Splash Screen
