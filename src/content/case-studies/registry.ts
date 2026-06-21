@@ -1,4 +1,5 @@
 import type { ComponentType } from 'react';
+import { caseStudyMetaEntries } from './_meta.generated';
 
 export interface CaseStudyMeta {
   slug: string;
@@ -19,14 +20,31 @@ export interface CaseStudyModule {
   default: ComponentType<{ components?: Record<string, ComponentType<any>> }>;
 }
 
-// Auto-discover every .mdx study in this folder at build time. Adding a new study
-// is just dropping in a `<slug>.mdx` file with an `export const meta`.
-const modules = import.meta.glob('./*.mdx', { eager: true }) as Record<string, CaseStudyModule>;
+// Same code-splitting strategy as the blog registry: metadata comes from the
+// generated plain-data sidecar; bodies are lazy-imported (dynamic-only glob) so
+// each study splits into its own on-demand chunk and stays out of the main bundle.
+const bodyLoaders = import.meta.glob('./*.mdx') as Record<
+  string,
+  () => Promise<CaseStudyModule>
+>;
 
-export const caseStudies: Record<string, CaseStudyModule> = {};
-for (const path in modules) {
-  const mod = modules[path];
-  if (mod?.meta?.slug) caseStudies[mod.meta.slug] = mod;
+const slugToPath: Record<string, string> = {};
+
+/** Metadata for every case study, keyed by slug. */
+export const caseStudiesMeta: Record<string, CaseStudyMeta> = {};
+for (const { path, meta } of caseStudyMetaEntries) {
+  if (!meta?.slug) continue;
+  caseStudiesMeta[meta.slug] = meta;
+  slugToPath[meta.slug] = path;
 }
 
-export const caseStudySlugs = Object.keys(caseStudies);
+export const caseStudySlugs = Object.keys(caseStudiesMeta);
+
+/**
+ * React.lazy-compatible loader for a study's compiled MDX body, or undefined if
+ * the slug is unknown. Only the individual case-study page calls this.
+ */
+export function loadCaseStudy(slug: string): (() => Promise<CaseStudyModule>) | undefined {
+  const path = slugToPath[slug];
+  return path ? bodyLoaders[path] : undefined;
+}

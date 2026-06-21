@@ -1,4 +1,4 @@
-import { caseStudies } from './registry';
+import { caseStudiesMeta } from './registry';
 
 /** Flat shape used by the homepage section and the /case-studies index page. */
 export interface CaseStudyIndexEntry {
@@ -22,12 +22,12 @@ const nomadcrew: CaseStudyIndexEntry = {
 // Curated display order — flagship first.
 const ORDER = ['nomadcrew', 'aladeen', 'mecanum', 'audex', 'intellifill'];
 
-const registryEntries: CaseStudyIndexEntry[] = Object.values(caseStudies).map((mod) => ({
-  slug: mod.meta.slug,
-  href: `/case-study/${mod.meta.slug}`,
-  headline: mod.meta.headline,
-  summary: mod.meta.deck || mod.meta.description,
-  tags: (mod.meta.tags || []).slice(0, 4),
+const registryEntries: CaseStudyIndexEntry[] = Object.values(caseStudiesMeta).map((meta) => ({
+  slug: meta.slug,
+  href: `/case-study/${meta.slug}`,
+  headline: meta.headline,
+  summary: meta.deck || meta.description,
+  tags: (meta.tags || []).slice(0, 4),
 }));
 
 const all = [nomadcrew, ...registryEntries];

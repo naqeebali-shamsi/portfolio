@@ -30,10 +30,11 @@ export function HeroPortrait() {
             ref={videoRef}
             className="hero-portrait__video"
             src="/portrait-video.mp4"
+            poster="/portrait-poster.webp"
             muted
             playsInline
             loop
-            preload="auto"
+            preload="none"
           />
         </div>
       </div>

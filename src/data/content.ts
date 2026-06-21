@@ -229,8 +229,8 @@ export const projects: Project[] = [
     description: 'Trip booking platform with real-time reservations, full testing suite, and Prisma ORM.',
     details:
       'A trip-booking platform with real-time seat reservations on a fully-typed Next.js + Prisma/PostgreSQL stack. Booking and checkout forms are built with React Hook Form, and the critical flows are covered end-to-end by a Playwright test suite.',
-    video: 'https://github.com/naqeebali-shamsi/portfolio/releases/download/rideskipper-demo/rideskipper-demo.mp4',
-    videoPoster: 'https://github.com/naqeebali-shamsi/portfolio/releases/download/rideskipper-demo/rideskipper-poster.jpg',
+    video: '/rideskipper-demo.mp4',
+    videoPoster: '/rideskipper-poster.jpg',
     techStack: ['Next.js', 'Prisma', 'PostgreSQL', 'React Hook Form', 'Playwright'],
     links: [],
     status: 'shipped',
