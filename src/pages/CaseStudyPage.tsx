@@ -8,6 +8,9 @@ import ExternalLink from '@/components/atoms/ExternalLink';
 import { Navbar } from '@/components/Navbar/Navbar';
 import { CustomCursor } from '@/components/CustomCursor';
 import Seo from '@/components/Seo';
+import ArticleAttribution from '@/components/ArticleAttribution';
+import CanaryPixel from '@/components/CanaryPixel';
+import { withArticleAttribution } from '@/lib/attribution';
 
 const fadeUp = {
   hidden: { opacity: 0, y: 30 },
@@ -63,7 +66,7 @@ const screenDescriptions = [
   { name: 'Invite', desc: 'Shareable links and direct invitations. New members inherit role-appropriate permissions the moment they accept. The matrix-based auth system configures access automatically based on trip phase and role.' },
 ];
 
-const nomadcrewJsonLd = {
+const nomadcrewJsonLd = withArticleAttribution({
   '@context': 'https://schema.org',
   '@type': 'TechArticle',
   headline: 'NomadCrew: Building Real-Time Group Travel Coordination in Go',
@@ -72,8 +75,6 @@ const nomadcrewJsonLd = {
   image: 'https://naqeebali.me/og-image.png',
   datePublished: '2026-06-08',
   dateModified: '2026-06-08',
-  author: { '@type': 'Person', name: 'Naqeebali Shamsi', url: 'https://naqeebali.me' },
-  publisher: { '@type': 'Person', name: 'Naqeebali Shamsi', url: 'https://naqeebali.me' },
   mainEntityOfPage: 'https://naqeebali.me/case-study/nomadcrew',
   url: 'https://naqeebali.me/case-study/nomadcrew',
   keywords: [
@@ -85,7 +86,7 @@ const nomadcrewJsonLd = {
     { '@type': 'Thing', name: 'Concurrency' },
     { '@type': 'Thing', name: 'Authorization' },
   ],
-};
+});
 
 export default function CaseStudyPage() {
   useEffect(() => {
@@ -101,6 +102,7 @@ export default function CaseStudyPage() {
         type="article"
         jsonLd={nomadcrewJsonLd}
       />
+      <CanaryPixel />
       <CustomCursor />
       <Navbar />
 
@@ -407,6 +409,13 @@ export default function CaseStudyPage() {
               )}
             </div>
           </motion.div>
+        </div>
+      </section>
+
+      {/* ═══ PROVENANCE ═══ */}
+      <section className="pb-section">
+        <div className="max-w-3xl mx-auto px-4 sm:px-5 lg:px-6">
+          <ArticleAttribution slug="nomadcrew" url="https://naqeebali.me/case-study/nomadcrew" />
         </div>
       </section>
 

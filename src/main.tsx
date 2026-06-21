@@ -10,6 +10,7 @@ const CaseStudiesIndexPage = lazy(() => import('./pages/CaseStudiesIndexPage'))
 const BlogPostPage = lazy(() => import('./pages/BlogPostPage'))
 const BlogIndexPage = lazy(() => import('./pages/BlogIndexPage'))
 const ProductsPage = lazy(() => import('./pages/ProductsPage'))
+const LicensePage = lazy(() => import('./pages/LicensePage'))
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
@@ -61,6 +62,14 @@ createRoot(document.getElementById('root')!).render(
           element={
             <Suspense fallback={null}>
               <ProductsPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/license"
+          element={
+            <Suspense fallback={null}>
+              <LicensePage />
             </Suspense>
           }
         />

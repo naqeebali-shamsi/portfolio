@@ -9,6 +9,9 @@ import SectionLabel from '@/components/atoms/SectionLabel';
 import ExternalLink from '@/components/atoms/ExternalLink';
 import { makeMdxComponents } from './mdx-components';
 import type { CaseStudyMeta } from '@/content/case-studies/registry';
+import ArticleAttribution from '@/components/ArticleAttribution';
+import CanaryPixel from '@/components/CanaryPixel';
+import { withArticleAttribution } from '@/lib/attribution';
 
 const SITE = 'https://naqeebali.me';
 
@@ -25,7 +28,7 @@ export default function CaseStudyLayout({ meta, Content }: Props) {
   const url = `${SITE}/case-study/${meta.slug}`;
   const components = makeMdxComponents({ slug: meta.slug, faq: meta.faq });
 
-  const techArticle: Record<string, unknown> = {
+  const techArticle = withArticleAttribution({
     '@context': 'https://schema.org',
     '@type': 'TechArticle',
     headline: meta.headline || meta.title,
@@ -33,12 +36,10 @@ export default function CaseStudyLayout({ meta, Content }: Props) {
     image: `${SITE}/og-image.png`,
     datePublished: meta.datePublished,
     dateModified: meta.dateModified || meta.datePublished,
-    author: { '@type': 'Person', name: 'Naqeebali Shamsi', url: SITE },
-    publisher: { '@type': 'Person', name: 'Naqeebali Shamsi', url: SITE },
     mainEntityOfPage: url,
     url,
     keywords: meta.tags,
-  };
+  });
   const faqLd =
     meta.faq && meta.faq.length
       ? {
@@ -56,6 +57,7 @@ export default function CaseStudyLayout({ meta, Content }: Props) {
   return (
     <div className="min-h-screen bg-bg text-text overflow-x-hidden">
       <Seo title={meta.title} description={meta.description} canonical={url} type="article" jsonLd={jsonLd} />
+      <CanaryPixel />
       <CustomCursor />
       <Navbar />
 
@@ -112,6 +114,7 @@ export default function CaseStudyLayout({ meta, Content }: Props) {
       <article className="py-section">
         <div className="max-w-3xl mx-auto px-4 sm:px-5 lg:px-6">
           <Content components={components} />
+          <ArticleAttribution slug={meta.slug} url={url} />
         </div>
       </article>
 

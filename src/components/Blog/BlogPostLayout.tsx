@@ -11,6 +11,9 @@ import SectionLabel from '@/components/atoms/SectionLabel';
 import { makeMdxComponents } from '@/components/CaseStudy/mdx-components';
 import type { BlogPostMeta } from '@/content/blog/registry';
 import ProductCTA from '@/components/Blog/ProductCTA';
+import ArticleAttribution from '@/components/ArticleAttribution';
+import CanaryPixel from '@/components/CanaryPixel';
+import { withArticleAttribution } from '@/lib/attribution';
 
 const SITE = 'https://naqeebali.me';
 
@@ -34,7 +37,7 @@ export default function BlogPostLayout({ meta, Content }: Props) {
   const url = `${SITE}/blog/${meta.slug}`;
   const components = makeMdxComponents({ slug: meta.slug, faq: meta.faq });
 
-  const blogPosting: Record<string, unknown> = {
+  const blogPosting = withArticleAttribution({
     '@context': 'https://schema.org',
     '@type': 'BlogPosting',
     headline: meta.headline || meta.title,
@@ -42,12 +45,10 @@ export default function BlogPostLayout({ meta, Content }: Props) {
     image: `${SITE}/og-image.png`,
     datePublished: meta.datePublished,
     dateModified: meta.dateModified || meta.datePublished,
-    author: { '@type': 'Person', '@id': `${SITE}/#person`, name: 'Naqeebali Shamsi', url: SITE },
-    publisher: { '@type': 'Person', '@id': `${SITE}/#person`, name: 'Naqeebali Shamsi', url: SITE },
     mainEntityOfPage: { '@type': 'WebPage', '@id': url },
     url,
     keywords: meta.tags,
-  };
+  });
   const faqLd =
     meta.faq && meta.faq.length
       ? {
@@ -65,6 +66,7 @@ export default function BlogPostLayout({ meta, Content }: Props) {
   return (
     <div className="min-h-screen bg-bg text-text overflow-x-hidden">
       <Seo title={meta.title} description={meta.description} canonical={url} type="article" jsonLd={jsonLd} />
+      <CanaryPixel />
       <CustomCursor />
       <Navbar />
 
@@ -98,6 +100,7 @@ export default function BlogPostLayout({ meta, Content }: Props) {
         <div className="max-w-3xl mx-auto px-4 sm:px-5 lg:px-6">
           <Content components={components} />
           <ProductCTA source={meta.slug} tags={meta.tags} />
+          <ArticleAttribution slug={meta.slug} url={url} />
         </div>
       </article>
 

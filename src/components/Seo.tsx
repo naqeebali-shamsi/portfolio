@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { ATTRIBUTION } from '@/lib/attribution';
 
 /**
  * Dependency-free per-route <head> manager.
@@ -78,6 +79,11 @@ export default function Seo({
     upsertMeta('name', 'twitter:title', title);
     upsertMeta('name', 'twitter:description', description);
     upsertMeta('name', 'twitter:image', image);
+    upsertMeta('name', 'twitter:creator', ATTRIBUTION.twitterHandle);
+
+    // Authorship / copyright provenance (machine-readable origin)
+    upsertMeta('name', 'author', ATTRIBUTION.name);
+    upsertMeta('name', 'copyright', ATTRIBUTION.copyrightNotice);
 
     // Route-specific JSON-LD (stable id so we update, never duplicate)
     if (ld) {

@@ -47,6 +47,7 @@ const ROUTES = [
   ...mdxSlugs.map((s) => ({ path: `/case-study/${s}`, priority: '0.8', changefreq: 'monthly' })),
   { path: '/blog', priority: '0.8', changefreq: 'weekly' },
   { path: '/products', priority: '0.9', changefreq: 'monthly' },
+  { path: '/license', priority: '0.3', changefreq: 'yearly' },
   ...blogSlugs.map((s) => ({ path: `/blog/${s}`, priority: '0.7', changefreq: 'monthly' })),
   { path: '/', priority: '1.0', changefreq: 'monthly' }, // homepage last (overwrites the shell dist/index.html)
 ];
@@ -85,6 +86,7 @@ async function main() {
   // Capture everything into memory first, THEN write — so overwriting dist/index.html
   // mid-run can't affect the SPA fallback used by later routes.
   const captures = [];
+  let guardMisses = 0;
   for (const route of ROUTES) {
     const page = await browser.newPage();
     try {
@@ -101,6 +103,19 @@ async function main() {
 
       let html = await page.content();
       if (!html.startsWith('<!')) html = '<!doctype html>\n' + html;
+
+      // Provenance guard: the self-canonical is the anti-theft weapon — a verbatim copy
+      // keeps it and gets de-ranked below the original. Article pages should also carry
+      // the copyright JSON-LD. Warn loudly (don't fail the deploy) on a miss.
+      if (!/<link[^>]+rel=["']canonical["']/i.test(html)) {
+        console.warn(`[prerender] ⚠ missing canonical: ${route.path}`);
+        guardMisses++;
+      }
+      if (/^\/(blog|case-study)\/.+/.test(route.path) && !/"creditText"|"copyrightNotice"/.test(html)) {
+        console.warn(`[prerender] ⚠ missing copyright JSON-LD: ${route.path}`);
+        guardMisses++;
+      }
+
       const outDir = route.path === '/' ? distDir : path.join(distDir, route.path);
       captures.push({ outDir, html, route: route.path });
     } catch (err) {
@@ -128,6 +143,7 @@ async function main() {
   const sitemap = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>\n`;
   await fs.writeFile(path.join(distDir, 'sitemap.xml'), sitemap, 'utf8');
   console.log('[prerender] wrote sitemap.xml');
+  if (guardMisses) console.warn(`[prerender] ⚠ provenance guard: ${guardMisses} miss(es) above — check canonical/copyright on those routes.`);
   console.log(`[prerender] done — ${captures.length}/${ROUTES.length} routes prerendered.`);
 }
 
