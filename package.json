@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && node scripts/prerender.mjs",
     "lint": "eslint .",
     "preview": "vite preview"
   },
@@ -29,6 +29,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
+    "@mdx-js/rollup": "^3.1.1",
     "@tailwindcss/postcss": "^4.1.18",
     "@types/react": "^19.2.9",
     "@types/react-dom": "^19.2.3",
@@ -41,6 +42,7 @@
     "globals": "^16.5.0",
     "postcss": "^8.5.6",
     "puppeteer": "^24.37.5",
+    "remark-gfm": "^4.0.1",
     "tailwindcss": "^4.1.18",
     "typescript": "^5.9.3",
     "vite": "^7.2.4"
